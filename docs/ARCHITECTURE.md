@@ -193,12 +193,12 @@ Three launches within ten minutes trips the breaker: launching is suspended for 
 
 The repository presents `core.py` plus six thin facade modules (`detector`, `manifest`, `launcher`, `statusline`, `security`, `state`) that re-export the public API by concern.
 
-`core.py` is the exact implementation that was built, tested and live-verified for 1.0.0. Mechanically splitting a 2,300-line module across six files for appearance would mean rewriting import graphs and shared state handling — real risk, no behavioural gain, against code whose value is precisely that it has been proven end to end.
+`core.py` is the exact implementation that was built, tested and live-verified for 1.0.0, and hardened in place since. Mechanically splitting a 2,300-line module across six files for appearance would mean rewriting import graphs and shared state handling — real risk, no behavioural gain, against code whose value is precisely that it has been proven end to end.
 
 So the split is deliberately a **naming layer**, not a rewrite:
 
 - `core.py` holds the implementation and stays behaviourally identical to the verified version.
 - The facades give tests and callers a stable, concern-oriented API surface, and document what belongs where.
-- If 1.1.0 genuinely needs the physical split, the facades are already the seams to split along, and their public names will not change.
+- If a later release genuinely needs the physical split, the facades are already the seams to split along, and their public names will not change.
 
 This is recorded here rather than left implicit, because a reader who opens `detector.py` and finds only imports deserves to know it was a choice.

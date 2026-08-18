@@ -209,7 +209,9 @@ The successor is instructed to delegate transcript analysis to a temporary subag
 - Manifests record no credentials, tokens, environment dumps, file contents, transcript contents or shell history.
 - The successor runs in your normal permission mode. Terminal Handoff never passes `--dangerously-skip-permissions` and never runs a destructive Git command.
 
-See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
+If a status line already exists, Terminal Handoff runs it through `/bin/sh -c` — the same way Claude Code already does. It is fixed at install time from your own settings, and no status JSON, transcript content, model ID, effort value or manifest data can alter it. Read [**The `--wrap` mechanism**](docs/SECURITY_MODEL.md#the---wrap-mechanism-read-this-before-installing) before installing over an existing status line.
+
+See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for the full threat model.
 
 ## Wrapping an existing status line
 
@@ -287,7 +289,7 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) and [docs/ARCHITECTURE.md](docs/A
 
 ## Version
 
-**1.0.0** — see [CHANGELOG.md](CHANGELOG.md).
+**1.0.1** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Licence
 

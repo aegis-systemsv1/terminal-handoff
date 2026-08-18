@@ -5,6 +5,69 @@ All notable changes to Terminal Handoff are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-08-18
+
+Hardening and documentation release. **No behavioural change to the 80% handoff
+mechanism**: threshold detection, model and effort preservation, manifest
+creation, transcript isolation, the successor lifecycle and every safety guard
+are byte-for-byte the behaviour shipped in 1.0.0.
+
+### Added
+
+- **Stronger `--wrap` security documentation.** `docs/SECURITY_MODEL.md` gains a
+  prominent section covering what the mechanism does, why wrapping an existing
+  status line is required rather than replacing it, where the trust boundary
+  sits, that the command originates from the user's own Claude settings and is
+  granted no privilege it did not already have, that no status JSON, transcript
+  path, transcript content, model ID, effort value or manifest data can enter
+  it, the real risk of an already-malicious pre-existing command, safe and
+  unsafe examples, how to inspect a command before installing, how to refuse
+  wrapping, how to use dry-run mode, and how to uninstall and restore.
+- **Wrapped-command integrity tests** (17). Shell metacharacters and a
+  filesystem canary are planted in every payload field, in transcript contents
+  and in a tampered manifest; the wrapped command is proven to run with a
+  byte-identical invocation and zero arguments, receiving the status JSON only
+  as stdin, with no canary ever created.
+- **Unusual-layout install and uninstall hardening tests** (19), covering
+  installation as `core.py`, `terminal-handoff.py`, `terminal_handoff.py` and a
+  neutrally-named executable in a neutrally-named directory; package-module
+  invocation; symlinked and space-bearing installation directories; a
+  third-party status line; repeated installation; an interrupted installation
+  whose registry was lost; a missing backup; multiple backups; malformed
+  settings JSON; settings without a `statusLine`; a legacy Terminal Handoff
+  command; a partial installation; a renamed executable; uninstall after module
+  relocation; and a full install / reinstall / uninstall round trip.
+- **Recursive self-wrap regression protection.** Generated status-line commands
+  now carry an explicit `--marker terminal-handoff` token, so the installer
+  recognises its own command regardless of module filename or directory name.
+  Previously, detection relied on the path containing `terminal-handoff`; a
+  runtime renamed and placed in a neutrally-named directory would not have been
+  recognised and would have been wrapped recursively.
+
+### Fixed
+
+- **Uninstall could discard a third-party status line** when the install
+  registry was missing (an interrupted install, a deleted state directory). The
+  original command is now recovered from the installed command's own `--wrap`
+  argument and restored, rather than the `statusLine` key being removed.
+- **Settings files using non-ASCII escapes were rewritten with literal
+  characters.** 1.0.0 preserved a file's trailing-newline convention but always
+  wrote non-ASCII literally, so a file written with backslash-u escapes had
+  unrelated keys rewritten. The escaping convention of the original file is now
+  recorded at install time and reproduced on both install and uninstall.
+- **Correct standalone MIT licence detection.** `LICENSE` contains only the MIT
+  text so GitHub and licence scanners detect it; the independence statement,
+  trademark attribution and third-party code status moved to `NOTICE.md`.
+
+### Unchanged
+
+The handoff mechanism itself. The threshold remains 80% by default, read only
+from `.context_window.used_percentage`; the successor still receives the exact
+model and effort, a fresh session ID and a clean context window; the parent
+transcript is still analysed by an isolated subagent; and one trigger per
+session with unlimited generations per chain is unaltered. All 1.0.0 tests pass
+unmodified.
+
 ## [1.0.0] - 2026-08-18
 
 First release.
@@ -90,4 +153,5 @@ First release.
 - A project-level `statusLine` overrides the global one and must be integrated
   explicitly; `coverage` reports which configurations are covered.
 
+[1.0.1]: https://github.com/aegis-systemsv1/terminal-handoff/releases/tag/v1.0.1
 [1.0.0]: https://github.com/aegis-systemsv1/terminal-handoff/releases/tag/v1.0.0

@@ -15,7 +15,7 @@ documented status-line interface and its public command-line flags.
 
 ## Third-party code
 
-Terminal Handoff 1.0.0 contains no vendored third-party code and has no
+Terminal Handoff contains no vendored third-party code and has no
 runtime dependencies beyond the Python standard library. The implementation is
 original work, distributable under the MIT License in [LICENSE](LICENSE).
 

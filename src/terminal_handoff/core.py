@@ -32,7 +32,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.0.0"
+TERMINAL_HANDOFF_VERSION = "1.0.1"
 MANIFEST_SCHEMA_VERSION = 1
 
 # ---------------------------------------------------------------------------
@@ -1922,22 +1922,46 @@ def preferred_python():
     return sys.executable
 
 
+# Emitted into every generated status-line command. Detection keys on this
+# rather than on the module's filename or directory, so a renamed executable in
+# a neutrally-named directory is still recognised and never wrapped recursively.
+TH_SELF_MARKER = "terminal-handoff"
+
+
 def th_statusline_command(wrap=None):
     self_path = os.path.abspath(__file__)
-    command = "%s %s statusline" % (shlex.quote(preferred_python()), shlex.quote(self_path))
+    command = "%s %s statusline --marker %s" % (
+        shlex.quote(preferred_python()),
+        shlex.quote(self_path),
+        shlex.quote(TH_SELF_MARKER),
+    )
     if wrap:
         command += " --wrap %s" % shlex.quote(wrap)
     return command
 
 
-def _serialize_settings(settings, original_text):
+def _is_ascii(text):
+    try:
+        text.encode("ascii")
+    except (UnicodeEncodeError, AttributeError):
+        return False
+    return True
+
+
+def _serialize_settings(settings, original_text, ascii_only=None):
     """Serialize settings without disturbing anything unrelated.
 
-    ensure_ascii=False keeps non-ASCII characters (e.g. emoji in an unrelated
-    `attribution` key) exactly as the project author wrote them, and the
-    trailing newline matches whatever the original file had.
+    Two conventions of the original file are preserved, because both change
+    bytes in keys that have nothing to do with Terminal Handoff:
+
+    * **Non-ASCII escaping.** A file that already contains literal non-ASCII
+      characters (an emoji in an `attribution` key, say) keeps them literal; a
+      file written with backslash-u escapes keeps them escaped.
+    * **Trailing newline.** Matched to whatever the original file had.
     """
-    text = json.dumps(settings, indent=2, ensure_ascii=False)
+    if ascii_only is None:
+        ascii_only = True if original_text is None else _is_ascii(original_text)
+    text = json.dumps(settings, indent=2, ensure_ascii=bool(ascii_only))
     if original_text is None or original_text.endswith("\n"):
         text += "\n"
     return text
@@ -2003,6 +2027,7 @@ def install_statusline(settings_file, tag):
     registry["targets"][settings_file] = {
         "original_statusLine": original,
         "original_ends_with_newline": bool(original_text is None or original_text.endswith("\n")),
+        "original_is_ascii": bool(original_text is None or _is_ascii(original_text)),
         "file_existed": not created,
         "backup": backup,
         "installed_at": utc_stamp(),
@@ -2026,6 +2051,33 @@ def install_statusline(settings_file, tag):
     }
 
 
+def extract_wrapped_command(command):
+    """Recover the wrapped command from a Terminal Handoff status-line command.
+
+    The install registry records the original status line, but it can be lost:
+    an interrupted install, a deleted state directory, a relocated module. In
+    that case the original is still recoverable from the installed command's
+    own `--wrap` argument, which is preferable to silently removing a status
+    line the user did not install through Terminal Handoff.
+    """
+    if not command:
+        return None
+    try:
+        parts = shlex.split(str(command))
+    except ValueError:
+        return None
+    if "--wrap" not in parts:
+        return None
+    index = parts.index("--wrap")
+    if index + 1 >= len(parts):
+        return None
+    recovered = parts[index + 1]
+    # Never "recover" our own command: that would reinstate a self-wrap.
+    if is_terminal_handoff_command(recovered):
+        return None
+    return recovered or None
+
+
 def uninstall_statusline(settings_file, dry_run=True):
     registry = load_registry()
     entry = (registry.get("targets") or {}).get(settings_file)
@@ -2036,9 +2088,15 @@ def uninstall_statusline(settings_file, dry_run=True):
     if not (isinstance(current, dict) and is_terminal_handoff_command(current.get("command", ""))):
         return {"ok": True, "settings_file": settings_file, "note": "Terminal Handoff not installed here"}
 
+    recovered = extract_wrapped_command(current.get("command", ""))
     if entry and entry.get("original_statusLine") is not None:
         planned = entry["original_statusLine"]
         action = "restore original statusLine"
+    elif recovered:
+        # No registry entry, but the installed command still names what it
+        # wrapped. Restoring that is strictly safer than dropping it.
+        planned = {"type": "command", "command": recovered}
+        action = "restore wrapped statusLine recovered from the installed command"
     elif entry and not entry.get("file_existed"):
         planned = None
         action = "remove generated settings file"
@@ -2056,8 +2114,11 @@ def uninstall_statusline(settings_file, dry_run=True):
         }
 
     backup_file(settings_file, "uninstall")
+    ascii_only = None
     if entry is not None and "original_ends_with_newline" in entry:
         original_text = "{}\n" if entry["original_ends_with_newline"] else "{}"
+        if "original_is_ascii" in entry:
+            ascii_only = bool(entry["original_is_ascii"])
     else:
         try:
             with open(settings_file, "r") as handle:
@@ -2068,7 +2129,7 @@ def uninstall_statusline(settings_file, dry_run=True):
         settings.pop("statusLine", None)
     else:
         settings["statusLine"] = planned
-    serialized = _serialize_settings(settings, original_text)
+    serialized = _serialize_settings(settings, original_text, ascii_only=ascii_only)
     json.loads(serialized)
     write_private(settings_file, serialized, mode=os.stat(settings_file).st_mode & 0o777)
     if entry:
@@ -2384,6 +2445,15 @@ def main(argv=None):
 
     p = sub.add_parser("statusline", help="Render the status line and evaluate the trigger")
     p.add_argument("--wrap", default=None, help="Pre-existing status-line command to wrap")
+    p.add_argument(
+        "--marker",
+        default=None,
+        help=(
+            "Self-identifying marker emitted by the installer. It has no runtime "
+            "effect; it lets the installer recognise its own command under any "
+            "module name or directory and refuse to wrap itself."
+        ),
+    )
     p.set_defaults(func=cmd_statusline)
 
     p = sub.add_parser("evaluate", help="Evaluate a status-line JSON payload from stdin")
