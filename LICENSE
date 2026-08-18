@@ -19,16 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Terminal Handoff is an independent project. It is not affiliated with,
-endorsed by, or sponsored by Anthropic, Claude, Apple or OpenAI.
-
-"Claude" and "Claude Code" are products of Anthropic, PBC.
-"macOS", "Terminal" and "AppleScript" are products of Apple Inc.
-All trademarks are the property of their respective owners.
-
-This project claims no ownership of, and grants no rights to, any Anthropic,
-Apple or OpenAI technology. It interoperates with Claude Code through its
-documented status-line interface and its public command-line flags.

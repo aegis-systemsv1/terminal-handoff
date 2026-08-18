@@ -293,4 +293,4 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) and [docs/ARCHITECTURE.md](docs/A
 
 MIT — see [LICENSE](LICENSE).
 
-Terminal Handoff is an independent project. It is **not affiliated with, endorsed by, or sponsored by** Anthropic, Claude, Apple or OpenAI. "Claude" and "Claude Code" are products of Anthropic; "macOS" and "Terminal" are products of Apple. All trademarks belong to their respective owners.
+Terminal Handoff is an independent project, **not affiliated with, endorsed by, or sponsored by** Anthropic, Claude, Apple or OpenAI. See [NOTICE.md](NOTICE.md) for trademark attribution and third-party code status.
