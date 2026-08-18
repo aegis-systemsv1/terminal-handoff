@@ -1,0 +1,87 @@
+name: Bug report
+description: Something in Terminal Handoff behaved incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug.
+
+        **Please redact before posting.** Logs and manifests can contain
+        repository paths and session identifiers. Replace anything you would
+        not publish. A synthetic example is always acceptable.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did Terminal Handoff do, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: th-version
+    attributes:
+      label: Terminal Handoff version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "15.7"
+    validations:
+      required: true
+
+  - type: input
+    id: claude
+    attributes:
+      label: Claude Code version
+      description: Output of `claude --version`
+      placeholder: "2.1.234"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.9.6"
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `terminal-handoff.py status`
+      render: json
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: From `~/.claude/terminal-handoff/logs/terminal-handoff.log` - redacted
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmations
+      options:
+        - label: I have redacted paths, session IDs and any private information
+          required: true
+        - label: This is not a security vulnerability (those go through the Security tab)
+          required: true

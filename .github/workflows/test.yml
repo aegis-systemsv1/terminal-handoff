@@ -1,0 +1,99 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (macOS, python ${{ matrix.python-version }})
+    # Terminal Handoff targets macOS: the launcher drives Apple Terminal through
+    # osascript. No Terminal window is opened here - the suite runs in test mode.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.11', '3.13']
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Report environment
+        run: |
+          python3 --version
+          git --version
+          sw_vers || true
+
+      - name: Compile all sources
+        run: python3 -m compileall -q src tests
+
+      - name: Run the test suite
+        env:
+          CLAUDE_TERMINAL_HANDOFF_TEST_MODE: '1'
+        run: python3 -m unittest discover -s tests -v
+
+  quality:
+    name: syntax, privacy and metadata
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Shell script syntax
+        run: |
+          sh -n install.sh
+          sh -n scripts/coverage-check.sh
+          sh -n scripts/verify-release.sh
+          zsh -n uninstall.sh
+
+      - name: JSON validity
+        run: |
+          for file in examples/*.json tests/fixtures/*.json; do
+            python3 -m json.tool "$file" > /dev/null && echo "ok  $file"
+          done
+
+      - name: Privacy, secret and personal-path scan
+        run: ./scripts/coverage-check.sh
+
+      - name: Release verification
+        run: ./scripts/verify-release.sh
+
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ruff
+        run: pip install 'ruff==0.6.9'
+
+      - name: Lint
+        run: ruff check src tests
