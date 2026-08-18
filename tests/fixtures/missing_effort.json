@@ -1,0 +1,20 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000005",
+  "transcript_path": "<TRANSCRIPT>",
+  "cwd": "<WORKDIR>",
+  "workspace": {
+    "current_dir": "<WORKDIR>",
+    "project_dir": "<WORKDIR>",
+    "added_dirs": []
+  },
+  "model": {
+    "id": "claude-opus-5[1m]",
+    "display_name": "Opus 5"
+  },
+  "version": "2.1.234",
+  "context_window": {
+    "context_window_size": 200000,
+    "used_percentage": 85.0,
+    "remaining_percentage": 15.0
+  }
+}
