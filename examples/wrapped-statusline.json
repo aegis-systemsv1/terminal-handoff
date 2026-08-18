@@ -1,0 +1,11 @@
+{
+  "_comment": "Example project .claude/settings.json where a status line already existed. Terminal Handoff WRAPS it: the original command receives the identical stdin bytes and its stdout is preserved byte-for-byte, with only a short badge appended. The original command is recorded in state/installed.json so an uninstall restores it exactly.",
+  "_original_statusLine": {
+    "type": "command",
+    "command": "node \"$CLAUDE_PROJECT_DIR/.claude/helpers/statusline.js\""
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "/usr/bin/python3 $HOME/.claude/terminal-handoff/terminal-handoff.py statusline --wrap 'node \"$CLAUDE_PROJECT_DIR/.claude/helpers/statusline.js\"'"
+  }
+}

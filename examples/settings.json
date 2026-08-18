@@ -1,0 +1,8 @@
+{
+  "_comment": "Example ~/.claude/settings.json after installing Terminal Handoff where no status line existed. Unrelated keys such as 'theme' are preserved exactly by the installer.",
+  "theme": "light",
+  "statusLine": {
+    "type": "command",
+    "command": "/usr/bin/python3 $HOME/.claude/terminal-handoff/terminal-handoff.py statusline"
+  }
+}
