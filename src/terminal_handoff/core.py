@@ -1,0 +1,2439 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Terminal Handoff - core implementation.
+
+Terminal Handoff monitors an active Claude Code session using Claude Code's
+official live status-line JSON. When the session's context window reaches the
+configured threshold (default 80%), Terminal Handoff opens a new macOS Terminal
+window running a genuinely fresh Claude Code session that uses the outgoing
+session's exact model and exact effort level, hands it a secure handoff
+manifest, and instructs it to reconstruct the work through a context-isolated
+subagent rather than by loading the parent transcript into its main context.
+
+Each Claude session may trigger exactly one successor. Every successor is itself
+monitored by Terminal Handoff and may trigger the next generation, so the chain
+continues indefinitely until explicitly disabled.
+
+Target: Python 3.9+ (macOS system python3). No third-party dependencies.
+"""
+
+from __future__ import print_function
+
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+
+TERMINAL_HANDOFF_VERSION = "1.0.0"
+MANIFEST_SCHEMA_VERSION = 1
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_THRESHOLD = 80.0
+DEFAULT_MIN_OBSERVATIONS = 2
+DEFAULT_COOLDOWN_SECONDS = 45
+DEFAULT_STORM_MAX_LAUNCHES = 3
+DEFAULT_STORM_WINDOW_SECONDS = 600
+DEFAULT_CIRCUIT_OPEN_SECONDS = 1800
+WRAPPED_STATUSLINE_TIMEOUT = 3.0
+GIT_TIMEOUT = 5.0
+
+# Effort levels accepted by Claude Code 2.1.x, as reported by `.effort.level`
+# in the official status-line JSON and validated by `claude --effort`.
+ALLOWED_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+# `--effort ultracode` is accepted by the CLI but is NOT an effort level: it
+# resolves to xhigh plus a separate internal `ultracode` boolean that is never
+# exposed in the status-line JSON. Terminal Handoff therefore cannot detect or
+# preserve ultracode. See README.md, "Known limitations".
+UNDETECTABLE_EFFORT_ALIASES = ("ultracode",)
+
+# Model IDs are untrusted input. Brackets are required: real model IDs such as
+# `claude-opus-5[1m]` contain them. Shell metacharacters are not permitted.
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._:@/\[\]-]{1,128}$")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
+CHAIN_ID_RE = re.compile(r"^[A-Za-z0-9]{6,32}$")
+
+# Paths that will be embedded in a generated shell script / AppleScript string.
+UNSAFE_PATH_RE = re.compile(r'["\\\x00-\x1f\x7f]')
+
+# Terminal Handoff recognises its own status-line command by this marker rather
+# than by a filename. Detecting on a literal filename meant that installing from
+# a differently-named module (e.g. the packaged `terminal_handoff/core.py`) made
+# the installer fail to recognise itself and wrap its own command recursively.
+TH_COMMAND_MARKER = re.compile(r"terminal[-_]handoff", re.IGNORECASE)
+
+
+def is_terminal_handoff_command(command):
+    """True if `command` is a Terminal Handoff status-line command."""
+    return bool(command) and bool(TH_COMMAND_MARKER.search(str(command)))
+
+
+STATE_DIRS = (
+    "handoffs",
+    "triggered",
+    "launching",
+    "completed",
+    "failed",
+    "logs",
+    "tests",
+    "backups",
+    "prompts",
+    "state",
+)
+
+TRUTHY = ("1", "true", "yes", "on")
+
+
+def env_flag(name):
+    return os.environ.get(name, "").strip().lower() in TRUTHY
+
+
+def env_float(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value
+
+
+def env_int(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def th_home():
+    override = os.environ.get("CLAUDE_TERMINAL_HANDOFF_HOME")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(os.path.expanduser("~"), ".claude", "terminal-handoff")
+
+
+def th_path(*parts):
+    return os.path.join(th_home(), *parts)
+
+
+def ensure_dirs():
+    home = th_home()
+    _mkdir_private(home)
+    for name in STATE_DIRS:
+        _mkdir_private(os.path.join(home, name))
+
+
+def _mkdir_private(path):
+    try:
+        os.makedirs(path, 0o700)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def threshold():
+    value = env_float("CLAUDE_TERMINAL_HANDOFF_THRESHOLD", DEFAULT_THRESHOLD)
+    if value <= 0 or value > 100:
+        return DEFAULT_THRESHOLD
+    return value
+
+
+def max_generations():
+    raw = os.environ.get("CLAUDE_TERMINAL_HANDOFF_MAX_GENERATIONS", "").strip()
+    if raw == "":
+        return None  # unlimited (documented default)
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def utc_stamp(dt=None):
+    return (dt or utc_now()).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def local_stamp(dt=None):
+    return (dt or datetime.now()).astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def file_stamp(dt=None):
+    return (dt or utc_now()).strftime("%Y%m%dT%H%M%SZ")
+
+
+# ---------------------------------------------------------------------------
+# Secure IO
+# ---------------------------------------------------------------------------
+
+
+def write_private(path, data, mode=0o600):
+    """Atomically write `data` (str) to `path` with private permissions."""
+    directory = os.path.dirname(path) or "."
+    _mkdir_private(directory)
+    tmp = "%s.tmp.%d.%s" % (path, os.getpid(), uuid.uuid4().hex[:8])
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+    return path
+
+
+def write_json_private(path, obj, mode=0o600, sort_keys=True):
+    return write_private(
+        path, json.dumps(obj, indent=2, sort_keys=sort_keys, ensure_ascii=False) + "\n", mode
+    )
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, "r") as handle:
+            return json.load(handle)
+    except Exception:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Logging (bounded rotation, private, never contains transcript content)
+# ---------------------------------------------------------------------------
+
+LOG_MAX_BYTES = 1024 * 1024
+LOG_KEEP = 5
+
+
+def log_path():
+    return th_path("logs", "terminal-handoff.log")
+
+
+def rotate_logs():
+    path = log_path()
+    try:
+        if os.path.getsize(path) < LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    for index in range(LOG_KEEP - 1, 0, -1):
+        src = "%s.%d" % (path, index)
+        dst = "%s.%d" % (path, index + 1)
+        if os.path.exists(src):
+            try:
+                os.replace(src, dst)
+            except OSError:
+                pass
+    try:
+        os.replace(path, path + ".1")
+    except OSError:
+        pass
+
+
+def log_event(event, **fields):
+    """Append one structured Terminal Handoff log record.
+
+    Never logs transcript contents, prompt bodies, secrets or environment dumps.
+    """
+    try:
+        ensure_dirs()
+        rotate_logs()
+        record = {"ts": utc_stamp(), "event": event, "th_version": TERMINAL_HANDOFF_VERSION}
+        record.update(fields)
+        line = json.dumps(record, sort_keys=True, default=str) + "\n"
+        fd = os.open(log_path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass  # Logging must never break the status line.
+
+
+# ---------------------------------------------------------------------------
+# Validation of the official status-line JSON
+# ---------------------------------------------------------------------------
+
+
+class Facts(object):
+    """Validated view of one status-line JSON payload."""
+
+    __slots__ = (
+        "ok",
+        "errors",
+        "warnings",
+        "session_id",
+        "session_name",
+        "transcript_path",
+        "cwd",
+        "current_dir",
+        "project_dir",
+        "worktree_path",
+        "worktree_name",
+        "git_worktree",
+        "model_id",
+        "model_display_name",
+        "effort_level",
+        "effort_available",
+        "percent",
+        "percent_valid",
+        "cc_version",
+    )
+
+    def __init__(self):
+        self.ok = False
+        self.errors = []
+        self.warnings = []
+        self.session_id = None
+        self.session_name = None
+        self.transcript_path = None
+        self.cwd = None
+        self.current_dir = None
+        self.project_dir = None
+        self.worktree_path = None
+        self.worktree_name = None
+        self.git_worktree = None
+        self.model_id = None
+        self.model_display_name = None
+        self.effort_level = None
+        self.effort_available = False
+        self.percent = None
+        self.percent_valid = False
+        self.cc_version = None
+
+    def to_dict(self):
+        return dict((k, getattr(self, k)) for k in self.__slots__)
+
+
+def _dget(payload, *keys):
+    node = payload
+    for key in keys:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
+def _safe_path_for_shell(path):
+    if not isinstance(path, str) or path == "":
+        return False
+    if UNSAFE_PATH_RE.search(path):
+        return False
+    return True
+
+
+def validate_transcript(path, session_id):
+    """Validate transcript_path. Returns (ok, errors, warnings)."""
+    errors = []
+    warnings = []
+    if not isinstance(path, str) or path.strip() == "":
+        return False, ["transcript_path missing"], warnings
+    if not os.path.isabs(path):
+        return False, ["transcript_path is not absolute"], warnings
+    if UNSAFE_PATH_RE.search(path):
+        return False, ["transcript_path contains unsafe characters"], warnings
+    normalized = os.path.normpath(path)
+    if ".." in normalized.split(os.sep):
+        return False, ["transcript_path contains traversal segments"], warnings
+    if not os.path.exists(normalized):
+        return False, ["transcript_path does not exist"], warnings
+    real = os.path.realpath(normalized)
+    if not os.path.isfile(real):
+        return False, ["transcript_path is not a regular file"], warnings
+    if not os.access(real, os.R_OK):
+        return False, ["transcript_path is not readable"], warnings
+    try:
+        size = os.path.getsize(real)
+    except OSError:
+        return False, ["transcript_path is not stat-able"], warnings
+    if size <= 0:
+        return False, ["transcript_path is empty"], warnings
+    # Shape check: the transcript must be JSON Lines.
+    try:
+        with open(real, "r", errors="replace") as handle:
+            first = handle.readline(65536).strip()
+    except Exception:
+        return False, ["transcript_path could not be read"], warnings
+    if not first:
+        return False, ["transcript first line is empty"], warnings
+    try:
+        json.loads(first)
+    except ValueError:
+        return False, ["transcript is not JSONL"], warnings
+    # Session correlation, as far as the available schema allows.
+    if session_id and os.path.basename(real) != ("%s.jsonl" % session_id):
+        warnings.append("transcript basename does not match session_id")
+    return True, errors, warnings
+
+
+def extract_facts(payload, validate_files=True):
+    facts = Facts()
+    if not isinstance(payload, dict):
+        facts.errors.append("payload is not a JSON object")
+        return facts
+
+    facts.cc_version = _dget(payload, "version")
+
+    session_id = _dget(payload, "session_id")
+    if isinstance(session_id, str) and SESSION_ID_RE.match(session_id):
+        facts.session_id = session_id
+    else:
+        facts.errors.append("session_id missing or invalid")
+
+    name = _dget(payload, "session_name")
+    if isinstance(name, str) and name.strip():
+        facts.session_name = name.strip()[:120]
+
+    facts.cwd = _dget(payload, "cwd")
+    facts.current_dir = _dget(payload, "workspace", "current_dir") or facts.cwd
+    facts.project_dir = _dget(payload, "workspace", "project_dir") or facts.current_dir
+    facts.git_worktree = _dget(payload, "workspace", "git_worktree")
+    facts.worktree_name = _dget(payload, "worktree", "name") or facts.git_worktree
+    facts.worktree_path = _dget(payload, "worktree", "path")
+
+    if not _safe_path_for_shell(facts.current_dir):
+        facts.errors.append("workspace.current_dir missing or unsafe for launch")
+    elif not (validate_files and os.path.isdir(facts.current_dir)) and validate_files:
+        facts.errors.append("workspace.current_dir is not a directory")
+
+    model_id = _dget(payload, "model", "id")
+    if isinstance(model_id, str) and MODEL_ID_RE.match(model_id):
+        facts.model_id = model_id
+    else:
+        facts.errors.append("model.id missing or invalid")
+    display = _dget(payload, "model", "display_name")
+    facts.model_display_name = display if isinstance(display, str) else None
+
+    # `.effort` is optional: present only when the model supports reasoning
+    # effort. Absent is legitimate; present-but-invalid is a hard failure.
+    effort_node = payload.get("effort")
+    if effort_node is None:
+        facts.effort_available = False
+        facts.effort_level = None
+        facts.warnings.append("effort unavailable: .effort absent from status JSON")
+    elif not isinstance(effort_node, dict):
+        facts.errors.append("effort is not an object")
+    else:
+        level = effort_node.get("level")
+        if isinstance(level, str) and level in ALLOWED_EFFORT_LEVELS:
+            facts.effort_available = True
+            facts.effort_level = level
+        else:
+            facts.errors.append("effort.level invalid: %r" % (level,))
+
+    context = payload.get("context_window")
+    if not isinstance(context, dict):
+        facts.warnings.append("context_window missing")
+    else:
+        used = context.get("used_percentage")
+        if isinstance(used, bool):
+            facts.warnings.append("used_percentage is not numeric")
+        elif isinstance(used, (int, float)):
+            value = float(used)
+            if value != value or value < 0 or value > 100:  # NaN / out of range
+                facts.warnings.append("used_percentage out of range")
+            else:
+                facts.percent = value
+                facts.percent_valid = True
+        elif used is None:
+            facts.warnings.append("used_percentage is null")
+        else:
+            facts.warnings.append("used_percentage is not numeric")
+
+    transcript = _dget(payload, "transcript_path")
+    if validate_files:
+        ok, errs, warns = validate_transcript(transcript, facts.session_id)
+        if ok:
+            facts.transcript_path = os.path.realpath(transcript)
+        else:
+            facts.errors.extend(errs)
+        facts.warnings.extend(warns)
+    else:
+        facts.transcript_path = transcript if isinstance(transcript, str) else None
+
+    facts.ok = not facts.errors
+    return facts
+
+
+# ---------------------------------------------------------------------------
+# Per-session observation state (storm protection: stability requirement)
+# ---------------------------------------------------------------------------
+
+
+def session_state_path(session_id):
+    return th_path("state", "session-%s.json" % session_id)
+
+
+def record_observation(session_id, percent):
+    """Record one non-null percentage observation for THIS session only.
+
+    A successor never inherits the parent's observations because the key is the
+    successor's own, different session_id.
+    """
+    path = session_state_path(session_id)
+    state = read_json(path, {}) or {}
+    state["session_id"] = session_id
+    state["observations"] = int(state.get("observations", 0)) + 1
+    state["last_percent"] = percent
+    state["last_seen"] = utc_stamp()
+    if "first_seen" not in state:
+        state["first_seen"] = state["last_seen"]
+    try:
+        write_json_private(path, state)
+    except Exception:
+        pass
+    return state
+
+
+def observation_count(session_id):
+    state = read_json(session_state_path(session_id), {}) or {}
+    try:
+        return int(state.get("observations", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Cooldown and storm circuit breaker
+# ---------------------------------------------------------------------------
+
+
+def launches_log():
+    return th_path("state", "launches.jsonl")
+
+
+def circuit_file():
+    return th_path("state", "circuit-open.json")
+
+
+def cooldown_file():
+    return th_path("state", "last-launch.json")
+
+
+def storm_settings():
+    return (
+        env_int("CLAUDE_TERMINAL_HANDOFF_STORM_MAX", DEFAULT_STORM_MAX_LAUNCHES),
+        env_int("CLAUDE_TERMINAL_HANDOFF_STORM_WINDOW", DEFAULT_STORM_WINDOW_SECONDS),
+        env_int("CLAUDE_TERMINAL_HANDOFF_COOLDOWN", DEFAULT_COOLDOWN_SECONDS),
+        env_int("CLAUDE_TERMINAL_HANDOFF_CIRCUIT_SECONDS", DEFAULT_CIRCUIT_OPEN_SECONDS),
+    )
+
+
+def storm_reset_file():
+    return th_path("state", "storm-reset.json")
+
+
+def storm_reset_epoch():
+    """Launches at or before this epoch are excluded from the storm window.
+
+    Set by `reset-circuit` so a deliberate manual reset actually permits the
+    next launch instead of instantly re-tripping on already-counted launches.
+    """
+    data = read_json(storm_reset_file())
+    if not isinstance(data, dict):
+        return 0.0
+    try:
+        return float(data.get("epoch", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def recent_launch_times(window_seconds, now=None):
+    now = now if now is not None else time.time()
+    reset_at = storm_reset_epoch()
+    times = []
+    try:
+        with open(launches_log(), "r") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    stamp = float(record.get("epoch", 0))
+                except (ValueError, TypeError):
+                    continue
+                if stamp <= reset_at:
+                    continue
+                if now - stamp <= window_seconds:
+                    times.append(stamp)
+    except IOError:
+        pass
+    return times
+
+
+def circuit_is_open(now=None):
+    now = now if now is not None else time.time()
+    data = read_json(circuit_file())
+    if not isinstance(data, dict):
+        return False, None
+    try:
+        until = float(data.get("until", 0))
+    except (TypeError, ValueError):
+        return False, None
+    if until > now:
+        return True, data
+    return False, data
+
+
+def trip_circuit(reason, count, now=None):
+    now = now if now is not None else time.time()
+    _, _, _, circuit_seconds = storm_settings()
+    payload = {
+        "opened_at": utc_stamp(),
+        "opened_epoch": now,
+        "until": now + circuit_seconds,
+        "until_human": utc_stamp(datetime.fromtimestamp(now + circuit_seconds, timezone.utc)),
+        "reason": reason,
+        "launches_in_window": count,
+        "reset_hint": "rm %s" % circuit_file(),
+    }
+    try:
+        write_json_private(circuit_file(), payload)
+    except Exception:
+        pass
+    log_event("circuit_breaker_open", reason=reason, launches_in_window=count)
+    return payload
+
+
+def cooldown_remaining(now=None):
+    now = now if now is not None else time.time()
+    _, _, cooldown, _ = storm_settings()
+    data = read_json(cooldown_file())
+    if not isinstance(data, dict):
+        return 0
+    try:
+        last = float(data.get("epoch", 0))
+    except (TypeError, ValueError):
+        return 0
+    remaining = cooldown - (now - last)
+    return remaining if remaining > 0 else 0
+
+
+def record_launch(session_id, chain_id, generation, now=None):
+    now = now if now is not None else time.time()
+    ensure_dirs()
+    record = {
+        "epoch": now,
+        "ts": utc_stamp(),
+        "session_id": session_id,
+        "chain_id": chain_id,
+        "generation": generation,
+    }
+    fd = os.open(launches_log(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.write(fd, (json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    write_json_private(cooldown_file(), record)
+
+
+# ---------------------------------------------------------------------------
+# Chain / generation identity
+# ---------------------------------------------------------------------------
+
+
+def chain_identity():
+    """Return (chain_id, generation, parent_manifest_path, parent_session_id).
+
+    A successor learns its chain from environment variables exported by the
+    Terminal Handoff launcher into its Terminal window. An ordinary session
+    starts a new chain at generation 1.
+    """
+    chain = os.environ.get("CLAUDE_TERMINAL_HANDOFF_CHAIN_ID", "").strip()
+    if not CHAIN_ID_RE.match(chain or ""):
+        chain = None
+    generation = env_int("CLAUDE_TERMINAL_HANDOFF_GENERATION", 0)
+    parent_manifest = os.environ.get("CLAUDE_TERMINAL_HANDOFF_MANIFEST", "").strip() or None
+    parent_session = os.environ.get("CLAUDE_TERMINAL_HANDOFF_PARENT_SESSION", "").strip() or None
+    if chain is None:
+        return uuid.uuid4().hex[:12], 1, None, None
+    if generation < 1:
+        generation = 1
+    return chain, generation, parent_manifest, parent_session
+
+
+# ---------------------------------------------------------------------------
+# Decision engine
+# ---------------------------------------------------------------------------
+
+# Decision states, mapped to the status-line badge vocabulary.
+BADGES = {
+    "disabled": "TH disabled",
+    "no_percent": "TH ready",
+    "below": None,  # rendered as "TH nn%"
+    "eligible": "TH ready",
+    "trigger": "TH launching",
+    "handed_off": "TH handed off",
+    "launching": "TH launching",
+    "blocked": "TH blocked",
+    "cooldown": "TH retrying",
+    "circuit_open": "TH circuit open",
+    "unstable": "TH ready",
+    "max_generations": "TH blocked",
+    "invalid": "TH blocked",
+}
+
+
+def decide(payload, validate_files=True, now=None, record=True):
+    """Pure-ish trigger decision. Returns a dict; never raises."""
+    now = now if now is not None else time.time()
+    limit = threshold()
+    result = {
+        "th_version": TERMINAL_HANDOFF_VERSION,
+        "trigger": False,
+        "state": "invalid",
+        "reason": "",
+        "threshold": limit,
+        "percent": None,
+        "session_id": None,
+        "model_id": None,
+        "effort_level": None,
+        "effort_available": False,
+        "errors": [],
+        "warnings": [],
+    }
+
+    if env_flag("CLAUDE_TERMINAL_HANDOFF_DISABLED"):
+        result["state"] = "disabled"
+        result["reason"] = "CLAUDE_TERMINAL_HANDOFF_DISABLED is set"
+        return result
+
+    if payload is None:
+        result["state"] = "invalid"
+        result["reason"] = "malformed or absent status-line JSON"
+        result["errors"] = ["malformed json"]
+        return result
+
+    facts = extract_facts(payload, validate_files=validate_files)
+    result["errors"] = list(facts.errors)
+    result["warnings"] = list(facts.warnings)
+    result["session_id"] = facts.session_id
+    result["model_id"] = facts.model_id
+    result["effort_level"] = facts.effort_level
+    result["effort_available"] = facts.effort_available
+    result["percent"] = facts.percent
+
+    # Gate 1: context percentage must be present, numeric and in range.
+    # Terminal Handoff never triggers on a missing, null or unverified value,
+    # and never reads rate-limit percentages.
+    if not facts.percent_valid:
+        result["state"] = "no_percent"
+        result["reason"] = "context_window.used_percentage unavailable"
+        return result
+
+    # Gate 2: below threshold. Cheap path; record stability observation only.
+    if record and facts.session_id:
+        record_observation(facts.session_id, facts.percent)
+
+    if facts.percent < limit:
+        result["state"] = "below"
+        result["reason"] = "%.2f%% < %.2f%%" % (facts.percent, limit)
+        return result
+
+    # At or above threshold from here.
+    if facts.errors:
+        result["state"] = "blocked"
+        result["reason"] = "validation failed: %s" % "; ".join(facts.errors)
+        return result
+
+    # Gate 3: one trigger per session (atomic marker keyed by session_id).
+    if os.path.exists(th_path("triggered", facts.session_id)):
+        result["state"] = "handed_off"
+        result["reason"] = "this session has already handed off"
+        return result
+
+    # Gate 4: optional generation ceiling.
+    chain_id, generation, parent_manifest, parent_session = chain_identity()
+    result["chain_id"] = chain_id
+    result["generation"] = generation
+    result["parent_manifest"] = parent_manifest
+    result["parent_session_id"] = parent_session
+    ceiling = max_generations()
+    if ceiling is not None and generation >= ceiling:
+        result["state"] = "max_generations"
+        result["reason"] = "generation %d has reached CLAUDE_TERMINAL_HANDOFF_MAX_GENERATIONS=%d" % (
+            generation,
+            ceiling,
+        )
+        return result
+
+    # Gate 5: storm circuit breaker.
+    open_now, circuit = circuit_is_open(now)
+    if open_now:
+        result["state"] = "circuit_open"
+        result["reason"] = "storm circuit breaker is open until %s" % (circuit or {}).get(
+            "until_human", "?"
+        )
+        return result
+
+    storm_max, storm_window, _, _ = storm_settings()
+    recent = recent_launch_times(storm_window, now)
+    if len(recent) >= storm_max:
+        trip_circuit("%d launches within %ds" % (len(recent), storm_window), len(recent), now)
+        result["state"] = "circuit_open"
+        result["reason"] = "storm circuit breaker tripped (%d launches in %ds)" % (
+            len(recent),
+            storm_window,
+        )
+        return result
+
+    # Gate 6: launch cooldown.
+    remaining = cooldown_remaining(now)
+    if remaining > 0:
+        result["state"] = "cooldown"
+        result["reason"] = "cooldown active, %.0fs remaining" % remaining
+        return result
+
+    # Gate 7: stability. The session must have produced at least N of its own
+    # non-null percentage observations. A brand-new successor cannot trigger on
+    # a stale or inherited reading.
+    minimum = env_int("CLAUDE_TERMINAL_HANDOFF_MIN_OBSERVATIONS", DEFAULT_MIN_OBSERVATIONS)
+    seen = observation_count(facts.session_id) if record else minimum
+    if seen < minimum:
+        result["state"] = "unstable"
+        result["reason"] = "only %d/%d stable observations for this session" % (seen, minimum)
+        return result
+
+    result["trigger"] = True
+    result["state"] = "trigger"
+    result["reason"] = "%.2f%% >= %.2f%%" % (facts.percent, limit)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Git and repository capture (trigger path only, never the status-line path)
+# ---------------------------------------------------------------------------
+
+
+def run_git(repo, args, timeout=GIT_TIMEOUT):
+    try:
+        proc = subprocess.Popen(
+            ["/usr/bin/git"] + args,
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
+        out, _ = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            return None
+        return out.decode("utf-8", "replace").strip()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return None
+
+
+def capture_repo_state(directory):
+    state = {
+        "is_git_repository": False,
+        "repo_root": None,
+        "branch": None,
+        "head_sha": None,
+        "origin_main_ref": None,
+        "origin_main_sha": None,
+        "ahead": None,
+        "behind": None,
+        "status_porcelain_count": 0,
+        "staged_files": [],
+        "modified_tracked_files": [],
+        "untracked_files": [],
+        "recent_commits": [],
+        "merge_in_progress": False,
+        "rebase_in_progress": False,
+        "cherry_pick_in_progress": False,
+        "revert_in_progress": False,
+        "bisect_in_progress": False,
+        "is_linked_worktree": False,
+        "worktree_path": None,
+    }
+    if not directory or not os.path.isdir(directory):
+        state["note"] = "directory does not exist"
+        return state
+
+    root = run_git(directory, ["rev-parse", "--show-toplevel"])
+    if not root:
+        state["note"] = "not a git repository"
+        return state
+
+    state["is_git_repository"] = True
+    state["repo_root"] = root
+    state["branch"] = run_git(directory, ["rev-parse", "--abbrev-ref", "HEAD"])
+    state["head_sha"] = run_git(directory, ["rev-parse", "HEAD"])
+
+    for ref in ("origin/main", "origin/master"):
+        sha = run_git(directory, ["rev-parse", "--verify", "--quiet", ref])
+        if sha:
+            state["origin_main_ref"] = ref
+            state["origin_main_sha"] = sha
+            break
+
+    if state["origin_main_ref"]:
+        counts = run_git(
+            directory, ["rev-list", "--left-right", "--count", "HEAD...%s" % state["origin_main_ref"]]
+        )
+        if counts:
+            parts = counts.split()
+            if len(parts) == 2:
+                try:
+                    state["ahead"] = int(parts[0])
+                    state["behind"] = int(parts[1])
+                except ValueError:
+                    pass
+
+    porcelain = run_git(directory, ["status", "--porcelain=v1"])
+    if porcelain is not None:
+        lines = [line for line in porcelain.splitlines() if line.strip()]
+        state["status_porcelain_count"] = len(lines)
+
+    def name_list(args, cap=200):
+        out = run_git(directory, args)
+        if not out:
+            return []
+        names = [line for line in out.splitlines() if line.strip()]
+        if len(names) > cap:
+            return names[:cap] + ["<%d more omitted>" % (len(names) - cap)]
+        return names
+
+    state["staged_files"] = name_list(["diff", "--cached", "--name-only"])
+    state["modified_tracked_files"] = name_list(["diff", "--name-only"])
+    state["untracked_files"] = name_list(["ls-files", "--others", "--exclude-standard"])
+
+    commits = run_git(directory, ["log", "-10", "--date=iso-strict", "--pretty=%h|%ad|%an|%s"])
+    if commits:
+        for line in commits.splitlines():
+            parts = line.split("|", 3)
+            if len(parts) == 4:
+                state["recent_commits"].append(
+                    {"sha": parts[0], "date": parts[1], "author": parts[2], "subject": parts[3][:200]}
+                )
+
+    git_dir = run_git(directory, ["rev-parse", "--absolute-git-dir"])
+    common_dir = run_git(directory, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if git_dir:
+        state["merge_in_progress"] = os.path.exists(os.path.join(git_dir, "MERGE_HEAD"))
+        state["rebase_in_progress"] = os.path.exists(
+            os.path.join(git_dir, "rebase-merge")
+        ) or os.path.exists(os.path.join(git_dir, "rebase-apply"))
+        state["cherry_pick_in_progress"] = os.path.exists(os.path.join(git_dir, "CHERRY_PICK_HEAD"))
+        state["revert_in_progress"] = os.path.exists(os.path.join(git_dir, "REVERT_HEAD"))
+        state["bisect_in_progress"] = os.path.exists(os.path.join(git_dir, "BISECT_LOG"))
+        if common_dir and os.path.normpath(common_dir) != os.path.normpath(git_dir):
+            state["is_linked_worktree"] = True
+            state["worktree_path"] = root
+    return state
+
+
+def applicable_claude_md(current_dir, project_dir):
+    paths = []
+    seen = set()
+    home = os.path.expanduser("~")
+    for candidate in (os.path.join(home, ".claude", "CLAUDE.md"),):
+        if os.path.isfile(candidate) and candidate not in seen:
+            paths.append(candidate)
+            seen.add(candidate)
+    walk_from = current_dir if current_dir and os.path.isdir(current_dir) else None
+    if walk_from:
+        node = os.path.abspath(walk_from)
+        while True:
+            for name in ("CLAUDE.md", "CLAUDE.local.md"):
+                candidate = os.path.join(node, name)
+                if os.path.isfile(candidate) and candidate not in seen:
+                    paths.append(candidate)
+                    seen.add(candidate)
+            parent = os.path.dirname(node)
+            if parent == node or node == home:
+                break
+            node = parent
+    if project_dir and os.path.isdir(project_dir):
+        candidate = os.path.join(project_dir, "CLAUDE.md")
+        if os.path.isfile(candidate) and candidate not in seen:
+            paths.append(candidate)
+            seen.add(candidate)
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# Manifest
+# ---------------------------------------------------------------------------
+
+
+def manifest_path(session_id):
+    return th_path("handoffs", "%s.json" % session_id)
+
+
+def build_manifest(facts, decision, now=None):
+    now = now if now is not None else time.time()
+    chain_id = decision.get("chain_id") or uuid.uuid4().hex[:12]
+    generation = decision.get("generation") or 1
+    repo = capture_repo_state(facts.current_dir)
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "terminal_handoff_version": TERMINAL_HANDOFF_VERSION,
+        "system": "Terminal Handoff",
+        "chain_id": chain_id,
+        "generation": generation,
+        "parent_handoff_manifest": decision.get("parent_manifest"),
+        "parent_of_outgoing_session_id": decision.get("parent_session_id"),
+        "outgoing": {
+            "session_id": facts.session_id,
+            "session_name": facts.session_name,
+            "transcript_path": facts.transcript_path,
+            "cwd": facts.cwd,
+            "current_dir": facts.current_dir,
+            "project_dir": facts.project_dir,
+            "worktree_path": facts.worktree_path or repo.get("worktree_path"),
+            "worktree_name": facts.worktree_name,
+            "claude_code_version": facts.cc_version,
+        },
+        "model": {
+            "id": facts.model_id,
+            "display_name": facts.model_display_name,
+        },
+        "effort": {
+            "level": facts.effort_level,
+            "available": facts.effort_available,
+            "ultracode": "undetectable",
+            "note": (
+                "Claude Code's status-line JSON never reports ultracode; "
+                "`--effort ultracode` resolves to xhigh plus a hidden flag. "
+                "Terminal Handoff preserves the reported level only."
+            ),
+        },
+        "trigger": {
+            "context_used_percentage": facts.percent,
+            "configured_threshold": decision.get("threshold"),
+            "timestamp_utc": utc_stamp(),
+            "timestamp_local": local_stamp(),
+            "epoch": now,
+            "reason": decision.get("reason"),
+        },
+        "repository": repo,
+        "claude_md_paths": applicable_claude_md(facts.current_dir, facts.project_dir),
+        "successor": {
+            "launch_state": "eligible",
+            "session_id": None,
+            "first_heartbeat_utc": None,
+            "confirmed_utc": None,
+            "expected_model_id": facts.model_id,
+            "expected_effort_level": facts.effort_level,
+            "expected_current_dir": facts.current_dir,
+            "generation": generation + 1,
+        },
+        "validation_warnings": list(facts.warnings) + list(decision.get("warnings") or []),
+        "security": {
+            "stores_secrets": False,
+            "stores_transcript_contents": False,
+            "stores_environment_dump": False,
+            "file_mode": "0600",
+        },
+    }
+    return manifest
+
+
+def update_manifest(path, mutator):
+    """Read-modify-write a manifest under an exclusive lock."""
+    ensure_dirs()
+    lock_path = path + ".lock"
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = read_json(path)
+        if not isinstance(data, dict):
+            return None
+        mutator(data)
+        write_json_private(path, data)
+        return data
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Launch command construction
+# ---------------------------------------------------------------------------
+
+
+def find_claude_executable():
+    explicit = os.environ.get("CLAUDE_TERMINAL_HANDOFF_CLAUDE_BIN", "").strip()
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend(
+        [
+            os.path.join(os.path.expanduser("~"), ".local", "bin", "claude"),
+            "/usr/local/bin/claude",
+            "/opt/homebrew/bin/claude",
+        ]
+    )
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    # Last resort: PATH lookup without a shell.
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(directory, "claude")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def successor_session_name(chain_id, generation):
+    return "terminal-handoff-%s-g%d" % (chain_id[:8], generation)
+
+
+def build_launch_argv(manifest, claude_bin, prompt_text):
+    """Construct the successor launch argv.
+
+    Never includes --continue, --resume, -c, -r, --fork-session or any
+    permission bypass. The model ID and effort level are passed as separate
+    argv elements, never as shell text.
+    """
+    model_id = (manifest.get("model") or {}).get("id")
+    effort = (manifest.get("effort") or {}).get("level")
+    effort_available = bool((manifest.get("effort") or {}).get("available"))
+    chain_id = manifest.get("chain_id")
+    generation = int(manifest.get("generation") or 1)
+
+    if not isinstance(model_id, str) or not MODEL_ID_RE.match(model_id):
+        raise ValueError("refusing to launch: model id is missing or unsafe")
+
+    argv = [claude_bin, "--model", model_id]
+
+    if effort_available:
+        if effort not in ALLOWED_EFFORT_LEVELS:
+            raise ValueError("refusing to launch: effort %r is not an allowed level" % (effort,))
+        argv += ["--effort", effort]
+    # else: effort proven unavailable -> --effort omitted, recorded in manifest.
+
+    argv += ["--name", successor_session_name(chain_id, generation + 1)]
+    argv += [prompt_text]
+    return argv
+
+
+FORBIDDEN_LAUNCH_TOKENS = (
+    "--continue",
+    "-c",
+    "--resume",
+    "-r",
+    "--fork-session",
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--permission-mode",
+    "--fallback-model",
+)
+
+
+def assert_launch_argv_safe(argv):
+    """Defence in depth: verify the constructed argv contains nothing banned."""
+    problems = []
+    for token in FORBIDDEN_LAUNCH_TOKENS:
+        if token in argv[:-1]:  # the final element is the prompt text
+            problems.append("forbidden flag present: %s" % token)
+    if "--model" not in argv:
+        problems.append("missing --model")
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# Successor prompt rendering
+# ---------------------------------------------------------------------------
+
+
+def successor_prompt_template_path():
+    """Locate the successor prompt template.
+
+    Checked in order: beside this module (the installed layout), then the
+    packaged `templates/` directory (the development layout), then the state
+    home. The template ships with the code, never with runtime state.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (
+        os.path.join(here, "successor-prompt.md"),
+        os.path.join(here, "templates", "successor-prompt.md"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return th_path("successor-prompt.md")
+
+
+def render_successor_prompt(manifest, template_path=None):
+    template_path = template_path or successor_prompt_template_path()
+    try:
+        with open(template_path, "r") as handle:
+            template = handle.read()
+    except IOError:
+        template = FALLBACK_PROMPT_TEMPLATE
+    effort = manifest.get("effort") or {}
+    effort_display = effort.get("level") if effort.get("available") else "unavailable (not exposed by this model/version)"
+    values = {
+        "{{GENERATION}}": str(int(manifest.get("generation") or 1) + 1),
+        "{{CHAIN_ID}}": str(manifest.get("chain_id")),
+        "{{PARENT_SESSION_ID}}": str((manifest.get("outgoing") or {}).get("session_id")),
+        "{{PARENT_GENERATION}}": str(manifest.get("generation")),
+        "{{HANDOFF_MANIFEST_PATH}}": manifest_path((manifest.get("outgoing") or {}).get("session_id")),
+        "{{MODEL_ID}}": str((manifest.get("model") or {}).get("id")),
+        "{{MODEL_DISPLAY_NAME}}": str((manifest.get("model") or {}).get("display_name")),
+        "{{EFFORT_LEVEL}}": str(effort_display),
+        "{{TRANSCRIPT_PATH}}": str((manifest.get("outgoing") or {}).get("transcript_path")),
+        "{{WORKING_DIRECTORY}}": str((manifest.get("outgoing") or {}).get("current_dir")),
+        "{{THRESHOLD}}": str(manifest.get("trigger", {}).get("configured_threshold")),
+        "{{TH_VERSION}}": TERMINAL_HANDOFF_VERSION,
+    }
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace(key, value)
+    return rendered
+
+
+FALLBACK_PROMPT_TEMPLATE = """TERMINAL HANDOFF SUCCESSOR
+
+You are generation {{GENERATION}} of Terminal Handoff chain {{CHAIN_ID}}.
+Parent session: {{PARENT_SESSION_ID}}
+Handoff manifest: {{HANDOFF_MANIFEST_PATH}}
+Required model: {{MODEL_ID}}
+Required effort: {{EFFORT_LEVEL}}
+
+Read the manifest, delegate parent-transcript analysis to a context-isolated
+subagent, verify repository state independently, then produce a TERMINAL HANDOFF
+CONTINUATION REPORT before continuing any work.
+"""
+
+
+def bootstrap_prompt(manifest, prompt_file):
+    """Short argv-safe prompt. The full instructions live in `prompt_file`,
+    which keeps them out of the process listing."""
+    return (
+        "TERMINAL HANDOFF SUCCESSOR - chain %s, generation %d. "
+        "Read the file %s and follow it exactly, in full, before doing anything else. "
+        "Your handoff manifest is %s."
+        % (
+            manifest.get("chain_id"),
+            int(manifest.get("generation") or 1) + 1,
+            prompt_file,
+            manifest_path((manifest.get("outgoing") or {}).get("session_id")),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Terminal launch (osascript)
+# ---------------------------------------------------------------------------
+
+
+def applescript_quote(value):
+    """Quote a value for embedding in an AppleScript string literal."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def build_launch_script(manifest, argv, workdir, manifest_file):
+    """Generate the per-handoff shell script executed in the new Terminal window.
+
+    Every value is single-quoted with shlex.quote. No eval, no interpolation of
+    transcript content, no clipboard use.
+    """
+    lines = [
+        "#!/bin/zsh",
+        "# Terminal Handoff " + TERMINAL_HANDOFF_VERSION + " - successor launcher",
+        "# Generated %s for chain %s generation %d"
+        % (utc_stamp(), manifest.get("chain_id"), int(manifest.get("generation") or 1) + 1),
+        "set -e",
+        "cd -- %s || { echo 'Terminal Handoff: working directory unavailable'; exit 1; }" % shlex.quote(workdir),
+        "export CLAUDE_TERMINAL_HANDOFF_MANIFEST=%s" % shlex.quote(manifest_file),
+        "export CLAUDE_TERMINAL_HANDOFF_CHAIN_ID=%s" % shlex.quote(str(manifest.get("chain_id"))),
+        "export CLAUDE_TERMINAL_HANDOFF_GENERATION=%s"
+        % shlex.quote(str(int(manifest.get("generation") or 1) + 1)),
+        "export CLAUDE_TERMINAL_HANDOFF_PARENT_SESSION=%s"
+        % shlex.quote(str((manifest.get("outgoing") or {}).get("session_id"))),
+        "echo 'Terminal Handoff: generation %d of chain %s'"
+        % (int(manifest.get("generation") or 1) + 1, manifest.get("chain_id")),
+        "exec " + " ".join(shlex.quote(part) for part in argv),
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def launch_terminal(manifest, script_file, title, test_mode):
+    """Open one macOS Terminal window running `script_file`."""
+    command = "/bin/zsh -l %s" % shlex.quote(script_file)
+    applescript = "\n".join(
+        [
+            'tell application "Terminal"',
+            "    activate",
+            "    do script " + applescript_quote(command),
+            "    try",
+            "        set custom title of front window to " + applescript_quote(title),
+            "    end try",
+            "end tell",
+        ]
+    )
+    if test_mode:
+        return {
+            "launched": False,
+            "test_mode": True,
+            "applescript": applescript,
+            "command": command,
+        }
+    try:
+        proc = subprocess.Popen(
+            ["/usr/bin/osascript", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out, err = proc.communicate(applescript.encode("utf-8"), timeout=45)
+        return {
+            "launched": proc.returncode == 0,
+            "test_mode": False,
+            "returncode": proc.returncode,
+            "stdout": out.decode("utf-8", "replace").strip()[:500],
+            "stderr": err.decode("utf-8", "replace").strip()[:500],
+            "command": command,
+        }
+    except Exception as exc:
+        return {"launched": False, "test_mode": False, "error": str(exc)[:500], "command": command}
+
+
+# ---------------------------------------------------------------------------
+# Trigger claim and launch pipeline
+# ---------------------------------------------------------------------------
+
+
+def claim_trigger(session_id):
+    """Atomically claim the one-shot trigger for this session.
+
+    Uses O_CREAT|O_EXCL so concurrent status-line processes produce exactly one
+    launch. Keyed by session_id, never by PID, cwd or generation, so a successor
+    never inherits its parent's claim.
+    """
+    ensure_dirs()
+    path = th_path("triggered", session_id)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            return False
+        raise
+    try:
+        os.write(
+            fd,
+            json.dumps({"claimed_utc": utc_stamp(), "pid": os.getpid()}, sort_keys=True).encode(
+                "utf-8"
+            ),
+        )
+    finally:
+        os.close(fd)
+    return True
+
+
+def set_state(session_id, state, **extra):
+    """Record the handoff lifecycle state: eligible -> launching -> launched ->
+    successor_started -> completed (or failed)."""
+    ensure_dirs()
+    record = {"session_id": session_id, "state": state, "ts": utc_stamp()}
+    record.update(extra)
+    directory = {
+        "launching": "launching",
+        "launched": "launching",
+        "successor_started": "launching",
+        "completed": "completed",
+        "failed": "failed",
+    }.get(state, "launching")
+    write_json_private(th_path(directory, "%s.json" % session_id), record)
+    if state in ("completed", "failed"):
+        stale = th_path("launching", "%s.json" % session_id)
+        if os.path.exists(stale):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+    return record
+
+
+MAX_LAUNCH_RETRIES = 2
+
+
+def fail_launch(session_id, reason, detail=None, allow_retry=True, manifest_file=None, state=None):
+    """Record a failed launch, retain diagnostics, and permit a bounded retry.
+
+    Never marks the handoff completed. Releases the one-shot trigger claim only
+    while the retry budget lasts, and applies the launch cooldown so a failing
+    session cannot spin.
+    """
+    if manifest_file and os.path.isfile(manifest_file):
+        update_manifest(
+            manifest_file,
+            lambda m: m.setdefault("successor", {}).update(
+                {"launch_state": state or "failed", "failure_reason": reason}
+            ),
+        )
+    set_state(session_id, "failed", reason=reason, detail=(str(detail)[:300] if detail else None))
+
+    retry_path = th_path("failed", "%s.retries" % session_id)
+    try:
+        with open(retry_path, "r") as handle:
+            retries = int((handle.read() or "0").strip() or "0")
+    except Exception:
+        retries = 0
+
+    released = False
+    if allow_retry and retries < MAX_LAUNCH_RETRIES:
+        write_private(retry_path, str(retries + 1))
+        try:
+            os.unlink(th_path("triggered", session_id))
+            released = True
+        except OSError:
+            released = False
+        # Apply the cooldown between retries so failures cannot spin.
+        try:
+            write_json_private(
+                cooldown_file(),
+                {"epoch": time.time(), "ts": utc_stamp(), "session_id": session_id, "failed": True},
+            )
+        except Exception:
+            pass
+    log_event(
+        "launch_failed",
+        session_id=session_id,
+        reason=reason,
+        detail=(str(detail)[:300] if detail else None),
+        retries=retries + (1 if released else 0),
+        retry_released=released,
+        retry_exhausted=(not released and allow_retry),
+    )
+    return released
+
+
+def perform_launch(payload_file):
+    """Detached child process: build manifest, render prompt, open Terminal.
+
+    Runs independently of the short-lived status-line process.
+    """
+    ensure_dirs()
+    # Test hook: proves the detached launcher outlives the short-lived
+    # status-line process. Never set in normal operation.
+    delay = env_float("CLAUDE_TERMINAL_HANDOFF_LAUNCH_DELAY", 0.0)
+    if delay > 0:
+        time.sleep(min(delay, 30.0))
+    payload = read_json(payload_file)
+    if payload is None:
+        log_event("launch_abort", reason="payload unreadable", payload_file=payload_file)
+        return 2
+
+    facts = extract_facts(payload, validate_files=True)
+    if not facts.ok:
+        log_event("launch_abort", reason="validation failed", errors=facts.errors)
+        return 3
+
+    decision = decide(payload, validate_files=True, record=False)
+    session_id = facts.session_id
+    chain_id, generation, parent_manifest, parent_session = chain_identity()
+    decision["chain_id"] = chain_id
+    decision["generation"] = generation
+    decision["parent_manifest"] = parent_manifest
+    decision["parent_session_id"] = parent_session
+
+    test_mode = env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE")
+    set_state(session_id, "launching", chain_id=chain_id, generation=generation)
+    log_event(
+        "launch_begin",
+        session_id=session_id,
+        chain_id=chain_id,
+        generation=generation,
+        percent=facts.percent,
+        model_id=facts.model_id,
+        effort_level=facts.effort_level,
+        effort_available=facts.effort_available,
+        test_mode=test_mode,
+    )
+
+    manifest = build_manifest(facts, decision)
+    mpath = manifest_path(session_id)
+    write_json_private(mpath, manifest)
+
+    # Re-check storm protection immediately before the real launch.
+    storm_max, storm_window, _, _ = storm_settings()
+    open_now, circuit = circuit_is_open()
+    recent = recent_launch_times(storm_window)
+    if open_now or len(recent) >= storm_max:
+        if not open_now:
+            trip_circuit("%d launches within %ds" % (len(recent), storm_window), len(recent))
+        fail_launch(
+            session_id,
+            "storm circuit breaker open",
+            manifest_file=mpath,
+            state="blocked_circuit_open",
+        )
+        return 4
+
+    claude_bin = find_claude_executable()
+    if not claude_bin:
+        fail_launch(
+            session_id,
+            "claude executable not found",
+            manifest_file=mpath,
+            state="failed_no_claude",
+        )
+        return 5
+
+    workdir = facts.current_dir
+    if not workdir or not os.path.isdir(workdir) or not _safe_path_for_shell(workdir):
+        fail_launch(
+            session_id,
+            "working directory invalid or unsafe",
+            detail=workdir,
+            manifest_file=mpath,
+            state="failed_bad_workdir",
+        )
+        return 6
+
+    prompt_file = th_path("prompts", "successor-%s.md" % session_id)
+    try:
+        write_private(prompt_file, render_successor_prompt(manifest))
+    except Exception as exc:
+        fail_launch(session_id, "prompt render failed", detail=exc, manifest_file=mpath)
+        return 7
+
+    try:
+        argv = build_launch_argv(manifest, claude_bin, bootstrap_prompt(manifest, prompt_file))
+    except ValueError as exc:
+        # The reported model or effort cannot be launched. Never fall back to a
+        # different model or effort: fail visibly and allow a controlled retry.
+        fail_launch(
+            session_id,
+            "model or effort could not be preserved: %s" % exc,
+            manifest_file=mpath,
+            state="failed_unpreservable",
+        )
+        return 8
+
+    problems = assert_launch_argv_safe(argv)
+    if problems:
+        fail_launch(session_id, "unsafe launch argv: %s" % "; ".join(problems), manifest_file=mpath)
+        return 9
+
+    script_file = th_path("launching", "%s.launch.sh" % session_id)
+    write_private(script_file, build_launch_script(manifest, argv, workdir, mpath), mode=0o700)
+
+    title = "Terminal Handoff, Generation %d" % (generation + 1)
+    record_launch(session_id, chain_id, generation)
+    result = launch_terminal(manifest, script_file, title, test_mode)
+
+    launch_record = {
+        "session_id": session_id,
+        "chain_id": chain_id,
+        "generation": generation,
+        "successor_generation": generation + 1,
+        "argv": argv,
+        "argv_redacted_prompt": argv[:-1] + ["<bootstrap prompt in %s>" % prompt_file],
+        "script_file": script_file,
+        "prompt_file": prompt_file,
+        "manifest": mpath,
+        "title": title,
+        "test_mode": test_mode,
+        "result": dict((k, v) for k, v in result.items() if k != "applescript"),
+        "applescript": result.get("applescript"),
+        "ts": utc_stamp(),
+    }
+    write_json_private(th_path("completed", "%s.launch.json" % session_id), launch_record)
+
+    if test_mode:
+        update_manifest(
+            mpath, lambda m: m["successor"].update({"launch_state": "simulated_test_mode"})
+        )
+        set_state(session_id, "completed", reason="test mode: launch simulated", test_mode=True)
+        log_event(
+            "launch_simulated",
+            session_id=session_id,
+            chain_id=chain_id,
+            generation=generation,
+            argv=launch_record["argv_redacted_prompt"],
+        )
+        return 0
+
+    if result.get("launched"):
+        update_manifest(mpath, lambda m: m["successor"].update({"launch_state": "launched"}))
+        set_state(session_id, "launched", reason="Terminal window opened; awaiting successor heartbeat")
+        log_event(
+            "launch_confirmed",
+            session_id=session_id,
+            chain_id=chain_id,
+            generation=generation,
+            model_id=facts.model_id,
+            effort_level=facts.effort_level,
+        )
+        return 0
+
+    fail_launch(
+        session_id,
+        "osascript could not open the Terminal window",
+        detail=result.get("stderr") or result.get("error"),
+        manifest_file=mpath,
+    )
+    return 10
+
+
+def spawn_launcher(payload):
+    """Write the payload securely and spawn the detached launch process."""
+    ensure_dirs()
+    session_id = _dget(payload, "session_id") or uuid.uuid4().hex
+    payload_file = th_path("launching", "%s.payload.json" % session_id)
+    write_json_private(payload_file, payload)
+    self_path = os.path.abspath(__file__)
+    try:
+        devnull = open(os.devnull, "wb")
+        subprocess.Popen(
+            [preferred_python(), self_path, "launch", "--payload", payload_file],
+            stdin=subprocess.DEVNULL,
+            stdout=devnull,
+            stderr=devnull,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return True
+    except Exception as exc:
+        log_event("spawn_failed", session_id=session_id, error=str(exc)[:300])
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Successor heartbeat
+# ---------------------------------------------------------------------------
+
+
+def successor_heartbeat(facts):
+    """If this session is a Terminal Handoff successor, prove it to the parent.
+
+    A launch is only marked `completed` once the successor reports its own,
+    different session ID together with its own live context percentage.
+    """
+    parent_manifest = os.environ.get("CLAUDE_TERMINAL_HANDOFF_MANIFEST", "").strip()
+    if not parent_manifest or not facts.session_id:
+        return None
+    if not os.path.isfile(parent_manifest):
+        return None
+
+    marker = th_path("state", "heartbeat-%s.json" % facts.session_id)
+    existing = read_json(marker, {}) or {}
+    beats = int(existing.get("beats", 0)) + 1
+    if beats > 3:
+        return existing.get("state")
+
+    data = read_json(parent_manifest, {}) or {}
+    parent_session = (data.get("outgoing") or {}).get("session_id")
+    if parent_session and parent_session == facts.session_id:
+        # Refuse to treat a session as its own successor.
+        log_event("heartbeat_rejected", session_id=facts.session_id, reason="parent==successor")
+        return None
+
+    state = "successor_started"
+    if beats >= 2 and facts.percent_valid:
+        state = "completed"
+
+    def mutate(manifest):
+        successor = manifest.setdefault("successor", {})
+        successor["session_id"] = facts.session_id
+        successor["launch_state"] = state
+        successor["observed_model_id"] = facts.model_id
+        successor["observed_effort_level"] = facts.effort_level
+        successor["observed_current_dir"] = facts.current_dir
+        successor["observed_context_percentage"] = facts.percent
+        successor["model_matches"] = facts.model_id == (manifest.get("model") or {}).get("id")
+        expected_effort = (manifest.get("effort") or {}).get("level")
+        successor["effort_matches"] = facts.effort_level == expected_effort
+        successor["cwd_matches"] = facts.current_dir == (manifest.get("successor") or {}).get(
+            "expected_current_dir"
+        )
+        successor["session_id_is_fresh"] = facts.session_id != parent_session
+        if not successor.get("first_heartbeat_utc"):
+            successor["first_heartbeat_utc"] = utc_stamp()
+        if state == "completed":
+            successor["confirmed_utc"] = utc_stamp()
+
+    update_manifest(parent_manifest, mutate)
+    write_json_private(
+        marker,
+        {
+            "session_id": facts.session_id,
+            "parent_manifest": parent_manifest,
+            "beats": beats,
+            "state": state,
+            "ts": utc_stamp(),
+        },
+    )
+    if parent_session:
+        set_state(parent_session, state, successor_session_id=facts.session_id)
+    log_event(
+        "successor_heartbeat",
+        session_id=facts.session_id,
+        parent_session_id=parent_session,
+        state=state,
+        beats=beats,
+        model_id=facts.model_id,
+        effort_level=facts.effort_level,
+    )
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Status line rendering
+# ---------------------------------------------------------------------------
+
+
+def run_wrapped_statusline(command, raw_input_bytes):
+    """Run a pre-existing status-line command, feeding it the identical JSON.
+
+    `command` comes from the Claude settings file that already configured it;
+    it is executed exactly as Claude Code itself would, via `/bin/sh -c`, with
+    the same stdin bytes. Its stdout is preserved byte-for-byte.
+    """
+    if not command:
+        return b""
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", command],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        out, _ = proc.communicate(raw_input_bytes, timeout=WRAPPED_STATUSLINE_TIMEOUT)
+        return out
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return b""
+
+
+def badge_for(decision):
+    state = decision.get("state")
+    if state == "below":
+        percent = decision.get("percent")
+        if percent is None:
+            return "TH ready"
+        return "TH %d%%" % int(percent)
+    return BADGES.get(state, "TH blocked")
+
+
+def render_default_statusline(payload, decision):
+    parts = []
+    model = _dget(payload, "model", "display_name") or _dget(payload, "model", "id")
+    if model:
+        parts.append(str(model))
+    effort = _dget(payload, "effort", "level")
+    if effort:
+        parts.append(str(effort))
+    percent = decision.get("percent")
+    if percent is not None:
+        parts.append("ctx %d%%" % int(percent))
+    else:
+        parts.append("ctx --")
+    directory = _dget(payload, "workspace", "current_dir")
+    if directory:
+        parts.append(os.path.basename(directory.rstrip("/")) or directory)
+    return " · ".join(parts)
+
+
+def cmd_statusline(args):
+    """Status-line entry point. Must never raise and must return promptly."""
+    raw = b""
+    try:
+        raw = sys.stdin.buffer.read()
+    except Exception:
+        raw = b""
+
+    wrapped_output = b""
+    if args.wrap:
+        wrapped_output = run_wrapped_statusline(args.wrap, raw)
+
+    payload = None
+    try:
+        text = raw.decode("utf-8", "replace").strip()
+        if text:
+            payload = json.loads(text)
+        if not isinstance(payload, dict):
+            payload = None
+    except Exception:
+        payload = None
+
+    decision = {"state": "invalid", "percent": None}
+    try:
+        ensure_dirs()
+        decision = decide(payload, validate_files=True)
+        facts = extract_facts(payload, validate_files=True) if payload else None
+        if facts is not None:
+            try:
+                successor_heartbeat(facts)
+            except Exception:
+                pass
+        if decision.get("trigger"):
+            session_id = decision.get("session_id")
+            if session_id and claim_trigger(session_id):
+                log_event(
+                    "trigger_claimed",
+                    session_id=session_id,
+                    percent=decision.get("percent"),
+                    threshold=decision.get("threshold"),
+                    chain_id=decision.get("chain_id"),
+                    generation=decision.get("generation"),
+                    model_id=decision.get("model_id"),
+                    effort_level=decision.get("effort_level"),
+                )
+                spawn_launcher(payload)
+                decision["state"] = "launching"
+            else:
+                decision["state"] = "handed_off"
+        elif decision.get("state") == "blocked":
+            log_event(
+                "blocked",
+                session_id=decision.get("session_id"),
+                reason=decision.get("reason"),
+                percent=decision.get("percent"),
+            )
+    except Exception as exc:
+        log_event("statusline_error", error=str(exc)[:300])
+        decision = {"state": "blocked", "percent": None}
+
+    badge = badge_for(decision)
+    if payload is not None and not args.wrap:
+        line = render_default_statusline(payload, decision) + " · " + badge
+        sys.stdout.write(line)
+    elif args.wrap:
+        prefix = wrapped_output.rstrip(b"\r\n")
+        sys.stdout.buffer.write(prefix)
+        if prefix:
+            sys.stdout.buffer.write(b" ")
+        sys.stdout.buffer.write(("· " + badge).encode("utf-8"))
+        sys.stdout.buffer.flush()
+    else:
+        sys.stdout.write(badge)
+    sys.stdout.write("\n")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Settings installation / uninstallation
+# ---------------------------------------------------------------------------
+
+
+def registry_path():
+    return th_path("state", "installed.json")
+
+
+def load_registry():
+    return read_json(registry_path(), {"targets": {}, "claude_md": None}) or {
+        "targets": {},
+        "claude_md": None,
+    }
+
+
+def save_registry(registry):
+    # sort_keys=False preserves the exact key order of any original statusLine
+    # object so an uninstall restores it byte-for-byte.
+    write_json_private(registry_path(), registry, sort_keys=False)
+
+
+def backup_file(path, tag):
+    """Timestamped private backup. The path digest keeps same-named settings
+    files (several projects all have `settings.json`) from colliding."""
+    ensure_dirs()
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as handle:
+        data = handle.read()
+    digest = hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()[:8]
+    stamp = file_stamp()
+    base = "%s.%s.%s.%s" % (os.path.basename(path), tag, stamp, digest)
+    for attempt in range(100):
+        suffix = "" if attempt == 0 else ".%d" % attempt
+        destination = th_path("backups", base + suffix + ".bak")
+        try:
+            fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                continue
+            raise
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        write_private(
+            destination + ".source",
+            json.dumps({"source": os.path.abspath(path), "tag": tag, "utc": utc_stamp()}, indent=2)
+            + "\n",
+        )
+        return destination
+    raise RuntimeError("could not create a unique backup for %s" % path)
+
+
+def preferred_python():
+    """Pin the stable system interpreter.
+
+    sys.executable resolves to /Library/Developer/CommandLineTools/... under the
+    /usr/bin/python3 shim; that path can disappear on an Xcode update and would
+    silently break the status line in every session.
+    """
+    for candidate in ("/usr/bin/python3", sys.executable):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return sys.executable
+
+
+def th_statusline_command(wrap=None):
+    self_path = os.path.abspath(__file__)
+    command = "%s %s statusline" % (shlex.quote(preferred_python()), shlex.quote(self_path))
+    if wrap:
+        command += " --wrap %s" % shlex.quote(wrap)
+    return command
+
+
+def _serialize_settings(settings, original_text):
+    """Serialize settings without disturbing anything unrelated.
+
+    ensure_ascii=False keeps non-ASCII characters (e.g. emoji in an unrelated
+    `attribution` key) exactly as the project author wrote them, and the
+    trailing newline matches whatever the original file had.
+    """
+    text = json.dumps(settings, indent=2, ensure_ascii=False)
+    if original_text is None or original_text.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def install_statusline(settings_file, tag):
+    """Install or wrap the status line in one settings file. Idempotent."""
+    ensure_dirs()
+    original_text = None
+    if os.path.isfile(settings_file):
+        try:
+            with open(settings_file, "r") as handle:
+                original_text = handle.read()
+        except IOError:
+            original_text = None
+    settings = read_json(settings_file, None)
+    created = False
+    if settings is None:
+        if os.path.isfile(settings_file):
+            return {"ok": False, "error": "existing settings file is not valid JSON"}
+        settings = {}
+        created = True
+    if not isinstance(settings, dict):
+        return {"ok": False, "error": "settings root is not an object"}
+
+    existing = settings.get("statusLine")
+
+    if isinstance(existing, dict) and is_terminal_handoff_command(existing.get("command", "")):
+        return {"ok": True, "already_installed": True, "settings_file": settings_file}
+
+    backup = backup_file(settings_file, tag) if not created else None
+
+    wrap_command = None
+    original = None
+    if isinstance(existing, dict):
+        original = existing
+        if existing.get("type") == "command" and isinstance(existing.get("command"), str):
+            if is_terminal_handoff_command(existing["command"]):
+                return {"ok": True, "already_installed": True, "settings_file": settings_file}
+            wrap_command = existing["command"]
+        else:
+            return {
+                "ok": False,
+                "error": "existing statusLine is not a command type; refusing to replace it",
+                "existing": existing,
+            }
+    elif existing is not None:
+        return {"ok": False, "error": "existing statusLine has an unexpected shape"}
+
+    new_statusline = {"type": "command", "command": th_statusline_command(wrap_command)}
+    if isinstance(original, dict):
+        for key in ("padding",):
+            if key in original:
+                new_statusline[key] = original[key]
+
+    settings["statusLine"] = new_statusline
+    serialized = _serialize_settings(settings, original_text)
+    json.loads(serialized)  # validate before install
+    mode = 0o600 if created else (os.stat(settings_file).st_mode & 0o777)
+    write_private(settings_file, serialized, mode=mode)
+
+    registry = load_registry()
+    registry["targets"][settings_file] = {
+        "original_statusLine": original,
+        "original_ends_with_newline": bool(original_text is None or original_text.endswith("\n")),
+        "file_existed": not created,
+        "backup": backup,
+        "installed_at": utc_stamp(),
+        "wrapped_command": wrap_command,
+        "th_command": new_statusline["command"],
+    }
+    save_registry(registry)
+    log_event(
+        "statusline_installed",
+        settings_file=settings_file,
+        wrapped=bool(wrap_command),
+        backup=backup,
+    )
+    return {
+        "ok": True,
+        "settings_file": settings_file,
+        "backup": backup,
+        "wrapped_command": wrap_command,
+        "th_command": new_statusline["command"],
+        "created_file": created,
+    }
+
+
+def uninstall_statusline(settings_file, dry_run=True):
+    registry = load_registry()
+    entry = (registry.get("targets") or {}).get(settings_file)
+    settings = read_json(settings_file, None)
+    if settings is None:
+        return {"ok": False, "error": "settings file missing or invalid", "settings_file": settings_file}
+    current = settings.get("statusLine")
+    if not (isinstance(current, dict) and is_terminal_handoff_command(current.get("command", ""))):
+        return {"ok": True, "settings_file": settings_file, "note": "Terminal Handoff not installed here"}
+
+    if entry and entry.get("original_statusLine") is not None:
+        planned = entry["original_statusLine"]
+        action = "restore original statusLine"
+    elif entry and not entry.get("file_existed"):
+        planned = None
+        action = "remove generated settings file"
+    else:
+        planned = None
+        action = "remove statusLine key"
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "settings_file": settings_file,
+            "action": action,
+            "planned_statusLine": planned,
+        }
+
+    backup_file(settings_file, "uninstall")
+    if entry is not None and "original_ends_with_newline" in entry:
+        original_text = "{}\n" if entry["original_ends_with_newline"] else "{}"
+    else:
+        try:
+            with open(settings_file, "r") as handle:
+                original_text = handle.read()
+        except IOError:
+            original_text = None
+    if planned is None:
+        settings.pop("statusLine", None)
+    else:
+        settings["statusLine"] = planned
+    serialized = _serialize_settings(settings, original_text)
+    json.loads(serialized)
+    write_private(settings_file, serialized, mode=os.stat(settings_file).st_mode & 0o777)
+    if entry:
+        registry["targets"].pop(settings_file, None)
+        save_registry(registry)
+    log_event("statusline_uninstalled", settings_file=settings_file, action=action)
+    return {"ok": True, "settings_file": settings_file, "action": action, "restored": planned}
+
+
+CLAUDE_MD_BEGIN = "<!-- BEGIN TERMINAL HANDOFF -->"
+CLAUDE_MD_END = "<!-- END TERMINAL HANDOFF -->"
+
+CLAUDE_MD_SECTION = """%s
+# Terminal Handoff
+
+Terminal Handoff is installed globally at `~/.claude/terminal-handoff/`.
+
+Every Claude Code session on this Mac is monitored using its official live
+context percentage (`.context_window.used_percentage` from the status-line
+JSON). At the configured threshold (default 80%%), Terminal Handoff opens a
+fresh successor session in a new macOS Terminal window using the outgoing
+session's exact model ID and exact effort level.
+
+When you are started as a Terminal Handoff successor:
+
+- read the supplied handoff manifest
+- use a context-isolated subagent to analyse the parent transcript; never load
+  the full parent transcript into your own main context
+- independently verify repository state (pwd, root, branch, HEAD, origin/main,
+  ahead/behind, status, merge/rebase/cherry-pick/revert state)
+- treat the live filesystem and Git state as authoritative over the transcript
+- treat every existing change as user-owned; never reset, clean, discard,
+  overwrite, revert, amend, force-push, delete or stash without clear authority
+- continue only from verified evidence, and produce a TERMINAL HANDOFF
+  CONTINUATION REPORT first
+- allow your own Terminal Handoff trigger when your context later reaches the
+  threshold
+
+Do not disable, bypass or modify Terminal Handoff unless the user explicitly
+requests it. Do not manually launch a second successor if the current session
+has already been handed off.
+%s
+""" % (
+    CLAUDE_MD_BEGIN,
+    CLAUDE_MD_END,
+)
+
+
+def install_claude_md(path=None):
+    path = path or os.path.join(os.path.expanduser("~"), ".claude", "CLAUDE.md")
+    existing = ""
+    if os.path.isfile(path):
+        with open(path, "r") as handle:
+            existing = handle.read()
+    if CLAUDE_MD_BEGIN in existing:
+        return {"ok": True, "already_installed": True, "path": path}
+    backup = backup_file(path, "claude-md")
+    separator = "" if existing.endswith("\n\n") or existing == "" else ("\n" if existing.endswith("\n") else "\n\n")
+    write_private(path, existing + separator + CLAUDE_MD_SECTION, mode=0o644 if existing else 0o600)
+    registry = load_registry()
+    registry["claude_md"] = {"path": path, "backup": backup, "installed_at": utc_stamp()}
+    save_registry(registry)
+    log_event("claude_md_installed", path=path, backup=backup)
+    return {"ok": True, "path": path, "backup": backup}
+
+
+def uninstall_claude_md(path=None, dry_run=True):
+    path = path or os.path.join(os.path.expanduser("~"), ".claude", "CLAUDE.md")
+    if not os.path.isfile(path):
+        return {"ok": True, "note": "no CLAUDE.md"}
+    with open(path, "r") as handle:
+        content = handle.read()
+    if CLAUDE_MD_BEGIN not in content:
+        return {"ok": True, "note": "Terminal Handoff section not present"}
+    start = content.index(CLAUDE_MD_BEGIN)
+    end = content.index(CLAUDE_MD_END) + len(CLAUDE_MD_END)
+    cleaned = (content[:start].rstrip("\n") + "\n" + content[end:].lstrip("\n")).rstrip("\n") + "\n"
+    if dry_run:
+        return {"ok": True, "dry_run": True, "path": path, "bytes_removed": end - start}
+    backup_file(path, "claude-md-uninstall")
+    write_private(path, cleaned, mode=os.stat(path).st_mode & 0o777)
+    log_event("claude_md_uninstalled", path=path)
+    return {"ok": True, "path": path, "bytes_removed": end - start}
+
+
+# ---------------------------------------------------------------------------
+# Coverage report
+# ---------------------------------------------------------------------------
+
+
+def discover_settings_files(roots=None, max_depth=6):
+    home = os.path.expanduser("~")
+    found = []
+    skip = {"Library", "node_modules", ".git", ".Trash", "Pictures", "Movies", "Music"}
+    for dirpath, dirnames, filenames in os.walk(home):
+        depth = dirpath[len(home):].count(os.sep)
+        if depth >= max_depth:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        if os.path.basename(dirpath) != ".claude":
+            continue
+        for name in filenames:
+            if name.startswith("settings") and name.endswith(".json"):
+                found.append(os.path.join(dirpath, name))
+    return sorted(found)
+
+
+def coverage_report():
+    files = discover_settings_files()
+    rows = []
+    for path in files:
+        data = read_json(path, None)
+        if data is None:
+            rows.append({"settings_file": path, "statusLine": "INVALID JSON", "terminal_handoff": "unknown"})
+            continue
+        status_line = data.get("statusLine")
+        if status_line is None:
+            rows.append(
+                {
+                    "settings_file": path,
+                    "statusLine": None,
+                    "terminal_handoff": "inherits global",
+                }
+            )
+        else:
+            command = str((status_line or {}).get("command", ""))
+            active = is_terminal_handoff_command(command)
+            rows.append(
+                {
+                    "settings_file": path,
+                    "statusLine": command[:160],
+                    "terminal_handoff": "ACTIVE (integrated)" if active else "OVERRIDE - NOT COVERED",
+                }
+            )
+    global_settings = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+    global_data = read_json(global_settings, {}) or {}
+    global_active = is_terminal_handoff_command(
+        (global_data.get("statusLine") or {}).get("command", "")
+    )
+    uncovered = [r for r in rows if r["terminal_handoff"] == "OVERRIDE - NOT COVERED"]
+    return {
+        "generated_utc": utc_stamp(),
+        "global_settings": global_settings,
+        "global_terminal_handoff_active": global_active,
+        "settings_files_scanned": len(rows),
+        "rows": rows,
+        "uncovered_overrides": uncovered,
+        "full_coverage": bool(global_active and not uncovered),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def cmd_evaluate(args):
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else None
+        if not isinstance(payload, dict):
+            payload = None
+    except ValueError:
+        payload = None
+    decision = decide(payload, validate_files=not args.no_file_validation, record=not args.no_record)
+    print(json.dumps(decision, indent=2, sort_keys=True, default=str))
+    return 0
+
+
+def cmd_launch(args):
+    return perform_launch(args.payload)
+
+
+def cmd_build_command(args):
+    manifest = read_json(args.manifest)
+    if manifest is None:
+        print(json.dumps({"ok": False, "error": "manifest unreadable"}))
+        return 1
+    claude_bin = args.claude_bin or find_claude_executable() or "/usr/bin/false"
+    prompt_file = th_path("prompts", "successor-%s.md" % (manifest.get("outgoing") or {}).get("session_id"))
+    try:
+        argv = build_launch_argv(manifest, claude_bin, bootstrap_prompt(manifest, prompt_file))
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+        return 2
+    problems = assert_launch_argv_safe(argv)
+    script = build_launch_script(
+        manifest, argv, (manifest.get("outgoing") or {}).get("current_dir") or "/tmp", args.manifest
+    )
+    print(
+        json.dumps(
+            {"ok": not problems, "argv": argv, "problems": problems, "launch_script": script},
+            indent=2,
+        )
+    )
+    return 0 if not problems else 3
+
+
+def cmd_install(args):
+    ensure_dirs()
+    results = {"targets": [], "claude_md": None}
+    for settings_file in args.settings:
+        results["targets"].append(install_statusline(os.path.abspath(os.path.expanduser(settings_file)), args.tag))
+    if not args.skip_claude_md:
+        results["claude_md"] = install_claude_md()
+    print(json.dumps(results, indent=2, default=str))
+    return 0 if all(t.get("ok") for t in results["targets"]) else 1
+
+
+def cmd_uninstall(args):
+    registry = load_registry()
+    targets = args.settings or sorted((registry.get("targets") or {}).keys())
+    results = {"dry_run": not args.apply, "targets": [], "claude_md": None}
+    for settings_file in targets:
+        results["targets"].append(uninstall_statusline(os.path.abspath(os.path.expanduser(settings_file)), dry_run=not args.apply))
+    if not args.skip_claude_md:
+        results["claude_md"] = uninstall_claude_md(dry_run=not args.apply)
+    results["retained"] = {
+        "handoffs": th_path("handoffs"),
+        "logs": th_path("logs"),
+        "backups": th_path("backups"),
+        "note": "Manifests, logs and backups are preserved. Transcripts are never touched.",
+    }
+    print(json.dumps(results, indent=2, default=str))
+    return 0
+
+
+def cmd_coverage(args):
+    report = coverage_report()
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+        return 0 if report["full_coverage"] else 1
+    print("Terminal Handoff %s - status-line coverage report" % TERMINAL_HANDOFF_VERSION)
+    print("Generated: %s" % report["generated_utc"])
+    print("")
+    print("Global settings: %s" % report["global_settings"])
+    print("Global Terminal Handoff active: %s" % ("YES" if report["global_terminal_handoff_active"] else "NO"))
+    print("Settings files scanned: %d" % report["settings_files_scanned"])
+    print("")
+    for row in report["rows"]:
+        print("  [%s] %s" % (row["terminal_handoff"], row["settings_file"]))
+        if row["statusLine"]:
+            print("        statusLine: %s" % row["statusLine"])
+    print("")
+    print("FULL COVERAGE: %s" % ("YES" if report["full_coverage"] else "NO"))
+    if report["uncovered_overrides"]:
+        print("Uncovered overrides:")
+        for row in report["uncovered_overrides"]:
+            print("  - %s" % row["settings_file"])
+    return 0 if report["full_coverage"] else 1
+
+
+def cmd_status(args):
+    ensure_dirs()
+    open_now, circuit = circuit_is_open()
+    storm_max, storm_window, cooldown, _ = storm_settings()
+    info = {
+        "terminal_handoff_version": TERMINAL_HANDOFF_VERSION,
+        "home": th_home(),
+        "threshold": threshold(),
+        "disabled": env_flag("CLAUDE_TERMINAL_HANDOFF_DISABLED"),
+        "test_mode": env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE"),
+        "max_generations": max_generations() or "unlimited",
+        "min_observations": env_int("CLAUDE_TERMINAL_HANDOFF_MIN_OBSERVATIONS", DEFAULT_MIN_OBSERVATIONS),
+        "cooldown_seconds": cooldown,
+        "storm_max_launches": storm_max,
+        "storm_window_seconds": storm_window,
+        "circuit_open": open_now,
+        "circuit": circuit,
+        "claude_executable": find_claude_executable(),
+        "triggered_sessions": len(os.listdir(th_path("triggered"))) if os.path.isdir(th_path("triggered")) else 0,
+        "manifests": len([f for f in os.listdir(th_path("handoffs"))]) if os.path.isdir(th_path("handoffs")) else 0,
+        "recent_launches_in_window": len(recent_launch_times(storm_window)),
+    }
+    print(json.dumps(info, indent=2, default=str))
+    return 0
+
+
+def cmd_reset_circuit(args):
+    ensure_dirs()
+    path = circuit_file()
+    was_open = os.path.exists(path)
+    if was_open:
+        os.unlink(path)
+    now = time.time()
+    # Exclude already-counted launches so the reset is not undone immediately.
+    write_json_private(storm_reset_file(), {"epoch": now, "ts": utc_stamp(), "by": "cli"})
+    # Cooldown is a separate guard; a manual reset clears it too.
+    if os.path.exists(cooldown_file()):
+        try:
+            os.unlink(cooldown_file())
+        except OSError:
+            pass
+    log_event("circuit_breaker_reset", by="cli", was_open=was_open)
+    if was_open:
+        print("Terminal Handoff: storm circuit breaker reset; launch window cleared.")
+    else:
+        print("Terminal Handoff: circuit breaker was not open; launch window cleared.")
+    return 0
+
+
+def cmd_version(args):
+    print("Terminal Handoff %s (manifest schema %d)" % (TERMINAL_HANDOFF_VERSION, MANIFEST_SCHEMA_VERSION))
+    return 0
+
+
+def main(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="terminal-handoff", description="Terminal Handoff")
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("statusline", help="Render the status line and evaluate the trigger")
+    p.add_argument("--wrap", default=None, help="Pre-existing status-line command to wrap")
+    p.set_defaults(func=cmd_statusline)
+
+    p = sub.add_parser("evaluate", help="Evaluate a status-line JSON payload from stdin")
+    p.add_argument("--no-file-validation", action="store_true")
+    p.add_argument("--no-record", action="store_true")
+    p.set_defaults(func=cmd_evaluate)
+
+    p = sub.add_parser("launch", help="Detached launcher (internal)")
+    p.add_argument("--payload", required=True)
+    p.set_defaults(func=cmd_launch)
+
+    p = sub.add_parser("build-command", help="Print the successor launch argv for a manifest")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--claude-bin", default=None)
+    p.set_defaults(func=cmd_build_command)
+
+    p = sub.add_parser("install", help="Install or wrap the status line in settings files")
+    p.add_argument("--settings", nargs="+", required=True)
+    p.add_argument("--tag", default="install")
+    p.add_argument("--skip-claude-md", action="store_true")
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("uninstall", help="Remove Terminal Handoff from settings files")
+    p.add_argument("--settings", nargs="*", default=None)
+    p.add_argument("--apply", action="store_true", help="Actually apply (default is a dry run)")
+    p.add_argument("--skip-claude-md", action="store_true")
+    p.set_defaults(func=cmd_uninstall)
+
+    p = sub.add_parser("coverage", help="Report status-line coverage across all Claude settings")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_coverage)
+
+    p = sub.add_parser("status", help="Show Terminal Handoff runtime state")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("reset-circuit", help="Reset the storm circuit breaker")
+    p.set_defaults(func=cmd_reset_circuit)
+
+    p = sub.add_parser("version", help="Print the Terminal Handoff version")
+    p.set_defaults(func=cmd_version)
+
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 1
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
