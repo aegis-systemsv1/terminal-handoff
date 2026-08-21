@@ -16,6 +16,8 @@ each boundary does about it.
 | `effort.level` | **Untrusted** | Allow-listed to exactly five values |
 | `transcript_path` | **Untrusted** | Fully validated, then used as a path only — never read into context, never executed |
 | `workspace.current_dir` | **Untrusted** | Must exist, be a directory, and contain no quote, backslash or control character |
+| `session_name` | **Untrusted** | Stripped of control characters, whitespace-collapsed, never allowed to begin with `-`, bounded to 64 characters; passed as a single argv element and escaped for AppleScript |
+| A bound parent process | **Verified, never assumed** | PID, start time, TTY, UID, executable name and working directory re-proved immediately before any signal |
 | A wrapped status-line command | **Trusted-by-configuration** | Comes from a Claude settings file the user already controls; run exactly as Claude Code itself would |
 | Environment variables | **Semi-trusted** | Only Terminal Handoff's own variables are read; values are range-checked and fall back to defaults |
 
@@ -62,6 +64,104 @@ A denylist is asserted against the finished argv as defence in depth. If
 `--continue`, `-c`, `--resume`, `-r`, `--fork-session`, `--permission-mode`,
 `--fallback-model` or any skip-permissions flag appears, the launch is refused
 and recorded as a failure.
+
+## Session names
+
+A session name is human-facing text that a user, or in a shared context someone
+else, can set. It reaches two boundaries: `claude --name <value>` and the
+AppleScript that titles the Terminal window.
+
+Before either, the name is sanitised: control characters, line separators and
+paragraph separators become spaces; runs of whitespace collapse; leading `-`
+characters are removed so a name can never be read as a command-line flag; and
+the result is bounded to 64 characters. Unicode survives, because a name is
+content.
+
+Sanitising is not the security boundary — quoting is. The name is passed as a
+single `argv` element, `shlex.quote`d inside the generated launch script, and
+escaped for the AppleScript string literal. A name of
+`"; touch /tmp/pwned; echo "` travels intact as literal text and executes
+nothing. The test suite proves this by planting shell metacharacters, command
+substitutions, backticks and a filesystem canary in the session name, running
+the real launch script, and asserting the name arrives as one argument and the
+canary was never created.
+
+## Stopping the parent Claude process
+
+This is the second place Terminal Handoff acts on something outside its own
+state directory, and it is the one with the widest blast radius if done badly.
+
+### What is never used
+
+- `pkill`, `killall` or any process-name pattern match
+- process groups (`killpg`, `kill(-pgid)`)
+- `SIGKILL`, or any escalation path to it
+- unverified PID files
+- "the front Terminal window" or any AppleScript window targeting
+- closing Terminal windows
+- arbitrary generated shell commands
+
+The suite enforces this statically: it strips comments and string literals from
+every shipped source file and asserts that none of those mechanisms appear, that
+`os.kill` is called exactly once in the codebase, and that the signal used is
+`SIGTERM`.
+
+### Binding
+
+The Claude Code session process is bound at trigger time, inside the status-line
+process, because that is the only place its real ancestry exists. Claude Code
+runs the status line through a shell, so the immediate parent is a shell, not
+Claude: the ancestry is walked with `ps` until a process whose executable file is
+named exactly `claude` is found.
+
+The candidate is rejected unless it is:
+
+- within six ancestry levels (a Claude process further away is somebody else's)
+- owned by the same UID
+- not this process
+- working in the same directory as the session in the status-line JSON
+
+That last check matters: without it, a status-line process run from inside an
+unrelated Claude session could bind the wrong session and stop the wrong work.
+
+The binding records PID, process start time, controlling TTY, UID, executable
+name and path, process working directory, session ID, chain ID and generation.
+
+### Re-proving
+
+Immediately before the signal — with no wait in between — every recorded value
+is checked against the live process. Any of these aborts the shutdown with the
+parent left running and the transfer recorded as failed:
+
+- the process no longer exists, or is a zombie
+- the start time differs (the PID has been reused)
+- the UID differs
+- the executable is no longer named `claude`
+- the controlling terminal differs
+- the working directory has moved
+- the binding names a different session, chain or generation
+
+### Signalling
+
+One `SIGTERM`, to one PID, at most twice, with a grace period between attempts.
+If the process has not exited, Terminal Handoff records
+`parent_stop_unconfirmed`, marks the transfer `TRANSFER_FAILED`, and stops. It
+does not escalate. The user closes the session themselves.
+
+The parent's shell and its Terminal window are never signalled, so the window
+remains open at its shell prompt.
+
+### Ownership
+
+A single atomic state machine — `LAUNCHING`, `SUCCESSOR_VERIFIED`,
+`PARENT_STOP_REQUESTED`, `TRANSFER_COMPLETE`, `TRANSFER_FAILED` — decides who
+owns continuation. Transitions are taken under an exclusive lock, refused when
+illegal, and appended to a history with a reason and the requesting PID. A
+supervisor is claimed with `O_CREAT|O_EXCL` per transfer, so duplicate
+status-line invocations cannot produce a second shutdown attempt.
+
+In test mode, and under `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN`, the entire path
+runs and no signal is ever sent.
 
 ---
 
@@ -350,5 +450,6 @@ off the machine.
 Fail closed, and fail visibly. When anything is missing, null, malformed or
 unverified, the answer is "do not trigger" — never "guess". When a launch cannot
 preserve the model or effort, the answer is "fail and tell the user" — never
-"launch something else". A circuit-breaker activation is logged and displayed,
-never hidden.
+"launch something else". When a parent process cannot be proved to be the exact
+one that was bound, the answer is "leave it running" — never "signal anyway". A
+circuit-breaker activation is logged and displayed, never hidden.

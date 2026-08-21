@@ -5,18 +5,27 @@
 ```
 src/terminal_handoff/
   core.py                     the implementation
-  __init__.py cli.py detector.py manifest.py
-  launcher.py statusline.py security.py state.py    facade modules
+  __init__.py cli.py detector.py manifest.py naming.py
+  launcher.py statusline.py security.py state.py transfer.py   facade modules
   templates/successor-prompt.md
 tests/
   _harness.py                 shared base case, fixtures, helpers
   test_detector.py            threshold and malformed input
   test_launcher.py            argv construction, model and effort
+  test_naming.py              successor display names across generations
   test_state.py               lifecycle, generations, safety guards
   test_manifest.py            manifest, repository capture, permissions
+  test_parent_stop.py         process binding and the shutdown boundary
   test_statusline.py          rendering and wrapping
   test_security.py            config integrity, restoration, boundary units
+  test_transfer.py            the heartbeat gate and transfer state machine
+  test_wrap_integrity.py      the wrapped command is unreachable from input
+  test_install_layouts.py     install and uninstall under unusual layouts
   fixtures/                   synthetic status-line payloads
+scripts/
+  live-handoff-test.py        controlled live test: real windows, real signals
+  coverage-check.sh           privacy, secret and personal-path scan
+  verify-release.sh           version consistency, syntax, links, suite
 ```
 
 `core.py` holds the implementation; the sibling modules are thin re-export
@@ -39,8 +48,39 @@ The suite:
 - touches **no** real repository (throwaway repos under a temp directory)
 - isolates state via `CLAUDE_TERMINAL_HANDOFF_HOME`
 
-It takes about a minute; the Git tests genuinely create merge, rebase,
-cherry-pick and revert conflicts rather than faking the marker files.
+It takes about three minutes; the Git tests genuinely create merge, rebase,
+cherry-pick and revert conflicts rather than faking the marker files, and the
+shutdown tests start real short-lived processes and signal them.
+
+Two things the suite does start, deliberately:
+
+- **real processes**, as stand-ins for a Claude session. They are symlinks to
+  `/bin/sleep` named `claude`, because macOS records the executed path, so
+  `ps -o comm=` reports the symlink's own name — which is the identity Terminal
+  Handoff binds on. A copied system binary is killed by the code-signing check,
+  and a shell script reports its interpreter, so neither works.
+- **real signals**, to those stand-ins only. Every binding a test may signal is
+  built from a PID the test started itself; no test signals a process found by
+  walking ancestry.
+
+## The controlled live test
+
+```sh
+python3 scripts/live-handoff-test.py           # run and clean up
+python3 scripts/live-handoff-test.py --keep    # keep the throwaway state
+```
+
+This one **does** open real Terminal windows, run real `osascript`, trace real
+ancestry and send a real `SIGTERM`. It still starts no Claude session: the
+stand-in is a small compiled program named `claude` that drives the real
+status-line command with synthetic status JSON. Everything lives in a throwaway
+`CLAUDE_TERMINAL_HANDOFF_HOME`.
+
+It runs a three-generation chain, proves `Ranger -> Ranger 2 -> Ranger 3`,
+proves the exact parent process is stopped while its Terminal stays open, proves
+an unrelated Claude process is untouched, and proves that an invalid successor
+heartbeat leaves the parent running. A recorded run is in
+[LIVE_TEST_EVIDENCE.md](LIVE_TEST_EVIDENCE.md).
 
 ## Running the CLI from a checkout
 

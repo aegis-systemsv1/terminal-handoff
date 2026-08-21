@@ -1,5 +1,8 @@
 # Architecture
 
+> Behavioural decisions with a rationale worth keeping are recorded in
+> [decisions/](decisions/0001-parent-shutdown-and-successor-naming.md).
+
 Terminal Handoff has one job: notice that a Claude Code session is nearly full, and hand its work to a fresh session that can verify what it inherits.
 
 Everything below follows from two constraints:
@@ -45,7 +48,8 @@ Only these fields are read:
 | `.workspace.current_dir` / `.project_dir` | successor working directory |
 | `.model.id` / `.model.display_name` | exact model to preserve |
 | `.effort.level` | exact effort to preserve (optional field) |
-| `.session_name`, `.version`, `.workspace.git_worktree` | recorded in the manifest |
+| `.session_name` | **the chain's base display name**, captured once at generation 1 |
+| `.version`, `.workspace.git_worktree` | recorded in the manifest |
 
 Usage is never estimated from transcript size, line count, elapsed time, message count, token guesses or session cost. `.rate_limits.five_hour.used_percentage` and `.rate_limits.seven_day.used_percentage` are **never** read: account rate limits are a different measurement from context usage, and confusing the two would fire handoffs at random.
 
@@ -143,11 +147,27 @@ An 80%-full transcript would consume most of a fresh window and trigger another 
 
 The successor re-derives `pwd`, repository root, branch, HEAD, `origin/main`, ahead/behind, status, staged and untracked files, and any in-progress merge, rebase, cherry-pick or revert. Where the live state disagrees with the transcript, **the live state wins**. Every existing change is treated as user-owned: no reset, clean, discard, overwrite, revert, amend, force-push, delete or stash without clear authority.
 
-## 9. Successor heartbeat
+## 9. Successor heartbeat — the transfer gate
 
-A window opening is not proof that a session started correctly — an invalid model only fails at startup, after `claude` has already been exec'd. So the parent's manifest is not closed out until the successor reports back.
+A window opening is not proof that a session started correctly — an invalid model only fails at startup, after `claude` has already been exec'd. So the parent's manifest is not closed out, and the parent is not stopped, until the successor reports back.
 
-The launcher exports `CLAUDE_TERMINAL_HANDOFF_MANIFEST` into the successor's environment. The successor's own status line sees it and writes back its session ID, model, effort, working directory and context percentage.
+The launcher exports `CLAUDE_TERMINAL_HANDOFF_MANIFEST`, `..._CHAIN_ID`, `..._GENERATION`, `..._BASE_NAME` and `..._TRANSFER` into the successor's Terminal window. The successor's own status line sees them and writes back its session ID, model, effort, working directory, chain, generation and live context percentage.
+
+Nine checks must all pass, across two heartbeats:
+
+| Check | Proves |
+|---|---|
+| `session_id_present` | there is a session at all |
+| `session_id_is_fresh` | it is not the parent |
+| `session_id_unused` | it is not a session already recorded elsewhere in this chain |
+| `model_matches` | the exact model was preserved |
+| `effort_matches` | the exact effort — including "none" — was preserved |
+| `cwd_matches` | it started in the right directory |
+| `chain_matches` | it belongs to this chain |
+| `generation_matches` | it is the generation that was launched |
+| `context_percentage_live` | it is running, not merely spawned |
+
+Any failure records `successor_mismatch` in the manifest, `successor_rejected` in the transfer, and leaves the parent alone.
 
 ```mermaid
 stateDiagram-v2
@@ -155,7 +175,8 @@ stateDiagram-v2
     eligible --> launching: atomic claim won
     launching --> launched: osascript returned 0
     launched --> successor_started: first heartbeat<br/>(fresh session ID)
-    successor_started --> completed: second heartbeat<br/>(own non-null percentage)
+    successor_started --> completed: second heartbeat,<br/>all nine checks pass
+    successor_started --> successor_mismatch: any check fails
     launching --> failed: launch error
     launched --> failed: launch error
     failed --> eligible: bounded retry (max 2)<br/>after cooldown
@@ -164,6 +185,44 @@ stateDiagram-v2
 ```
 
 The heartbeat also refuses to treat a session as its own successor, which would otherwise be possible if a manifest path were passed to the wrong session.
+
+## 9a. Successor naming
+
+The chain carries a **base display name** and a **chain ID**, and they are different things.
+
+- The base display name is human-facing: `Ranger`. It is captured once, from `.session_name`, when the chain is created, written to `chains/<chain-id>.json`, and never rewritten. Generation *n* is displayed as `<base> <n>`; generation 1 keeps the base name unchanged.
+- The chain ID is machine-safe hex used to key state. It never appears as a session name.
+
+The generation number is read from trusted chain state — `chains/<chain-id>.json` records which session ID occupies which generation — and only falls back to the launcher's exported `CLAUDE_TERMINAL_HANDOFF_GENERATION` when chain state does not yet know the session. It is never derived by parsing digits off a visible name, so `Project 42` hands off to `Project 42 2`.
+
+If no session name is available, the documented fallback is `Terminal Handoff <chain-id[:8]>`. No repository, directory or project name is ever substituted.
+
+## 9b. Transfer of ownership and parent shutdown
+
+Two agents in one repository is the failure this prevents. There is exactly one boundary.
+
+```mermaid
+stateDiagram-v2
+    [*] --> LAUNCHING: successor launched
+    LAUNCHING --> SUCCESSOR_VERIFIED: all nine heartbeat checks pass
+    SUCCESSOR_VERIFIED --> PARENT_STOP_REQUESTED: parent process identity re-proved
+    PARENT_STOP_REQUESTED --> TRANSFER_COMPLETE: parent exited
+    LAUNCHING --> TRANSFER_FAILED: heartbeat timeout,<br/>launch failure, unbound parent
+    SUCCESSOR_VERIFIED --> TRANSFER_FAILED: identity could not be re-proved
+    PARENT_STOP_REQUESTED --> TRANSFER_FAILED: parent did not exit<br/>(never escalated)
+    TRANSFER_COMPLETE --> [*]
+    TRANSFER_FAILED --> [*]
+```
+
+`LAUNCHING` and `SUCCESSOR_VERIFIED` mean the **parent** owns continuation. `PARENT_STOP_REQUESTED` and `TRANSFER_COMPLETE` mean the **successor** does. `TRANSFER_FAILED` returns ownership to the parent, which is still running.
+
+Transitions happen under an exclusive lock, are refused when illegal, and append to a history carrying the reason and the requesting PID. Repeating a transition is refused, which is precisely what stops a duplicate status-line invocation or a second supervisor from requesting a second shutdown; a supervisor is additionally claimed per transfer with `O_CREAT|O_EXCL`.
+
+**Binding the parent.** The Claude process is bound inside the status-line process at trigger time, because the detached launcher starts its own session and has no ancestry to trace. `ps` walks upward to the nearest process whose executable file is named exactly `claude`; the candidate must be within six levels, owned by the same UID, not this process, and working in the same directory as the session in the payload. PID, start time, TTY, UID, executable name, working directory, session, chain and generation are all recorded.
+
+**Stopping it.** A detached supervisor waits for `SUCCESSOR_VERIFIED`, re-proves every recorded value with no wait between the check and the signal, then sends one `SIGTERM` — at most twice, never `SIGKILL`, never to a process group, never by name. The parent's shell and Terminal window are untouched, so the window stays open at a prompt.
+
+**Restart is deterministic.** Running the supervisor again from any state does the same thing: it resumes waiting from `LAUNCHING`, stops from `SUCCESSOR_VERIFIED`, and exits without signalling from `PARENT_STOP_REQUESTED`, `TRANSFER_COMPLETE` or `TRANSFER_FAILED`.
 
 ## 10. Multi-generation continuation
 
@@ -175,7 +234,7 @@ flowchart LR
     G1 -.->|chain abc123| G4
 ```
 
-A chain ID is generated once and inherited through environment variables; the generation number increments. Each successor's manifest points at its parent's. **One trigger per session; unlimited generations per chain.** `CLAUDE_TERMINAL_HANDOFF_MAX_GENERATIONS` imposes a ceiling if you want one; unset means unlimited, and there is no hidden stop.
+A chain ID and a base display name are generated once and inherited through environment variables and `chains/<chain-id>.json`; the generation number increments, and so does the visible name — `Ranger`, `Ranger 2`, `Ranger 3`. Each successor's manifest points at its parent's. **One trigger per session; unlimited generations per chain.** `CLAUDE_TERMINAL_HANDOFF_MAX_GENERATIONS` imposes a ceiling if you want one; unset means unlimited, and there is no hidden stop.
 
 ## 11. Failure and retry
 
@@ -191,9 +250,9 @@ Three launches within ten minutes trips the breaker: launching is suspended for 
 
 ## Why the implementation is a single core module
 
-The repository presents `core.py` plus six thin facade modules (`detector`, `manifest`, `launcher`, `statusline`, `security`, `state`) that re-export the public API by concern.
+The repository presents `core.py` plus eight thin facade modules (`detector`, `manifest`, `launcher`, `naming`, `statusline`, `security`, `state`, `transfer`) that re-export the public API by concern.
 
-`core.py` is the exact implementation that was built, tested and live-verified for 1.0.0, and hardened in place since. Mechanically splitting a 2,300-line module across six files for appearance would mean rewriting import graphs and shared state handling — real risk, no behavioural gain, against code whose value is precisely that it has been proven end to end.
+`core.py` is the exact implementation that was built, tested and live-verified for 1.0.0, and hardened in place since. Mechanically splitting a 3,000-line module across six files for appearance would mean rewriting import graphs and shared state handling — real risk, no behavioural gain, against code whose value is precisely that it has been proven end to end.
 
 So the split is deliberately a **naming layer**, not a rewrite:
 

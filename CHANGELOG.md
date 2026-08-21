@@ -5,6 +5,133 @@ All notable changes to Terminal Handoff are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-22
+
+Behaviour and safety release. Two production defects reported from live use are
+fixed: successors were named with an internal identifier instead of the user's
+own session name, and a parent session kept running after its successor was
+launched, so two agents could work on the same repository at once.
+
+### Fixed
+
+- **Successor naming exposed an internal identifier.** A session named `Ranger`
+  produced a successor named `terminal-handoff-7a282bd6-g2`. Successors are now
+  named `Ranger 2`, `Ranger 3`, `Ranger 4`, and so on, in both the Claude
+  session name and the Terminal window title. Generation 1 keeps its name
+  unchanged; no `1` is ever appended.
+
+  The base name is captured once, from `.session_name` in the official
+  status-line JSON, and stored as explicit chain metadata in
+  `chains/<chain-id>.json`. Later generations read it from that trusted state,
+  never from the visible session name, and the generation number comes from
+  chain state rather than from parsing trailing digits — so `Project 42` hands
+  off to `Project 42 2`, not `Project 43`. The machine-safe `chain_id` is still
+  used for state keying and is never shown as a session name. When no session
+  name is available, the documented fallback is
+  `Terminal Handoff <chain-id[:8]>`; no repository or directory name is ever
+  invented.
+
+- **The parent session kept running after a handoff.** Once the successor has
+  proved itself, the exact parent Claude process is now asked to exit
+  gracefully, so one session continues the work. Its Terminal window stays open
+  at a shell prompt.
+
+### Added
+
+- **A transfer-of-ownership state machine** with one boundary: `LAUNCHING` ->
+  `SUCCESSOR_VERIFIED` -> `PARENT_STOP_REQUESTED` -> `TRANSFER_COMPLETE`, and
+  `TRANSFER_FAILED` from any non-terminal state. Before the stop request the
+  parent owns continuation; after it, the successor does. Transitions are taken
+  under an exclusive lock, refused when illegal, and appended to an auditable
+  history with a reason and the requesting PID. Records live in
+  `transfers/<parent-session-id>.json` and are summarised by `status`.
+
+- **A nine-point successor heartbeat gate.** The transfer is only verified when
+  the successor reports, from its own live status-line JSON across two
+  heartbeats: a fresh session ID, a session ID not already used elsewhere in the
+  chain, the required model, the required effort level (including "none"), the
+  required working directory, the correct chain ID, the correct generation and
+  its own live context percentage. Any failure records `successor_mismatch` and
+  leaves the parent running.
+
+- **Exact parent-process binding.** The Claude Code process is bound inside the
+  status-line process at trigger time, where its real ancestry is visible.
+  Claude Code runs the status line through a shell, so the ancestry is traced
+  with `ps` rather than assumed. PID, process start time, controlling TTY, UID,
+  executable name, process working directory, session ID, chain ID and
+  generation are recorded, and every one is re-proved immediately before any
+  signal is sent.
+
+- **A detached shutdown supervisor**, claimed per transfer with
+  `O_CREAT|O_EXCL`, so duplicate status-line invocations cannot produce a second
+  shutdown attempt. Restart from any transfer state is deterministic.
+
+- **`supervise` subcommand** (internal) and new configuration:
+  `CLAUDE_TERMINAL_HANDOFF_STOP_PARENT`,
+  `CLAUDE_TERMINAL_HANDOFF_HEARTBEAT_TIMEOUT`,
+  `CLAUDE_TERMINAL_HANDOFF_STOP_GRACE`,
+  `CLAUDE_TERMINAL_HANDOFF_STOP_ATTEMPTS`,
+  `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN` and
+  `CLAUDE_TERMINAL_HANDOFF_TRANSFER_POLL`.
+
+- **Terminal Handoff configuration is inherited by successors.** Apple Terminal
+  starts a fresh login shell that does not inherit the launcher's environment,
+  so every `CLAUDE_TERMINAL_HANDOFF_*` variable set at trigger time is now
+  written into the successor's launch script. A chain keeps the settings it was
+  started with.
+
+- **82 new tests** across `tests/test_naming.py`, `tests/test_transfer.py` and
+  `tests/test_parent_stop.py`, plus a controlled live test,
+  `scripts/live-handoff-test.py`, that drives real Terminal windows, real
+  `osascript`, real process ancestry and real signals.
+
+- **Two new facade modules**, `naming` and `transfer`.
+
+### Security
+
+- **No SIGKILL path exists.** One signal type, `SIGTERM`, to one PID, at most
+  twice, with no escalation. A parent that does not exit is recorded as
+  `parent_stop_unconfirmed` and left running.
+- **No broad process targeting.** No `pkill`, no `killall`, no process-name
+  pattern matching, no process groups, no unverified PID files, no Terminal
+  front-window assumptions, no generated shell commands. The suite enforces this
+  statically against every shipped source file, with comments and string
+  literals stripped so documentation cannot satisfy the check.
+- **Wrong-session protection.** A bound candidate is rejected unless it is
+  within six ancestry levels, owned by the same UID, not the signalling process
+  itself, and working in the same directory as the session in the status-line
+  JSON. Binding a Claude process from an unrelated session would otherwise stop
+  the wrong work.
+- **Session names are untrusted text.** Control characters are stripped,
+  whitespace collapsed, leading dashes removed so a name cannot look like a
+  flag, and length bounded to 64 characters. The name is then passed as a single
+  argv element, `shlex.quote`d in the launch script and escaped for AppleScript.
+  Unicode is preserved. Tests plant metacharacters, command substitutions,
+  backticks and canaries and prove nothing executes.
+- Test mode and `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN` run the entire shutdown
+  path and never signal a real process.
+
+### Changed
+
+- `MANIFEST_SCHEMA_VERSION` is now `2`: manifests carry a `display` block
+  (base name, its source, this generation's name, the successor's name) and the
+  `successor` block records every heartbeat check.
+- The documented statement "The original Terminal is never closed" has been
+  removed. The Terminal window is still never closed, but the parent Claude
+  session is now stopped once the successor is verified, and the documentation
+  says so precisely.
+- The successor prompt states the ownership boundary explicitly: read, search
+  and verify freely, but mutate nothing until the heartbeat is validated,
+  repository verification is complete, and the transfer state authorises it.
+
+### Migration
+
+No action is required. Existing chains keep working; manifests written by 1.0.x
+are still readable. To keep the previous behaviour of leaving the parent
+running, set `CLAUDE_TERMINAL_HANDOFF_STOP_PARENT=0` before starting `claude`.
+
+---
+
 ## [1.0.1] - 2026-08-18
 
 Hardening and documentation release. **No behavioural change to the 80% handoff

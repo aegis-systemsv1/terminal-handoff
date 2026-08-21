@@ -180,8 +180,12 @@ cp "$SRC_DIR/src/terminal_handoff/core.py" "$PREFIX/terminal-handoff.py"
 cp "$SRC_DIR/src/terminal_handoff/templates/successor-prompt.md" "$PREFIX/successor-prompt.md"
 cp "$SRC_DIR/uninstall.sh" "$PREFIX/uninstall.sh"
 cp "$SRC_DIR/README.md" "$PREFIX/README.md" 2>/dev/null || true
+cp "$SRC_DIR/VERSION" "$PREFIX/VERSION" 2>/dev/null || true
+cp "$SRC_DIR/CHANGELOG.md" "$PREFIX/CHANGELOG.md" 2>/dev/null || true
 chmod 700 "$PREFIX/terminal-handoff.py" "$PREFIX/uninstall.sh"
 chmod 600 "$PREFIX/successor-prompt.md"
+[ -f "$PREFIX/VERSION" ] && chmod 600 "$PREFIX/VERSION"
+[ -f "$PREFIX/CHANGELOG.md" ] && chmod 600 "$PREFIX/CHANGELOG.md"
 note "runtime installed to $PREFIX"
 
 mkdir -p "$(dirname "$SETTINGS")"
@@ -196,7 +200,9 @@ print("  settings JSON validated")
 PYEOF
 
 printf '\nInstalled.\n\n'
+printf 'Installed version: %s\n' "$(cat "$PREFIX/VERSION" 2>/dev/null || echo unknown)"
 printf 'Verify with:\n'
+printf '  %s %s/terminal-handoff.py version\n' "$PY" "$PREFIX"
 printf '  %s %s/terminal-handoff.py status\n' "$PY" "$PREFIX"
 printf '  %s %s/terminal-handoff.py coverage\n' "$PY" "$PREFIX"
 printf '\nStart a new Claude Code session to see the status line.\n'

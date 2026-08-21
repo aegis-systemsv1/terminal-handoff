@@ -92,7 +92,24 @@ output is preserved byte-for-byte and only a short badge is appended. Re-run
 
 ## Controlled live test
 
-Automated tests never open a window. To exercise the real launcher once:
+The supported way to exercise the whole thing — real Terminal windows, real
+`osascript`, real process ancestry, a real `SIGTERM` — without starting a Claude
+session or consuming a context window:
+
+```sh
+python3 scripts/live-handoff-test.py
+```
+
+It runs a three-generation chain in a throwaway state directory, proves
+`Ranger -> Ranger 2 -> Ranger 3`, proves the exact parent process is stopped
+while its Terminal window stays open at a shell prompt, proves an unrelated
+Claude process is untouched, and proves that an invalid successor heartbeat
+leaves the parent running. A recorded run is in
+[LIVE_TEST_EVIDENCE.md](LIVE_TEST_EVIDENCE.md).
+
+### Doing it by hand
+
+To exercise the real launcher once, manually:
 
 1. Create a throwaway git repository and a synthetic transcript somewhere
    temporary. The transcript must be JSON Lines and named `<session-id>.jsonl`.
@@ -109,8 +126,11 @@ Automated tests never open a window. To exercise the real launcher once:
    sh -c "$CMD" < payload.json
    ```
 
-4. Exactly one Terminal window should open, titled
-   `Terminal Handoff, Generation 2`.
+4. Exactly one Terminal window should open. Its title, and the successor's
+   Claude session name, are your session's name plus the generation number —
+   `Ranger 2` for a session named `Ranger`. If your payload carried no
+   `session_name`, the documented fallback
+   `Terminal Handoff <chain-id[:8]> 2` is used instead.
 5. Confirm the handoff:
 
    ```sh
@@ -123,7 +143,24 @@ Automated tests never open a window. To exercise the real launcher once:
    ```
 
    `session_id_is_fresh`, `model_matches`, `effort_matches` and `cwd_matches`
-   should all be true, and `launch_state` should reach `completed`.
+   should all be true, `checks` should be all-true, and `launch_state` should
+   reach `completed`.
+
+6. Once the successor is verified, the parent session is asked to exit. Confirm
+   what happened:
+
+   ```sh
+   python3 ~/.claude/terminal-handoff/terminal-handoff.py status
+   ```
+
+   The `transfers` entry should read `TRANSFER_COMPLETE` with `parent_stopped`
+   true. The parent's Terminal window stays open at its shell prompt. If it
+   reads `TRANSFER_FAILED`, the parent is still running on purpose and the
+   record says why — see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+   To rehearse without ever signalling anything, set
+   `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN=1`, or disable the behaviour with
+   `CLAUDE_TERMINAL_HANDOFF_STOP_PARENT=0`.
 
 To rehearse without opening anything, set
 `CLAUDE_TERMINAL_HANDOFF_TEST_MODE=1` first; the launch is simulated and the

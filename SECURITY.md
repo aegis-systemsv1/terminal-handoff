@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| 1.0.x | Yes |
+| 1.1.x | Yes |
+| 1.0.x | Security fixes only |
 
 ## Reporting a vulnerability
 
@@ -50,11 +51,29 @@ Terminal window. Every one of those is treated as an untrusted boundary.
   permission mode. Terminal Handoff never passes
   `--dangerously-skip-permissions`, never changes the permission mode, and never
   runs a destructive Git command.
+- **Session names are untrusted text.** They are stripped of control
+  characters, prevented from beginning with `-`, bounded in length, then passed
+  as a single argv element and escaped for AppleScript. Unicode is preserved; a
+  name can never become a command.
+- **Exactly one process may ever be signalled.** Since 1.1.0 Terminal Handoff
+  stops the parent Claude session after a verified successor heartbeat. It binds
+  that one process by tracing the status-line process's real ancestry, records
+  its PID, start time, TTY, UID, executable name and working directory, and
+  re-proves every one of them immediately before signalling. It sends one
+  `SIGTERM`, at most twice, and **never escalates to `SIGKILL`**. There is no
+  `pkill`, no `killall`, no process-name matching, no process-group signalling
+  and no Terminal window targeting. If anything cannot be proved, nothing is
+  signalled. See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
 
 ## What Terminal Handoff deliberately does not do
 
 - It does not bypass Claude Code's permission system.
-- It does not close, terminate or send keystrokes to any existing session.
+- It does not close any Terminal window, and it never sends keystrokes to a
+  session.
+- It does not terminate any session other than the one parent process it bound
+  at trigger time, and only after that successor has been verified. Unrelated
+  Claude sessions are never targeted, and a parent that cannot be proved is left
+  running.
 - It does not modify shell startup files.
 - It does not modify application repositories.
 - It does not transmit anything off the machine. There is no network code.

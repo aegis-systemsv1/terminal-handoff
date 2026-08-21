@@ -4,6 +4,7 @@
 
 When your session fills up, Terminal Handoff opens a new Terminal window running a genuinely fresh Claude Code session that:
 
+- is named after the original session and its generation: `Ranger` hands off to `Ranger 2`, then `Ranger 3`
 - starts in the **same working directory**
 - uses the **same model**
 - uses the **same supported effort level**
@@ -14,7 +15,7 @@ When your session fills up, Terminal Handoff opens a new Terminal window running
 - continues authorised work
 - can later hand off to another generation, indefinitely
 
-The original Terminal is never closed.
+Once the successor has proved it started correctly, the parent Claude session is asked to exit gracefully, so exactly one session continues the work. Its Terminal window stays open at a shell prompt, and if the successor cannot be verified the parent keeps running. Unrelated Claude sessions and Terminal windows are never touched.
 
 ---
 
@@ -61,7 +62,11 @@ flowchart TD
     K --> L[successor: subagent reads parent transcript]
     L --> M[successor verifies repo state]
     M --> N[continuation report, then continue]
-    K --> O[successor heartbeat confirms<br/>fresh ID, model, effort, cwd]
+    K --> O[successor heartbeat confirms<br/>fresh ID, model, effort, cwd,<br/>chain and generation]
+    O --> P{all checks pass?}
+    P -- no --> Q[parent keeps running,<br/>transfer recorded as failed]
+    P -- yes --> R[graceful SIGTERM to the exact<br/>bound parent Claude process]
+    R --> S[parent Terminal stays open<br/>at its shell prompt]
 ```
 
 The status line stays responsive: below the threshold it parses JSON, renders, and returns. All expensive work — Git capture, manifest building, the Terminal launch — happens in a **detached** process that outlives the short-lived status-line invocation.
@@ -125,7 +130,13 @@ python3 src/terminal_handoff/core.py evaluate < tests/fixtures/at_threshold.json
 unset CLAUDE_TERMINAL_HANDOFF_TEST_MODE
 ```
 
-See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full controlled live-test procedure.
+For a controlled end-to-end test that opens real Terminal windows, stops a real process and starts no Claude session:
+
+```sh
+python3 scripts/live-handoff-test.py
+```
+
+See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full procedure and [docs/LIVE_TEST_EVIDENCE.md](docs/LIVE_TEST_EVIDENCE.md) for a recorded run.
 
 ---
 
@@ -146,6 +157,13 @@ All configuration is environment variables. Terminal Handoff is enabled by defau
 | `CLAUDE_TERMINAL_HANDOFF_CIRCUIT_SECONDS` | How long the breaker stays open | `1800` |
 | `CLAUDE_TERMINAL_HANDOFF_HOME` | State directory | `~/.claude/terminal-handoff` |
 | `CLAUDE_TERMINAL_HANDOFF_CLAUDE_BIN` | Override the `claude` executable | auto-detected |
+| `CLAUDE_TERMINAL_HANDOFF_STOP_PARENT=0` | Never stop the parent session after a handoff | enabled |
+| `CLAUDE_TERMINAL_HANDOFF_HEARTBEAT_TIMEOUT` | Seconds to wait for a verified successor heartbeat before giving up and leaving the parent running | `300` |
+| `CLAUDE_TERMINAL_HANDOFF_STOP_GRACE` | Seconds to wait for the parent to exit after each `SIGTERM` | `20` |
+| `CLAUDE_TERMINAL_HANDOFF_STOP_ATTEMPTS` | `SIGTERM` requests before giving up (never escalates) | `2` |
+| `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN=1` | Run the whole shutdown path but send no signal | unset |
+
+Every `CLAUDE_TERMINAL_HANDOFF_*` variable set when a handoff is triggered is carried into the successor's Terminal window, so a chain keeps the configuration you started it with.
 
 > The status-line process inherits the environment of the Claude Code session that started it. Exporting a variable in one shell does **not** affect sessions that are already running. Set it before starting `claude`, or restart the session. Terminal Handoff does not edit your shell startup files; see [docs/CONFIGURATION.md](docs/CONFIGURATION.md) if you want a setting to persist.
 
@@ -156,7 +174,7 @@ All configuration is environment variables. Terminal Handoff is enabled by defau
 The successor is launched with the outgoing session's exact values, taken from the live status-line JSON:
 
 ```sh
-claude --model "<exact .model.id>" --effort "<exact .effort.level>" --name "<chain>-g<n>" "<bootstrap prompt>"
+claude --model "<exact .model.id>" --effort "<exact .effort.level>" --name "<base name> <generation>" "<bootstrap prompt>"
 ```
 
 There is **no silent fallback**. Terminal Handoff will never substitute a cheaper model, a faster model, a default model, Sonnet for Opus, Opus for Sonnet, or a different effort level. If the reported model or effort cannot be launched, it logs the exact reason, shows a visible warning in the status line, leaves the outgoing session fully operational, and permits a bounded retry after a cooldown.
@@ -164,6 +182,61 @@ There is **no silent fallback**. Terminal Handoff will never substitute a cheape
 Model IDs are treated as untrusted input, allow-listed, and passed as **separate argv elements** — never as shell text. Bracketed IDs such as `claude-opus-5[1m]` survive intact; the brackets are a genuine shell hazard under zsh.
 
 `.effort` is optional in the status-line schema: it is present only when the model exposes reasoning effort. When it is genuinely absent, `--effort` is omitted, and that fact is recorded in the manifest and the log. No effort level is ever invented.
+
+## Successor naming
+
+The successor keeps your session's name and adds its generation number:
+
+```
+Ranger      ->  Ranger 2   ->  Ranger 3   ->  Ranger 4
+Nova Drone  ->  Nova Drone 2
+```
+
+The original generation-one session keeps its name exactly as it is; no `1` is ever appended. The name applies to both the Claude session name and the Terminal window title.
+
+Three rules make this dependable:
+
+1. **The base name is captured once**, from `.session_name` in the official status-line JSON, when the chain is created. It is then stored as explicit chain metadata under `~/.claude/terminal-handoff/chains/` and reused for every later generation. Renaming a successor mid-chain does not rewrite the chain's base name.
+2. **The generation number comes from trusted chain state**, not from the visible name. Terminal Handoff never parses trailing digits off a session name, so a session legitimately named `Project 42` hands off to `Project 42 2` rather than `Project 43`.
+3. **The internal chain identifier is never shown.** `chain_id` remains a machine-safe hex string used for state keying; it never appears as a session name. Names such as `terminal-handoff-7a282bd6-g2` are gone.
+
+A session name is untrusted text. It is stripped of control characters, collapsed to single spaces, prevented from beginning with `-`, and bounded to 64 characters — then passed as a single argv element and escaped for AppleScript. Unicode is preserved. Shell metacharacters cannot become commands.
+
+If no session name is available at all, Terminal Handoff uses the documented fallback `Terminal Handoff <first 8 characters of the chain id>` — it never invents a repository, directory or project name.
+
+## The parent session stops, once the successor is proved
+
+Two agents working in the same repository at once is worse than a full context window. So after a successor is launched there is exactly one transfer-of-ownership boundary.
+
+```
+LAUNCHING  ->  SUCCESSOR_VERIFIED  ->  PARENT_STOP_REQUESTED  ->  TRANSFER_COMPLETE
+     |                  |                        |
+     +------------------+------------------------+---------->  TRANSFER_FAILED
+```
+
+Before `PARENT_STOP_REQUESTED` the **parent** owns continuation. After it, the **successor** does. Transitions are atomic, recorded with a reason, and refused if illegal — which is what stops a duplicate status-line invocation or a second supervisor from requesting a second shutdown.
+
+The successor is only verified when **all** of these hold, proved from its own live status-line JSON across two heartbeats:
+
+- a fresh session ID, different from the parent's and not already used elsewhere in the chain
+- the required model
+- the required effort level (including "no effort level" when the parent had none)
+- the required working directory
+- the correct chain ID
+- the correct generation
+- its own live context percentage
+
+If any check fails, or no verified heartbeat arrives within the timeout, the parent is **left fully operational**, the transfer is recorded as `TRANSFER_FAILED` with the exact reason, and the failure is logged. Terminal Handoff never marks a transfer complete that it could not prove.
+
+### How the exact parent process is identified
+
+The Claude Code session process is bound at trigger time, from inside the status-line process — the only place its real ancestry is visible. Claude Code runs the status line through a shell, so the ancestry is traced with `ps` rather than assumed: the immediate parent is not the Claude process.
+
+The binding records the PID, the process start time, the controlling terminal, the UID, the executable name, the process working directory, the session ID, the chain ID and the generation. Immediately before any signal is sent, every one of those is re-proved. A reused PID, a renamed executable, a different terminal, a different user or a moved working directory all abort the shutdown with the parent left running.
+
+Terminal Handoff does **not** use `pkill`, `killall`, process-name pattern matching, process groups, unverified PID files, Terminal front-window assumptions or generated shell commands. It sends exactly one signal type — `SIGTERM` — to exactly one PID, at most twice, and **never escalates to `SIGKILL`**. If the parent does not exit, that is recorded and logged as a visible failure rather than forced.
+
+The parent's Terminal window and its shell are never signalled: the window remains open at its shell prompt.
 
 ## The continuous generation loop
 
@@ -273,8 +346,11 @@ Stated plainly, because overstating them would make this tool untrustworthy.
 7. **Claude Code only.** Codex and other agent CLIs are **not implemented and not verified**.
 8. **Claude Code auto-updates.** If a future version renames a status-line field, Terminal Handoff fails closed — `TH blocked`, never a wrong trigger. Re-run the suite after a major upgrade.
 9. **Automation permission is required.** If macOS Automation access to Terminal is revoked, launches fail with a logged reason and the outgoing session stays fully operational.
+10. **The parent is only stopped when its process can be proved.** If the Claude Code process cannot be bound from the status line's ancestry — an unusual host setup, a Claude process further than six levels away, or one whose working directory does not match the session's — the handoff still happens and the parent is simply left running. That is the safe direction, but it means two sessions can briefly coexist; the successor is told not to mutate anything until the transfer state authorises it.
+11. **A parent that ignores `SIGTERM` is not forced.** There is no `SIGKILL` path. If the parent does not exit within the grace period, the transfer is recorded as failed and you close the session yourself.
+12. **Renaming a session mid-chain does not rename the chain.** The base display name is captured once, at generation 1, and is deliberately immutable thereafter.
 
-Terminal Handoff **does not** bypass Claude Code permissions, **does not** close the original session, and **does not** execute transcript contents.
+Terminal Handoff **does not** bypass Claude Code permissions, **does not** close the original Terminal window, and **does not** execute transcript contents. It does stop the original Claude *session*, but only the exact process it bound and only after the successor has been verified.
 
 ## Development and testing
 
@@ -285,11 +361,11 @@ python3 tests/test_detector.py                # one module
 
 The suite runs entirely against synthetic status-line fixtures in isolated temporary directories. It opens no Terminal window, starts no Claude session, consumes no context window and modifies no real repository — Git tests build throwaway repositories under `/tmp`.
 
-See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the decision records in [docs/decisions/](docs/decisions/0001-parent-shutdown-and-successor-naming.md).
 
 ## Version
 
-**1.0.1** — see [CHANGELOG.md](CHANGELOG.md).
+**1.1.0** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Licence
 

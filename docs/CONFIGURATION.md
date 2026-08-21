@@ -19,9 +19,45 @@ files.
 | `CLAUDE_TERMINAL_HANDOFF_CIRCUIT_SECONDS` | how long the breaker stays open | `1800` |
 | `CLAUDE_TERMINAL_HANDOFF_HOME` | state directory | `~/.claude/terminal-handoff` |
 | `CLAUDE_TERMINAL_HANDOFF_CLAUDE_BIN` | explicit `claude` executable | auto-detected |
+| `CLAUDE_TERMINAL_HANDOFF_STOP_PARENT` | `0` never stops the parent session after a handoff | enabled |
+| `CLAUDE_TERMINAL_HANDOFF_HEARTBEAT_TIMEOUT` | seconds to wait for a verified successor heartbeat | `300` |
+| `CLAUDE_TERMINAL_HANDOFF_STOP_GRACE` | seconds to wait for the parent to exit after each `SIGTERM` | `20` |
+| `CLAUDE_TERMINAL_HANDOFF_STOP_ATTEMPTS` | `SIGTERM` requests before giving up; never escalates | `2` |
+| `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN` | `1` runs the whole shutdown path but sends no signal | unset |
+| `CLAUDE_TERMINAL_HANDOFF_TRANSFER_POLL` | supervisor poll interval in seconds | `2` |
 
 Invalid values fall back to the default rather than failing: a non-numeric
 threshold, or one outside 0-100, is ignored and 80 is used.
+
+## Parent shutdown
+
+Since 1.1.0, once a successor has proved it started correctly, Terminal Handoff
+asks the parent Claude session to exit so that only one session continues the
+work. The Terminal window itself is never closed; it returns to its shell
+prompt.
+
+If verification fails, times out, or the parent process cannot be re-proved, the
+parent is left fully operational and the transfer is recorded as
+`TRANSFER_FAILED`. To turn the behaviour off entirely and keep both sessions
+running:
+
+```sh
+export CLAUDE_TERMINAL_HANDOFF_STOP_PARENT=0
+```
+
+To exercise the whole path without ever signalling anything — useful when
+validating an upgrade:
+
+```sh
+export CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN=1
+```
+
+## Configuration is inherited by successors
+
+Apple Terminal starts a fresh login shell that does not inherit the launcher's
+environment, so every `CLAUDE_TERMINAL_HANDOFF_*` variable that is set when a
+handoff triggers is written into the successor's launch script explicitly. A
+chain therefore keeps the settings you started it with, for every generation.
 
 ## The scope gotcha
 

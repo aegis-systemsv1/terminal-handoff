@@ -7,6 +7,7 @@ and a successor never inherits its parent's claim.
 
 from terminal_handoff.core import (  # noqa: F401
     STATE_DIRS,
+    chain_generation_for_session,
     chain_identity,
     circuit_is_open,
     claim_trigger,
@@ -15,8 +16,10 @@ from terminal_handoff.core import (  # noqa: F401
     log_event,
     observation_count,
     record_launch,
+    record_chain_generation,
     record_observation,
     recent_launch_times,
+    read_chain_state,
     rotate_logs,
     set_state,
     storm_reset_epoch,
@@ -24,10 +27,12 @@ from terminal_handoff.core import (  # noqa: F401
     th_home,
     th_path,
     trip_circuit,
+    update_json_locked,
 )
 
 __all__ = [
     "STATE_DIRS",
+    "chain_generation_for_session",
     "chain_identity",
     "circuit_is_open",
     "claim_trigger",
@@ -36,8 +41,10 @@ __all__ = [
     "log_event",
     "observation_count",
     "record_launch",
+    "record_chain_generation",
     "record_observation",
     "recent_launch_times",
+    "read_chain_state",
     "rotate_logs",
     "set_state",
     "storm_reset_epoch",
@@ -45,4 +52,5 @@ __all__ = [
     "th_home",
     "th_path",
     "trip_circuit",
+    "update_json_locked",
 ]

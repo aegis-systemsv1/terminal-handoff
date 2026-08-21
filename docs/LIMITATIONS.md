@@ -3,6 +3,30 @@
 Stated plainly. A tool that automates opening agent sessions is only worth
 trusting if it is honest about what it cannot do.
 
+## 0. The parent is only stopped when its process can be proved
+
+Terminal Handoff binds the exact Claude Code process by walking the status-line
+process's real ancestry, and re-proves that binding immediately before
+signalling it. If it cannot — an unusual host topology, a Claude process more
+than six ancestry levels away, one whose working directory does not match the
+session's, or a PID that has been reused — the handoff still happens and the
+parent is **left running**.
+
+That is the safe direction, but it means two sessions can coexist. The successor
+is told explicitly not to mutate anything until the transfer state authorises
+it, and `terminal-handoff.py status` shows every transfer's state.
+
+There is also no `SIGKILL` path. A parent that ignores `SIGTERM` is recorded as
+`parent_stop_unconfirmed` and left alone; you close it yourself.
+
+## 0a. A chain's base name is immutable
+
+The human-facing base name is captured once, at generation 1, from
+`.session_name`. Renaming a successor mid-chain does not rewrite it: generation
+4 of a chain created as `Ranger` is `Ranger 4`, whatever you renamed generation
+3 to. Generation numbers are never inferred from a visible name, so a session
+legitimately called `Project 42` hands off to `Project 42 2`.
+
 ## 1. `ultracode` cannot be preserved
 
 `claude --effort ultracode` is accepted by the CLI, but it is not an effort

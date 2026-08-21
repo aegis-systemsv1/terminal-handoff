@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "terminal-handoff"
-version = "1.0.1"
+version = "1.1.0"
 description = "Automatically hand off long Claude Code sessions to a fresh Terminal context while preserving model, effort and verified working state."
 readme = "README.md"
 requires-python = ">=3.9"
