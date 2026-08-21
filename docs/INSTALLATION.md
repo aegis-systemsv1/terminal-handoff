@@ -172,6 +172,76 @@ Pull, then re-run `./install.sh --apply`. The installer is idempotent: it
 recognises its own status-line command under any module name and will not wrap
 itself.
 
+Before upgrading, take a snapshot you can return to. The installer backs up
+settings files, but it overwrites the runtime in place:
+
+```sh
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+BACKUP="$HOME/.claude/terminal-handoff/backups/pre-upgrade-$STAMP"
+mkdir -p "$BACKUP" && chmod 700 "$BACKUP"
+cp "$HOME/.claude/terminal-handoff/terminal-handoff.py" "$BACKUP/"
+cp "$HOME/.claude/terminal-handoff/successor-prompt.md" "$BACKUP/"
+cp "$HOME/.claude/terminal-handoff/uninstall.sh" "$BACKUP/"
+cp "$HOME/.claude/terminal-handoff/VERSION" "$BACKUP/" 2>/dev/null
+cp "$HOME/.claude/settings.json" "$BACKUP/"
+cp "$HOME/.claude/CLAUDE.md" "$BACKUP/"
+echo "$BACKUP"
+```
+
+After upgrading, confirm what is actually installed:
+
+```sh
+python3 ~/.claude/terminal-handoff/terminal-handoff.py version
+python3 ~/.claude/terminal-handoff/terminal-handoff.py status
+python3 ~/.claude/terminal-handoff/terminal-handoff.py coverage
+```
+
+Running Claude Code sessions pick up the new runtime on their next status
+refresh. There is nothing to restart.
+
+## Rolling back
+
+Three levels, from least to most disruptive.
+
+**1. Turn off the new behaviour, keep the version.** If parent shutdown is the
+only thing you want to undo, set this before starting `claude` — no reinstall
+needed:
+
+```sh
+export CLAUDE_TERMINAL_HANDOFF_STOP_PARENT=0
+```
+
+`CLAUDE_TERMINAL_HANDOFF_DISABLED=1` turns off triggering entirely.
+
+**2. Restore the previous runtime from your snapshot.** The runtime is a single
+file plus its prompt template, so this is a copy:
+
+```sh
+BACKUP="$HOME/.claude/terminal-handoff/backups/pre-upgrade-<stamp>"
+cp "$BACKUP/terminal-handoff.py" "$HOME/.claude/terminal-handoff/terminal-handoff.py"
+cp "$BACKUP/successor-prompt.md" "$HOME/.claude/terminal-handoff/successor-prompt.md"
+cp "$BACKUP/uninstall.sh"        "$HOME/.claude/terminal-handoff/uninstall.sh"
+cp "$BACKUP/VERSION"             "$HOME/.claude/terminal-handoff/VERSION" 2>/dev/null
+chmod 700 "$HOME/.claude/terminal-handoff/terminal-handoff.py" \
+          "$HOME/.claude/terminal-handoff/uninstall.sh"
+chmod 600 "$HOME/.claude/terminal-handoff/successor-prompt.md"
+python3 ~/.claude/terminal-handoff/terminal-handoff.py version
+```
+
+Or reinstall a published version from source:
+
+```sh
+cd /path/to/Terminal-Handoff
+git checkout v1.0.1
+./install.sh --apply
+```
+
+The status-line command in `settings.json` names a path, not a version, so it
+keeps working across either route. Existing manifests and chain state stay on
+disk; an older runtime ignores the fields it does not know.
+
+**3. Remove it entirely.** See [UNINSTALLATION.md](UNINSTALLATION.md).
+
 ## Uninstall
 
 See [UNINSTALLATION.md](UNINSTALLATION.md).

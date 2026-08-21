@@ -311,6 +311,13 @@ Project-level settings override user-level settings, so any repository defining 
 python3 src/terminal_handoff/core.py coverage
 ```
 
+## Rolling back
+
+To undo just the parent-shutdown behaviour without changing versions, set
+`CLAUDE_TERMINAL_HANDOFF_STOP_PARENT=0` before starting `claude`. To restore a
+previous runtime, or to remove Terminal Handoff entirely, see
+[docs/INSTALLATION.md](docs/INSTALLATION.md#rolling-back).
+
 ## Uninstallation
 
 ```sh
