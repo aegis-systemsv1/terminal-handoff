@@ -19,6 +19,20 @@ it, and `terminal-handoff.py status` shows every transfer's state.
 There is also no `SIGKILL` path. A parent that ignores `SIGTERM` is recorded as
 `parent_stop_unconfirmed` and left alone; you close it yourself.
 
+One window cannot be closed entirely. POSIX signals address a PID, not a
+specific process, and macOS offers no handle equivalent that would let a process
+be signalled by identity. Terminal Handoff re-proves the PID, start time, UID,
+executable name, terminal and working directory with no wait between the check
+and the signal, which reduces the window to microseconds and makes any
+substituted process detectable in the general case — but it does not reduce it
+to zero. Recording the start time is what makes PID reuse detectable at all;
+without it, the reuse would be silent.
+
+The practical exposure is small: PIDs are not reused that quickly on macOS, and
+the replacement would have to be another process of yours whose executable is
+also named `claude`, on the same TTY, in the same directory. It is stated here
+because "we check immediately before signalling" is a mitigation, not a proof.
+
 ## 0a. A chain's base name is immutable
 
 The human-facing base name is captured once, at generation 1, from

@@ -143,6 +143,15 @@ parent left running and the transfer recorded as failed:
 
 ### Signalling
 
+There is one window that cannot be closed. POSIX signals name a PID, not a
+process, and macOS offers no handle that would let a process be signalled by
+identity. Re-proving immediately before the signal reduces the window to
+microseconds and makes a substituted process detectable in the general case; it
+does not eliminate it. Recording the start time is what makes PID reuse
+detectable at all. The residual exposure requires another of the user's own
+processes to acquire the same PID within that window, be named `claude`, be on
+the same TTY and be in the same directory.
+
 One `SIGTERM`, to one PID, at most twice, with a grace period between attempts.
 If the process has not exited, Terminal Handoff records
 `parent_stop_unconfirmed`, marks the transfer `TRANSFER_FAILED`, and stops. It
