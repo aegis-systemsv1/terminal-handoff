@@ -5,6 +5,32 @@ All notable changes to Terminal Handoff are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-08-22
+
+### Fixed
+
+- **The launch record could appear before the records it summarises.** A
+  handoff wrote `completed/<session-id>.launch.json` before updating the
+  manifest, the lifecycle state and the transfer record, so anything watching
+  for that file - the test suite, and any external tooling - could read a
+  manifest still marked `eligible` for a launch that had already happened. The
+  launch record is now written last on every path, so its appearance means
+  every other record for that handoff is already on disk. Surfaced by an
+  intermittent failure of `test_30_test_mode_suppresses_real_terminal_launch`
+  on a slow runner.
+
+### Changed
+
+- Documentation states the residual PID-reuse window plainly: re-proving the
+  binding immediately before signalling reduces the window to microseconds and
+  makes a substituted process detectable in the general case, but POSIX signals
+  name a PID rather than a process and macOS offers no handle that closes the
+  gap entirely.
+- The upgrade snapshot and rollback procedure are documented in
+  `docs/INSTALLATION.md`.
+
+---
+
 ## [1.1.0] - 2026-08-22
 
 Behaviour and safety release. Two production defects reported from live use are

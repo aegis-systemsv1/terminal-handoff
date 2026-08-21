@@ -372,7 +372,7 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), [docs/ARCHITECTURE.md](docs/ARCH
 
 ## Version
 
-**1.1.0** — see [CHANGELOG.md](CHANGELOG.md).
+**1.1.1** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Licence
 
