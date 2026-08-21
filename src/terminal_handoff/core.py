@@ -33,7 +33,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.1.0"
+TERMINAL_HANDOFF_VERSION = "1.1.1"
 MANIFEST_SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
@@ -2344,7 +2344,13 @@ def perform_launch(payload_file):
         "applescript": result.get("applescript"),
         "ts": utc_stamp(),
     }
-    write_json_private(th_path("completed", "%s.launch.json" % session_id), launch_record)
+    # The launch record is written last on every path, so its appearance means
+    # every other record for this handoff - manifest, lifecycle state, transfer
+    # - has already been written. Writing it first left a window in which the
+    # record existed but the manifest still said `eligible`.
+    def record_outcome(code):
+        write_json_private(th_path("completed", "%s.launch.json" % session_id), launch_record)
+        return code
 
     if test_mode:
         update_manifest(
@@ -2360,7 +2366,7 @@ def perform_launch(payload_file):
             successor_display_name=display.get("successor_display_name"),
             argv=launch_record["argv_redacted_prompt"],
         )
-        return 0
+        return record_outcome(0)
 
     if result.get("launched"):
         update_manifest(mpath, lambda m: m["successor"].update({"launch_state": "launched"}))
@@ -2393,7 +2399,7 @@ def perform_launch(payload_file):
             parent_process_bound=bool(binding),
             supervisor_spawned=bool(supervised),
         )
-        return 0
+        return record_outcome(0)
 
     transfer_transition(
         transfer_file,
@@ -2407,7 +2413,7 @@ def perform_launch(payload_file):
         detail=result.get("stderr") or result.get("error"),
         manifest_file=mpath,
     )
-    return 10
+    return record_outcome(10)
 
 
 def spawn_launcher(payload, parent_binding=None):
