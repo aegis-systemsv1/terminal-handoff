@@ -7,6 +7,47 @@ python3 ~/.claude/terminal-handoff/terminal-handoff.py status
 tail -20 ~/.claude/terminal-handoff/logs/terminal-handoff.log
 ```
 
+## The parent session did not stop after a handoff
+
+By design, that means it could not be proved safe to stop it. Look at the
+transfer record:
+
+```sh
+python3 ~/.claude/terminal-handoff/terminal-handoff.py status
+cat ~/.claude/terminal-handoff/transfers/<parent-session-id>.json
+```
+
+The `state` and the last `history` entry give the exact reason:
+
+| State | Meaning |
+|---|---|
+| `LAUNCHING` | no verified successor heartbeat yet; the parent still owns the work |
+| `SUCCESSOR_VERIFIED` | the successor is proved; the shutdown request is next |
+| `PARENT_STOP_REQUESTED` | `SIGTERM` sent; waiting for the parent to exit |
+| `TRANSFER_COMPLETE` | the parent stopped; the successor owns the work |
+| `TRANSFER_FAILED` | the parent is still running, and the reason says why |
+
+Common reasons, all deliberate:
+
+- *no verified successor heartbeat within Ns* — the successor never started, or
+  started with the wrong model, effort, directory, chain or generation. Check
+  `failed_checks` in the parent's manifest.
+- *the parent Claude process was not bound at trigger time* — its ancestry could
+  not be traced; see [LIMITATIONS.md](LIMITATIONS.md).
+- *parent process identity could not be re-proved* — the PID was reused, the
+  terminal changed, or the working directory moved.
+- *parent pid N did not exit* — it ignored `SIGTERM`. Terminal Handoff does not
+  escalate. Close that session yourself.
+
+To stop trying entirely, `export CLAUDE_TERMINAL_HANDOFF_STOP_PARENT=0`.
+
+## The successor is named `Terminal Handoff <hex> 2`
+
+That is the documented fallback used when the status-line JSON carried no
+`.session_name`. Name the session (`/rename`) before it hands off and the chain
+will use that name instead. Terminal Handoff will not substitute a repository or
+directory name.
+
 ## No status line appears at all
 
 1. Confirm the setting exists:

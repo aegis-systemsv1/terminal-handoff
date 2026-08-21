@@ -51,6 +51,14 @@ repositories under a temporary directory.
    ./scripts/coverage-check.sh
    ./scripts/verify-release.sh
    ```
+5. For a change to the launch, naming or shutdown path, run the controlled live
+   test as well. It opens real Terminal windows and stops a real process, but
+   starts no Claude session and consumes no context window:
+   ```sh
+   python3 scripts/live-handoff-test.py
+   ```
+6. A change to behaviour that a future maintainer could reasonably reverse needs
+   a decision record in `docs/decisions/`, stating what was rejected and why.
 5. Keep commits focused and their messages descriptive.
 
 ## Commit style

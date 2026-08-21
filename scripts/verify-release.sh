@@ -49,6 +49,11 @@ if "$PY" -m compileall -q src tests >/dev/null 2>&1; then
 else
     report "python compilation failed"
 fi
+if "$PY" -m compileall -q scripts >/dev/null 2>&1; then
+    ok "helper scripts compile"
+else
+    report "helper script compilation failed"
+fi
 for script in install.sh uninstall.sh scripts/coverage-check.sh scripts/verify-release.sh; do
     interpreter=sh
     head -1 "$script" | grep -q zsh && interpreter=zsh
@@ -62,7 +67,10 @@ done
 printf '\nRequired files\n'
 for f in README.md LICENSE CHANGELOG.md SECURITY.md CONTRIBUTING.md CODE_OF_CONDUCT.md \
          pyproject.toml .gitignore .editorconfig install.sh uninstall.sh \
-         src/terminal_handoff/core.py src/terminal_handoff/templates/successor-prompt.md; do
+         src/terminal_handoff/core.py src/terminal_handoff/templates/successor-prompt.md \
+         src/terminal_handoff/naming.py src/terminal_handoff/transfer.py \
+         scripts/live-handoff-test.py docs/LIVE_TEST_EVIDENCE.md \
+         docs/decisions/0001-parent-shutdown-and-successor-naming.md; do
     if [ -f "$f" ]; then ok "$f"; else report "missing: $f"; fi
 done
 

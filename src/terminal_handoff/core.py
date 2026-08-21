@@ -26,14 +26,15 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.0.1"
-MANIFEST_SCHEMA_VERSION = 1
+TERMINAL_HANDOFF_VERSION = "1.1.0"
+MANIFEST_SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -90,6 +91,8 @@ STATE_DIRS = (
     "backups",
     "prompts",
     "state",
+    "chains",
+    "transfers",
 )
 
 TRUTHY = ("1", "true", "yes", "on")
@@ -673,12 +676,16 @@ def record_launch(session_id, chain_id, generation, now=None):
 # ---------------------------------------------------------------------------
 
 
-def chain_identity():
+def chain_identity(session_id=None, session_name=None):
     """Return (chain_id, generation, parent_manifest_path, parent_session_id).
 
     A successor learns its chain from environment variables exported by the
     Terminal Handoff launcher into its Terminal window. An ordinary session
     starts a new chain at generation 1.
+
+    The generation is cross-checked against trusted Terminal Handoff chain
+    state, which is authoritative when it knows this session. It is never
+    inferred by parsing trailing digits off a visible session name.
     """
     chain = os.environ.get("CLAUDE_TERMINAL_HANDOFF_CHAIN_ID", "").strip()
     if not CHAIN_ID_RE.match(chain or ""):
@@ -688,9 +695,197 @@ def chain_identity():
     parent_session = os.environ.get("CLAUDE_TERMINAL_HANDOFF_PARENT_SESSION", "").strip() or None
     if chain is None:
         return uuid.uuid4().hex[:12], 1, None, None
+    recorded = chain_generation_for_session(chain, session_id)
+    if recorded:
+        generation = recorded
     if generation < 1:
         generation = 1
     return chain, generation, parent_manifest, parent_session
+
+
+# ---------------------------------------------------------------------------
+# Human-facing session display names
+# ---------------------------------------------------------------------------
+
+# A Claude session name is human-facing text. Terminal Handoff keeps the base
+# name exactly as the user chose it and appends the generation number:
+#
+#     Ranger      ->  Ranger 2  ->  Ranger 3  ->  Ranger 4
+#     Nova Drone  ->  Nova Drone 2
+#
+# The machine-safe chain identifier stays separate and is never shown as a
+# session name.
+DISPLAY_NAME_MAX = 64
+DISPLAY_NAME_CONVENTION = "SessionName, SessionName 2, SessionName 3, SessionName 4"
+
+# Control characters, line separators and paragraph separators are removed
+# before a name is used. Everything else - including Unicode - is preserved:
+# a display name is only ever passed as a single argv element (never as shell
+# text) and escaped for AppleScript, so it cannot alter a command.
+DISPLAY_NAME_STRIP_RE = re.compile(u"[\x00-\x1f\x7f\u2028\u2029]")
+
+
+def sanitize_display_name(raw):
+    """Return a safe human-facing name, or None when there isn't one."""
+    if not isinstance(raw, str):
+        return None
+    text = DISPLAY_NAME_STRIP_RE.sub(" ", raw)
+    text = " ".join(text.split())
+    # A leading dash would make the name look like a command-line flag.
+    text = text.lstrip("-").strip()
+    if not text:
+        return None
+    if len(text) > DISPLAY_NAME_MAX:
+        text = text[:DISPLAY_NAME_MAX].rstrip()
+    return text or None
+
+
+def fallback_base_name(chain_id):
+    """Documented safe fallback when no Claude session name is available.
+
+    Terminal Handoff never invents a repository, directory or project name to
+    stand in for a session name.
+    """
+    return "Terminal Handoff %s" % (str(chain_id or "")[:8] or "chain")
+
+
+def generation_display_name(base_name, generation):
+    """`Ranger` -> `Ranger 2`. Generation 1 keeps the base name unchanged."""
+    base = sanitize_display_name(base_name)
+    if base is None:
+        return None
+    try:
+        gen = int(generation)
+    except (TypeError, ValueError):
+        return base
+    if gen <= 1:
+        return base
+    return "%s %d" % (base, gen)
+
+
+def successor_session_name(base_name, successor_generation):
+    """The successor's human-facing Claude session name."""
+    return generation_display_name(base_name, successor_generation)
+
+
+# ---------------------------------------------------------------------------
+# Trusted chain metadata
+# ---------------------------------------------------------------------------
+
+
+def update_json_locked(path, mutator, default=None):
+    """Read-modify-write a private JSON file under an exclusive lock."""
+    ensure_dirs()
+    _mkdir_private(os.path.dirname(path) or ".")
+    lock_path = path + ".lock"
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = read_json(path)
+        if not isinstance(data, dict):
+            data = dict(default or {})
+        mutator(data)
+        write_json_private(path, data)
+        return data
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def chain_state_path(chain_id):
+    return th_path("chains", "%s.json" % chain_id)
+
+
+def read_chain_state(chain_id):
+    if not chain_id or not CHAIN_ID_RE.match(str(chain_id)):
+        return None
+    data = read_json(chain_state_path(chain_id))
+    return data if isinstance(data, dict) else None
+
+
+def record_chain_generation(
+    chain_id, generation, session_id=None, display_name=None, base_name=None, source=None, **extra
+):
+    """Record trusted chain metadata for one generation.
+
+    The base display name is written once, when the chain is created, and is
+    never rewritten by a later generation: it is the chain's identity.
+    """
+    if not chain_id or not CHAIN_ID_RE.match(str(chain_id)):
+        return None
+
+    def mutate(data):
+        data["chain_id"] = chain_id
+        data["schema_version"] = MANIFEST_SCHEMA_VERSION
+        if base_name and not data.get("base_display_name"):
+            data["base_display_name"] = base_name
+            data["base_name_source"] = source or "unknown"
+            data["naming_convention"] = DISPLAY_NAME_CONVENTION
+            data["created_utc"] = utc_stamp()
+        generations = data.setdefault("generations", {})
+        entry = generations.setdefault(str(int(generation)), {})
+        entry["generation"] = int(generation)
+        entry["updated_utc"] = utc_stamp()
+        if display_name:
+            entry["display_name"] = display_name
+        if session_id:
+            entry["session_id"] = session_id
+            seen = data.setdefault("session_ids", [])
+            if session_id not in seen:
+                seen.append(session_id)
+        entry.update(extra)
+        try:
+            latest = int(data.get("latest_generation") or 0)
+        except (TypeError, ValueError):
+            latest = 0
+        data["latest_generation"] = max(int(generation), latest)
+
+    return update_json_locked(chain_state_path(chain_id), mutate, {"chain_id": chain_id})
+
+
+def chain_generation_for_session(chain_id, session_id):
+    """The generation this session occupies, from trusted chain state only."""
+    data = read_chain_state(chain_id)
+    if not data or not session_id:
+        return None
+    for key, entry in (data.get("generations") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("session_id") == session_id:
+            try:
+                return int(entry.get("generation", key))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def resolve_base_display_name(chain_id, generation, session_name):
+    """Return (base_name, source) for a chain.
+
+    Generation 1 captures the live Claude session name from the official
+    status-line JSON. Every later generation takes the base name from trusted
+    Terminal Handoff chain state - never by parsing trailing digits off a
+    visible session name.
+    """
+    try:
+        generation = int(generation)
+    except (TypeError, ValueError):
+        generation = 1
+    if generation > 1:
+        state = read_chain_state(chain_id) or {}
+        stored = sanitize_display_name(state.get("base_display_name"))
+        if stored:
+            return stored, "chain_state"
+        from_env = sanitize_display_name(os.environ.get("CLAUDE_TERMINAL_HANDOFF_BASE_NAME"))
+        if from_env:
+            return from_env, "environment"
+        return fallback_base_name(chain_id), "fallback"
+    captured = sanitize_display_name(session_name)
+    if captured:
+        return captured, "session_name"
+    return fallback_base_name(chain_id), "fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -784,11 +979,18 @@ def decide(payload, validate_files=True, now=None, record=True):
         return result
 
     # Gate 4: optional generation ceiling.
-    chain_id, generation, parent_manifest, parent_session = chain_identity()
+    chain_id, generation, parent_manifest, parent_session = chain_identity(
+        facts.session_id, facts.session_name
+    )
+    base_name, base_source = resolve_base_display_name(chain_id, generation, facts.session_name)
     result["chain_id"] = chain_id
     result["generation"] = generation
     result["parent_manifest"] = parent_manifest
     result["parent_session_id"] = parent_session
+    result["base_display_name"] = base_name
+    result["base_name_source"] = base_source
+    result["display_name"] = generation_display_name(base_name, generation)
+    result["successor_display_name"] = generation_display_name(base_name, generation + 1)
     ceiling = max_generations()
     if ceiling is not None and generation >= ceiling:
         result["state"] = "max_generations"
@@ -1009,6 +1211,12 @@ def build_manifest(facts, decision, now=None):
     now = now if now is not None else time.time()
     chain_id = decision.get("chain_id") or uuid.uuid4().hex[:12]
     generation = decision.get("generation") or 1
+    base_name = decision.get("base_display_name")
+    base_source = decision.get("base_name_source")
+    if not base_name:
+        base_name, base_source = resolve_base_display_name(
+            chain_id, generation, facts.session_name
+        )
     repo = capture_repo_state(facts.current_dir)
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -1016,6 +1224,19 @@ def build_manifest(facts, decision, now=None):
         "system": "Terminal Handoff",
         "chain_id": chain_id,
         "generation": generation,
+        "display": {
+            "base_name": base_name,
+            "base_name_source": base_source,
+            "outgoing_display_name": generation_display_name(base_name, generation),
+            "successor_display_name": generation_display_name(base_name, generation + 1),
+            "convention": DISPLAY_NAME_CONVENTION,
+            "note": (
+                "The human-facing session name is the chain's base name plus the "
+                "generation number. Generation 1 keeps the base name unchanged. The "
+                "chain_id above is a machine-safe identifier and is never shown as a "
+                "session name."
+            ),
+        },
         "parent_handoff_manifest": decision.get("parent_manifest"),
         "parent_of_outgoing_session_id": decision.get("parent_session_id"),
         "outgoing": {
@@ -1061,6 +1282,8 @@ def build_manifest(facts, decision, now=None):
             "expected_model_id": facts.model_id,
             "expected_effort_level": facts.effort_level,
             "expected_current_dir": facts.current_dir,
+            "expected_display_name": generation_display_name(base_name, generation + 1),
+            "expected_chain_id": chain_id,
             "generation": generation + 1,
         },
         "validation_warnings": list(facts.warnings) + list(decision.get("warnings") or []),
@@ -1122,10 +1345,6 @@ def find_claude_executable():
     return None
 
 
-def successor_session_name(chain_id, generation):
-    return "terminal-handoff-%s-g%d" % (chain_id[:8], generation)
-
-
 def build_launch_argv(manifest, claude_bin, prompt_text):
     """Construct the successor launch argv.
 
@@ -1150,7 +1369,13 @@ def build_launch_argv(manifest, claude_bin, prompt_text):
         argv += ["--effort", effort]
     # else: effort proven unavailable -> --effort omitted, recorded in manifest.
 
-    argv += ["--name", successor_session_name(chain_id, generation + 1)]
+    display = manifest.get("display") or {}
+    successor_name = sanitize_display_name(display.get("successor_display_name"))
+    if not successor_name:
+        # Fail closed on to the documented fallback rather than inventing a
+        # name from the repository, the directory or the chain identifier.
+        successor_name = successor_session_name(fallback_base_name(chain_id), generation + 1)
+    argv += ["--name", successor_name]
     argv += [prompt_text]
     return argv
 
@@ -1210,8 +1435,18 @@ def render_successor_prompt(manifest, template_path=None):
         template = FALLBACK_PROMPT_TEMPLATE
     effort = manifest.get("effort") or {}
     effort_display = effort.get("level") if effort.get("available") else "unavailable (not exposed by this model/version)"
+    display = manifest.get("display") or {}
+    generation = int(manifest.get("generation") or 1)
+    base_name = display.get("base_name")
     values = {
-        "{{GENERATION}}": str(int(manifest.get("generation") or 1) + 1),
+        "{{GENERATION}}": str(generation + 1),
+        "{{DISPLAY_NAME}}": str(display.get("successor_display_name") or "this session"),
+        "{{SUCCESSOR_DISPLAY_NAME}}": str(
+            generation_display_name(base_name, generation + 2) or "the next generation"
+        ),
+        "{{BASE_DISPLAY_NAME}}": str(base_name or "unavailable"),
+        "{{PARENT_DISPLAY_NAME}}": str(display.get("outgoing_display_name") or "unknown"),
+        "{{TRANSFER_PATH}}": transfer_path((manifest.get("outgoing") or {}).get("session_id")),
         "{{CHAIN_ID}}": str(manifest.get("chain_id")),
         "{{PARENT_SESSION_ID}}": str((manifest.get("outgoing") or {}).get("session_id")),
         "{{PARENT_GENERATION}}": str(manifest.get("generation")),
@@ -1232,11 +1467,18 @@ def render_successor_prompt(manifest, template_path=None):
 
 FALLBACK_PROMPT_TEMPLATE = """TERMINAL HANDOFF SUCCESSOR
 
-You are generation {{GENERATION}} of Terminal Handoff chain {{CHAIN_ID}}.
+You are {{DISPLAY_NAME}}: generation {{GENERATION}} of Terminal Handoff chain
+{{CHAIN_ID}}.
 Parent session: {{PARENT_SESSION_ID}}
 Handoff manifest: {{HANDOFF_MANIFEST_PATH}}
 Required model: {{MODEL_ID}}
 Required effort: {{EFFORT_LEVEL}}
+Transfer state: {{TRANSFER_PATH}}
+
+Your parent session may still be running and still own the work. Do not mutate
+any repository file until your heartbeat has been validated, your repository
+verification is complete, and the transfer state reads PARENT_STOP_REQUESTED or
+TRANSFER_COMPLETE. Reading and verifying are always allowed.
 
 Read the manifest, delegate parent-transcript analysis to a context-isolated
 subagent, verify repository state independently, then produce a TERMINAL HANDOFF
@@ -1249,8 +1491,8 @@ def bootstrap_prompt(manifest, prompt_file):
     which keeps them out of the process listing."""
     return (
         "TERMINAL HANDOFF SUCCESSOR - chain %s, generation %d. "
-        "Read the file %s and follow it exactly, in full, before doing anything else. "
-        "Your handoff manifest is %s."
+        "Read %s in full and follow it exactly before anything else. "
+        "Mutate nothing until the transfer state authorises it. Manifest: %s."
         % (
             manifest.get("chain_id"),
             int(manifest.get("generation") or 1) + 1,
@@ -1270,27 +1512,72 @@ def applescript_quote(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def build_launch_script(manifest, argv, workdir, manifest_file):
+# Terminal Handoff configuration is carried into the successor's Terminal
+# window so that a chain keeps the operator's settings. Apple Terminal starts a
+# fresh login shell that does not inherit the launcher's environment.
+PROPAGATED_ENV_RE = re.compile(r"^CLAUDE_TERMINAL_HANDOFF_[A-Z0-9_]+$")
+
+# Set explicitly per handoff; never copied from the launcher's environment.
+PER_HANDOFF_ENV = (
+    "CLAUDE_TERMINAL_HANDOFF_MANIFEST",
+    "CLAUDE_TERMINAL_HANDOFF_CHAIN_ID",
+    "CLAUDE_TERMINAL_HANDOFF_GENERATION",
+    "CLAUDE_TERMINAL_HANDOFF_PARENT_SESSION",
+    "CLAUDE_TERMINAL_HANDOFF_BASE_NAME",
+    "CLAUDE_TERMINAL_HANDOFF_DISPLAY_NAME",
+    "CLAUDE_TERMINAL_HANDOFF_TRANSFER",
+)
+
+
+def propagated_environment(environ=None):
+    """The Terminal Handoff settings a successor should inherit."""
+    environ = os.environ if environ is None else environ
+    carried = {}
+    for key in sorted(environ):
+        if key in PER_HANDOFF_ENV:
+            continue
+        if not PROPAGATED_ENV_RE.match(key):
+            continue
+        value = environ[key]
+        if not isinstance(value, str) or "\x00" in value:
+            continue
+        carried[key] = value
+    return carried
+
+
+def build_launch_script(manifest, argv, workdir, manifest_file, transfer_file=None):
     """Generate the per-handoff shell script executed in the new Terminal window.
 
     Every value is single-quoted with shlex.quote. No eval, no interpolation of
     transcript content, no clipboard use.
     """
+    display = manifest.get("display") or {}
+    generation = int(manifest.get("generation") or 1)
+    successor_name = display.get("successor_display_name") or ""
     lines = [
         "#!/bin/zsh",
         "# Terminal Handoff " + TERMINAL_HANDOFF_VERSION + " - successor launcher",
         "# Generated %s for chain %s generation %d"
-        % (utc_stamp(), manifest.get("chain_id"), int(manifest.get("generation") or 1) + 1),
+        % (utc_stamp(), manifest.get("chain_id"), generation + 1),
         "set -e",
         "cd -- %s || { echo 'Terminal Handoff: working directory unavailable'; exit 1; }" % shlex.quote(workdir),
+    ]
+    for key, value in propagated_environment().items():
+        lines.append("export %s=%s" % (key, shlex.quote(value)))
+    lines += [
         "export CLAUDE_TERMINAL_HANDOFF_MANIFEST=%s" % shlex.quote(manifest_file),
         "export CLAUDE_TERMINAL_HANDOFF_CHAIN_ID=%s" % shlex.quote(str(manifest.get("chain_id"))),
-        "export CLAUDE_TERMINAL_HANDOFF_GENERATION=%s"
-        % shlex.quote(str(int(manifest.get("generation") or 1) + 1)),
+        "export CLAUDE_TERMINAL_HANDOFF_GENERATION=%s" % shlex.quote(str(generation + 1)),
         "export CLAUDE_TERMINAL_HANDOFF_PARENT_SESSION=%s"
         % shlex.quote(str((manifest.get("outgoing") or {}).get("session_id"))),
+        "export CLAUDE_TERMINAL_HANDOFF_BASE_NAME=%s" % shlex.quote(str(display.get("base_name") or "")),
+        "export CLAUDE_TERMINAL_HANDOFF_DISPLAY_NAME=%s" % shlex.quote(str(successor_name)),
+    ]
+    if transfer_file:
+        lines.append("export CLAUDE_TERMINAL_HANDOFF_TRANSFER=%s" % shlex.quote(transfer_file))
+    lines += [
         "echo 'Terminal Handoff: generation %d of chain %s'"
-        % (int(manifest.get("generation") or 1) + 1, manifest.get("chain_id")),
+        % (generation + 1, manifest.get("chain_id")),
         "exec " + " ".join(shlex.quote(part) for part in argv),
         "",
     ]
@@ -1336,6 +1623,444 @@ def launch_terminal(manifest, script_file, title, test_mode):
         }
     except Exception as exc:
         return {"launched": False, "test_mode": False, "error": str(exc)[:500], "command": command}
+
+
+# ---------------------------------------------------------------------------
+# Parent Claude process identity and binding
+# ---------------------------------------------------------------------------
+
+# Terminal Handoff never uses pkill, killall, process-name pattern matching,
+# process groups, front-window AppleScript targeting or SIGKILL. It binds one
+# exact process at trigger time and re-proves that binding immediately before
+# signalling it.
+PS_BIN = "/bin/ps"
+PS_TIMEOUT = 5.0
+LSOF_CANDIDATES = ("/usr/sbin/lsof", "/usr/bin/lsof")
+MAX_ANCESTRY_DEPTH = 24
+
+# Only a process whose executable file is named exactly `claude` is ever
+# considered a Claude Code session process.
+PARENT_PROCESS_NAMES = ("claude",)
+
+# Claude Code runs the status-line command through a shell, so the owning
+# session process is a near ancestor. A Claude process further away than this
+# is somebody else's session and is never bound.
+MAX_BIND_DEPTH = 6
+
+# The only signal Terminal Handoff ever sends. There is no escalation path.
+PARENT_STOP_SIGNAL = signal.SIGTERM
+PARENT_STOP_SIGNAL_NAME = "SIGTERM"
+
+
+def _ps_field(pid, fmt):
+    """Run `ps -o <fmt> -p <pid>`. `fmt` must end with the widest field.
+
+    macOS truncates `comm` to 16 characters unless it is the final column, so
+    it is always requested on its own.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    try:
+        proc = subprocess.Popen(
+            [PS_BIN, "-o", fmt, "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        out, _ = proc.communicate(timeout=PS_TIMEOUT)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    text = out.decode("utf-8", "replace").strip()
+    return text or None
+
+
+def process_identity(pid):
+    """Stable identity for one live process, or None if it is not running.
+
+    `start` is the process start time: together with the PID it distinguishes
+    the bound process from any later process that reuses the same PID.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 1:
+        return None
+    head = _ps_field(pid, "ppid=,uid=,tty=,stat=,lstart=")
+    if not head:
+        return None
+    tokens = head.split()
+    if len(tokens) < 5:
+        return None
+    try:
+        ppid = int(tokens[0])
+        uid = int(tokens[1])
+    except (TypeError, ValueError):
+        return None
+    state = tokens[3]
+    if state.startswith("Z"):
+        return None  # a zombie has already exited; it is not a live session
+    command = (_ps_field(pid, "comm=") or "").strip()
+    return {
+        "pid": pid,
+        "ppid": ppid,
+        "uid": uid,
+        "tty": tokens[2],
+        "state": state,
+        "start": " ".join(tokens[4:]),
+        "command": command[:400],
+        "name": os.path.basename(command)[:120],
+    }
+
+
+def process_cwd(pid):
+    """Best-effort working directory of a live process. Never fatal."""
+    lsof = None
+    for candidate in LSOF_CANDIDATES:
+        if os.path.exists(candidate):
+            lsof = candidate
+            break
+    if lsof is None:
+        return None
+    try:
+        proc = subprocess.Popen(
+            [lsof, "-a", "-p", str(int(pid)), "-d", "cwd", "-Fn"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        out, _ = proc.communicate(timeout=PS_TIMEOUT)
+    except Exception:
+        return None
+    for line in out.decode("utf-8", "replace").splitlines():
+        if line.startswith("n"):
+            return line[1:].strip() or None
+    return None
+
+
+def process_ancestry(pid=None, limit=MAX_ANCESTRY_DEPTH):
+    """Walk the real process ancestry upwards from `pid` (default: self).
+
+    The status-line process is a descendant of the Claude Code session process
+    but not necessarily its direct child - Claude Code runs the status-line
+    command through a shell - so the ancestry is traced rather than assumed.
+    """
+    chain = []
+    try:
+        current = os.getpid() if pid is None else int(pid)
+    except (TypeError, ValueError):
+        return chain
+    seen = set()
+    while current > 1 and len(chain) < limit and current not in seen:
+        seen.add(current)
+        identity = process_identity(current)
+        if identity is None:
+            break
+        chain.append(identity)
+        current = identity["ppid"]
+    return chain
+
+
+def bind_parent_claude_process(session_id, current_dir=None, start_pid=None):
+    """Bind the exact Claude Code process that owns this status-line run.
+
+    Returns `(binding, reason)`. `binding` is None when no Claude Code process
+    could be proved, in which case the handoff still proceeds and the parent is
+    simply never stopped.
+    """
+    chain = process_ancestry(start_pid)
+    ancestry = [
+        {"pid": item["pid"], "name": item["name"], "tty": item["tty"]} for item in chain
+    ]
+    uid = os.getuid()
+    for depth, identity in enumerate(chain):
+        if identity["name"] not in PARENT_PROCESS_NAMES:
+            continue
+        if depth > MAX_BIND_DEPTH:
+            return None, (
+                "the nearest Claude Code process is %d levels away, which is too "
+                "distant to be this session" % depth
+            )
+        if identity["uid"] != uid:
+            return None, "candidate parent %d belongs to another user" % identity["pid"]
+        if identity["pid"] == os.getpid():
+            return None, "refusing to bind this process as its own parent"
+        observed_cwd = process_cwd(identity["pid"])
+        if current_dir and observed_cwd:
+            try:
+                same = os.path.realpath(observed_cwd) == os.path.realpath(current_dir)
+            except Exception:
+                same = False
+            if not same:
+                # The candidate is running a different session's work. Binding
+                # it could stop the wrong Claude session, so refuse.
+                return None, (
+                    "candidate parent %d is working in a different directory"
+                    % identity["pid"]
+                )
+        return (
+            {
+                "pid": identity["pid"],
+                "ppid": identity["ppid"],
+                "uid": identity["uid"],
+                "tty": identity["tty"],
+                "start": identity["start"],
+                "name": identity["name"],
+                "command": identity["command"],
+                "process_cwd": observed_cwd,
+                "session_id": session_id,
+                "session_current_dir": current_dir,
+                "ancestry_depth": depth,
+                "ancestry": ancestry,
+                "bound_utc": utc_stamp(),
+                "bound_by_pid": os.getpid(),
+            },
+            None,
+        )
+    return None, "no Claude Code process was found in this process's ancestry"
+
+
+def verify_parent_binding(binding, chain_id=None, generation=None, session_id=None):
+    """Re-prove that a binding still names the same live Claude process.
+
+    Returns `(ok, reason)`. Fails closed on every mismatch: a reused PID, a
+    changed executable, a different controlling terminal, a different user or a
+    moved working directory all abort the shutdown.
+    """
+    if not isinstance(binding, dict):
+        return False, "no parent process binding was recorded"
+    try:
+        pid = int(binding.get("pid"))
+    except (TypeError, ValueError):
+        return False, "binding has no usable pid"
+    if pid <= 1:
+        return False, "refusing to signal pid %d" % pid
+    if pid == os.getpid():
+        return False, "refusing to signal this process"
+    if session_id and binding.get("session_id") and binding["session_id"] != session_id:
+        return False, "binding belongs to a different session"
+    if chain_id and binding.get("chain_id") and binding["chain_id"] != chain_id:
+        return False, "binding belongs to a different chain"
+    if (
+        generation is not None
+        and binding.get("generation") is not None
+        and int(binding["generation"]) != int(generation)
+    ):
+        return False, "binding belongs to a different generation"
+    identity = process_identity(pid)
+    if identity is None:
+        return False, "bound parent process %d is no longer running" % pid
+    if not binding.get("start") or identity["start"] != binding.get("start"):
+        return False, "pid %d has been reused: start time differs" % pid
+    if identity["uid"] != os.getuid():
+        return False, "pid %d now belongs to another user" % pid
+    if identity["name"] not in PARENT_PROCESS_NAMES:
+        return False, "pid %d is not a Claude Code process" % pid
+    if binding.get("name") and identity["name"] != binding["name"]:
+        return False, "pid %d has a different executable name" % pid
+    if binding.get("tty") and identity["tty"] != binding["tty"]:
+        return False, "pid %d is on a different terminal" % pid
+    recorded_cwd = binding.get("process_cwd")
+    if recorded_cwd:
+        observed = process_cwd(pid)
+        if observed and observed != recorded_cwd:
+            return False, "pid %d has a different working directory" % pid
+    return True, None
+
+
+def parent_binding_path(session_id):
+    return th_path("launching", "%s.parent.json" % session_id)
+
+
+# ---------------------------------------------------------------------------
+# Transfer of ownership: an auditable, atomic state machine
+# ---------------------------------------------------------------------------
+
+TRANSFER_LAUNCHING = "LAUNCHING"
+TRANSFER_SUCCESSOR_VERIFIED = "SUCCESSOR_VERIFIED"
+TRANSFER_PARENT_STOP_REQUESTED = "PARENT_STOP_REQUESTED"
+TRANSFER_COMPLETE = "TRANSFER_COMPLETE"
+TRANSFER_FAILED = "TRANSFER_FAILED"
+
+TRANSFER_STATES = (
+    TRANSFER_LAUNCHING,
+    TRANSFER_SUCCESSOR_VERIFIED,
+    TRANSFER_PARENT_STOP_REQUESTED,
+    TRANSFER_COMPLETE,
+    TRANSFER_FAILED,
+)
+
+# Before SUCCESSOR_VERIFIED the parent owns continuation. After
+# PARENT_STOP_REQUESTED the successor owns it. There is exactly one boundary,
+# and every transition is recorded.
+TRANSFER_TRANSITIONS = {
+    TRANSFER_LAUNCHING: (TRANSFER_SUCCESSOR_VERIFIED, TRANSFER_FAILED),
+    TRANSFER_SUCCESSOR_VERIFIED: (TRANSFER_PARENT_STOP_REQUESTED, TRANSFER_FAILED),
+    TRANSFER_PARENT_STOP_REQUESTED: (TRANSFER_COMPLETE, TRANSFER_FAILED),
+    TRANSFER_COMPLETE: (),
+    TRANSFER_FAILED: (),
+}
+
+TRANSFER_OWNER = {
+    TRANSFER_LAUNCHING: "parent",
+    TRANSFER_SUCCESSOR_VERIFIED: "parent",
+    TRANSFER_PARENT_STOP_REQUESTED: "successor",
+    TRANSFER_COMPLETE: "successor",
+    TRANSFER_FAILED: "parent",
+}
+
+DEFAULT_HEARTBEAT_TIMEOUT = 300.0
+DEFAULT_TRANSFER_POLL = 2.0
+DEFAULT_STOP_GRACE = 20.0
+DEFAULT_STOP_ATTEMPTS = 2
+MAX_STOP_ATTEMPTS = 3
+
+
+def stop_parent_enabled():
+    """Parent shutdown is on by default; `...STOP_PARENT=0` disables it."""
+    raw = os.environ.get("CLAUDE_TERMINAL_HANDOFF_STOP_PARENT")
+    if raw is None or raw.strip() == "":
+        return True
+    return raw.strip().lower() in TRUTHY
+
+
+def heartbeat_timeout():
+    value = env_float("CLAUDE_TERMINAL_HANDOFF_HEARTBEAT_TIMEOUT", DEFAULT_HEARTBEAT_TIMEOUT)
+    return value if value > 0 else DEFAULT_HEARTBEAT_TIMEOUT
+
+
+def transfer_poll_seconds():
+    value = env_float("CLAUDE_TERMINAL_HANDOFF_TRANSFER_POLL", DEFAULT_TRANSFER_POLL)
+    if value <= 0 or value > 60:
+        return DEFAULT_TRANSFER_POLL
+    return value
+
+
+def stop_grace_seconds():
+    value = env_float("CLAUDE_TERMINAL_HANDOFF_STOP_GRACE", DEFAULT_STOP_GRACE)
+    return value if value > 0 else DEFAULT_STOP_GRACE
+
+
+def stop_attempts():
+    value = env_int("CLAUDE_TERMINAL_HANDOFF_STOP_ATTEMPTS", DEFAULT_STOP_ATTEMPTS)
+    if value < 1:
+        return 1
+    return min(value, MAX_STOP_ATTEMPTS)
+
+
+def transfer_path(parent_session_id):
+    return th_path("transfers", "%s.json" % parent_session_id)
+
+
+def read_transfer(path):
+    data = read_json(path)
+    return data if isinstance(data, dict) else None
+
+
+def build_transfer_record(manifest, binding, now=None):
+    now = now if now is not None else time.time()
+    outgoing = manifest.get("outgoing") or {}
+    successor = manifest.get("successor") or {}
+    display = manifest.get("display") or {}
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "terminal_handoff_version": TERMINAL_HANDOFF_VERSION,
+        "state": TRANSFER_LAUNCHING,
+        "owner": TRANSFER_OWNER[TRANSFER_LAUNCHING],
+        "chain_id": manifest.get("chain_id"),
+        "parent_generation": manifest.get("generation"),
+        "successor_generation": successor.get("generation"),
+        "parent_session_id": outgoing.get("session_id"),
+        "parent_display_name": display.get("outgoing_display_name"),
+        "successor_display_name": display.get("successor_display_name"),
+        "manifest_path": manifest_path(outgoing.get("session_id")),
+        "parent_process": binding,
+        "parent_process_bound": bool(binding),
+        "expected_successor": {
+            "model_id": (manifest.get("model") or {}).get("id"),
+            "effort_level": (manifest.get("effort") or {}).get("level"),
+            "effort_available": bool((manifest.get("effort") or {}).get("available")),
+            "current_dir": successor.get("expected_current_dir"),
+            "chain_id": manifest.get("chain_id"),
+            "generation": successor.get("generation"),
+            "display_name": display.get("successor_display_name"),
+        },
+        "successor": {},
+        "stop": {
+            "enabled": stop_parent_enabled(),
+            "signal": PARENT_STOP_SIGNAL_NAME,
+            "escalates": False,
+            "attempts": 0,
+        },
+        "created_utc": utc_stamp(),
+        "created_epoch": now,
+        "history": [
+            {"state": TRANSFER_LAUNCHING, "ts": utc_stamp(), "reason": "successor launch started"}
+        ],
+    }
+
+
+def transfer_transition(path, target, reason=None, **fields):
+    """Atomically move a transfer record to `target`.
+
+    Returns `(ok, record)`. An illegal or repeated transition is refused, which
+    is what makes duplicate status-line invocations and duplicate supervisors
+    unable to request a second shutdown.
+    """
+    if target not in TRANSFER_STATES:
+        return False, None
+    outcome = {"ok": False, "record": None}
+
+    def mutate(data):
+        current = data.get("state")
+        if current not in TRANSFER_STATES:
+            data["state"] = TRANSFER_LAUNCHING
+            current = TRANSFER_LAUNCHING
+        if target not in TRANSFER_TRANSITIONS.get(current, ()):
+            outcome["ok"] = False
+            outcome["record"] = dict(data)
+            return
+        data["state"] = target
+        data["owner"] = TRANSFER_OWNER[target]
+        data["updated_utc"] = utc_stamp()
+        for key, value in fields.items():
+            data[key] = value
+        history = data.setdefault("history", [])
+        history.append(
+            {"state": target, "ts": utc_stamp(), "reason": reason, "from": current, "pid": os.getpid()}
+        )
+        del history[:-40]
+        outcome["ok"] = True
+        outcome["record"] = dict(data)
+
+    if not os.path.isfile(path):
+        return False, None
+    update_json_locked(path, mutate)
+    if outcome["ok"]:
+        log_event(
+            "transfer_state",
+            transfer=os.path.basename(path),
+            state=target,
+            reason=reason,
+            chain_id=(outcome["record"] or {}).get("chain_id"),
+            parent_session_id=(outcome["record"] or {}).get("parent_session_id"),
+        )
+    return outcome["ok"], outcome["record"]
+
+
+def update_transfer_fields(path, **fields):
+    """Record observations without changing the transfer state."""
+    if not os.path.isfile(path):
+        return None
+
+    def mutate(data):
+        for key, value in fields.items():
+            data[key] = value
+        data["updated_utc"] = utc_stamp()
+
+    return update_json_locked(path, mutate)
 
 
 # ---------------------------------------------------------------------------
@@ -1471,11 +2196,16 @@ def perform_launch(payload_file):
 
     decision = decide(payload, validate_files=True, record=False)
     session_id = facts.session_id
-    chain_id, generation, parent_manifest, parent_session = chain_identity()
+    chain_id, generation, parent_manifest, parent_session = chain_identity(
+        facts.session_id, facts.session_name
+    )
+    base_name, base_source = resolve_base_display_name(chain_id, generation, facts.session_name)
     decision["chain_id"] = chain_id
     decision["generation"] = generation
     decision["parent_manifest"] = parent_manifest
     decision["parent_session_id"] = parent_session
+    decision["base_display_name"] = base_name
+    decision["base_name_source"] = base_source
 
     test_mode = env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE")
     set_state(session_id, "launching", chain_id=chain_id, generation=generation)
@@ -1556,10 +2286,38 @@ def perform_launch(payload_file):
         fail_launch(session_id, "unsafe launch argv: %s" % "; ".join(problems), manifest_file=mpath)
         return 9
 
-    script_file = th_path("launching", "%s.launch.sh" % session_id)
-    write_private(script_file, build_launch_script(manifest, argv, workdir, mpath), mode=0o700)
+    display = manifest.get("display") or {}
+    binding = read_json(parent_binding_path(session_id))
+    if isinstance(binding, dict):
+        binding["chain_id"] = chain_id
+        binding["generation"] = generation
+    else:
+        binding = None
 
-    title = "Terminal Handoff, Generation %d" % (generation + 1)
+    transfer_file = transfer_path(session_id)
+    write_json_private(transfer_file, build_transfer_record(manifest, binding))
+
+    script_file = th_path("launching", "%s.launch.sh" % session_id)
+    write_private(
+        script_file,
+        build_launch_script(manifest, argv, workdir, mpath, transfer_file),
+        mode=0o700,
+    )
+
+    title = display.get("successor_display_name") or (
+        "Terminal Handoff, Generation %d" % (generation + 1)
+    )
+    record_chain_generation(
+        chain_id,
+        generation,
+        session_id=session_id,
+        display_name=display.get("outgoing_display_name"),
+        base_name=display.get("base_name"),
+        source=display.get("base_name_source"),
+    )
+    record_chain_generation(
+        chain_id, generation + 1, display_name=display.get("successor_display_name")
+    )
     record_launch(session_id, chain_id, generation)
     result = launch_terminal(manifest, script_file, title, test_mode)
 
@@ -1568,11 +2326,18 @@ def perform_launch(payload_file):
         "chain_id": chain_id,
         "generation": generation,
         "successor_generation": generation + 1,
+        "successor_display_name": display.get("successor_display_name"),
+        "outgoing_display_name": display.get("outgoing_display_name"),
+        "base_display_name": display.get("base_name"),
+        "base_name_source": display.get("base_name_source"),
         "argv": argv,
         "argv_redacted_prompt": argv[:-1] + ["<bootstrap prompt in %s>" % prompt_file],
         "script_file": script_file,
         "prompt_file": prompt_file,
         "manifest": mpath,
+        "transfer_file": transfer_file,
+        "parent_process_bound": bool(binding),
+        "parent_pid": (binding or {}).get("pid"),
         "title": title,
         "test_mode": test_mode,
         "result": dict((k, v) for k, v in result.items() if k != "applescript"),
@@ -1586,11 +2351,13 @@ def perform_launch(payload_file):
             mpath, lambda m: m["successor"].update({"launch_state": "simulated_test_mode"})
         )
         set_state(session_id, "completed", reason="test mode: launch simulated", test_mode=True)
+        update_transfer_fields(transfer_file, supervisor_spawned=False, test_mode=True)
         log_event(
             "launch_simulated",
             session_id=session_id,
             chain_id=chain_id,
             generation=generation,
+            successor_display_name=display.get("successor_display_name"),
             argv=launch_record["argv_redacted_prompt"],
         )
         return 0
@@ -1598,6 +2365,23 @@ def perform_launch(payload_file):
     if result.get("launched"):
         update_manifest(mpath, lambda m: m["successor"].update({"launch_state": "launched"}))
         set_state(session_id, "launched", reason="Terminal window opened; awaiting successor heartbeat")
+        # With parent shutdown disabled there is nothing to supervise: the
+        # transfer still records the successor's verification, and the parent
+        # keeps running by choice rather than by failure.
+        supervised = False
+        if stop_parent_enabled():
+            supervised = spawn_supervisor(transfer_file)
+            if not supervised:
+                transfer_transition(
+                    transfer_file,
+                    TRANSFER_FAILED,
+                    reason=(
+                        "the shutdown supervisor could not be started; "
+                        "the parent is left running"
+                    ),
+                    parent_stopped=False,
+                )
+        update_transfer_fields(transfer_file, supervisor_spawned=bool(supervised))
         log_event(
             "launch_confirmed",
             session_id=session_id,
@@ -1605,9 +2389,18 @@ def perform_launch(payload_file):
             generation=generation,
             model_id=facts.model_id,
             effort_level=facts.effort_level,
+            successor_display_name=display.get("successor_display_name"),
+            parent_process_bound=bool(binding),
+            supervisor_spawned=bool(supervised),
         )
         return 0
 
+    transfer_transition(
+        transfer_file,
+        TRANSFER_FAILED,
+        reason="the successor Terminal window could not be opened; the parent is left running",
+        parent_stopped=False,
+    )
     fail_launch(
         session_id,
         "osascript could not open the Terminal window",
@@ -1617,12 +2410,20 @@ def perform_launch(payload_file):
     return 10
 
 
-def spawn_launcher(payload):
-    """Write the payload securely and spawn the detached launch process."""
+def spawn_launcher(payload, parent_binding=None):
+    """Write the payload securely and spawn the detached launch process.
+
+    `parent_binding` is the exact Claude Code process bound by the status-line
+    invocation that claimed the trigger. It is recorded here because process
+    ancestry is only visible from that process, never from the detached
+    launcher, which starts its own session.
+    """
     ensure_dirs()
     session_id = _dget(payload, "session_id") or uuid.uuid4().hex
     payload_file = th_path("launching", "%s.payload.json" % session_id)
     write_json_private(payload_file, payload)
+    if parent_binding:
+        write_json_private(parent_binding_path(session_id), parent_binding)
     self_path = os.path.abspath(__file__)
     try:
         devnull = open(os.devnull, "wb")
@@ -1641,15 +2442,86 @@ def spawn_launcher(payload):
 
 
 # ---------------------------------------------------------------------------
-# Successor heartbeat
+# Successor heartbeat: the transfer-of-ownership gate
 # ---------------------------------------------------------------------------
+
+# Two heartbeats are required. The first proves a session exists; the second
+# proves it is alive and reporting its own live context percentage.
+HEARTBEATS_REQUIRED = 2
+MAX_HEARTBEATS = 8
+
+SUCCESSOR_CHECK_NAMES = (
+    "session_id_present",
+    "session_id_is_fresh",
+    "session_id_unused",
+    "model_matches",
+    "effort_matches",
+    "cwd_matches",
+    "chain_matches",
+    "generation_matches",
+    "context_percentage_live",
+)
+
+
+def successor_expectations_from_env():
+    """What this session was told it is, by the Terminal Handoff launcher."""
+    chain = os.environ.get("CLAUDE_TERMINAL_HANDOFF_CHAIN_ID", "").strip() or None
+    generation = env_int("CLAUDE_TERMINAL_HANDOFF_GENERATION", 0) or None
+    transfer = os.environ.get("CLAUDE_TERMINAL_HANDOFF_TRANSFER", "").strip() or None
+    return chain, generation, transfer
+
+
+def evaluate_successor_checks(manifest, facts, env_chain, env_generation, parent_session_id):
+    """Every condition that must hold before a parent may be stopped.
+
+    A single false value leaves the parent running.
+    """
+    successor = manifest.get("successor") or {}
+    expected_model = (manifest.get("model") or {}).get("id")
+    expected_effort = (manifest.get("effort") or {}).get("level")
+    expected_effort_available = bool((manifest.get("effort") or {}).get("available"))
+    expected_dir = successor.get("expected_current_dir")
+    expected_chain = manifest.get("chain_id")
+    try:
+        expected_generation = int(successor.get("generation") or 0)
+    except (TypeError, ValueError):
+        expected_generation = 0
+    prior_generation = chain_generation_for_session(expected_chain, facts.session_id)
+    return {
+        "session_id_present": bool(facts.session_id),
+        "session_id_is_fresh": bool(facts.session_id) and facts.session_id != parent_session_id,
+        "session_id_unused": prior_generation is None
+        or int(prior_generation) == expected_generation,
+        "model_matches": bool(expected_model) and facts.model_id == expected_model,
+        "effort_matches": facts.effort_level == expected_effort
+        and bool(facts.effort_available) == expected_effort_available,
+        "cwd_matches": bool(expected_dir) and facts.current_dir == expected_dir,
+        "chain_matches": bool(env_chain) and bool(expected_chain) and env_chain == expected_chain,
+        "generation_matches": bool(env_generation)
+        and expected_generation > 0
+        and int(env_generation) == expected_generation,
+        "context_percentage_live": bool(facts.percent_valid),
+    }
+
+
+def resolve_transfer_file(env_transfer, parent_session_id):
+    if env_transfer and os.path.isfile(env_transfer):
+        return env_transfer
+    if parent_session_id:
+        candidate = transfer_path(parent_session_id)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def successor_heartbeat(facts):
     """If this session is a Terminal Handoff successor, prove it to the parent.
 
-    A launch is only marked `completed` once the successor reports its own,
-    different session ID together with its own live context percentage.
+    The parent's manifest is only marked `completed`, and the transfer is only
+    moved to SUCCESSOR_VERIFIED, once this session has reported its own fresh
+    session ID, the required model, the required effort, the required working
+    directory, the correct chain, the correct generation and its own live
+    context percentage. Any failure leaves the parent fully operational.
     """
     parent_manifest = os.environ.get("CLAUDE_TERMINAL_HANDOFF_MANIFEST", "").strip()
     if not parent_manifest or not facts.session_id:
@@ -1660,7 +2532,7 @@ def successor_heartbeat(facts):
     marker = th_path("state", "heartbeat-%s.json" % facts.session_id)
     existing = read_json(marker, {}) or {}
     beats = int(existing.get("beats", 0)) + 1
-    if beats > 3:
+    if beats > MAX_HEARTBEATS:
         return existing.get("state")
 
     data = read_json(parent_manifest, {}) or {}
@@ -1670,9 +2542,16 @@ def successor_heartbeat(facts):
         log_event("heartbeat_rejected", session_id=facts.session_id, reason="parent==successor")
         return None
 
-    state = "successor_started"
-    if beats >= 2 and facts.percent_valid:
+    env_chain, env_generation, env_transfer = successor_expectations_from_env()
+    checks = evaluate_successor_checks(data, facts, env_chain, env_generation, parent_session)
+    failed = sorted(name for name in SUCCESSOR_CHECK_NAMES if not checks.get(name))
+
+    if failed:
+        state = "successor_mismatch"
+    elif beats >= HEARTBEATS_REQUIRED:
         state = "completed"
+    else:
+        state = "successor_started"
 
     def mutate(manifest):
         successor = manifest.setdefault("successor", {})
@@ -1682,13 +2561,16 @@ def successor_heartbeat(facts):
         successor["observed_effort_level"] = facts.effort_level
         successor["observed_current_dir"] = facts.current_dir
         successor["observed_context_percentage"] = facts.percent
-        successor["model_matches"] = facts.model_id == (manifest.get("model") or {}).get("id")
-        expected_effort = (manifest.get("effort") or {}).get("level")
-        successor["effort_matches"] = facts.effort_level == expected_effort
-        successor["cwd_matches"] = facts.current_dir == (manifest.get("successor") or {}).get(
-            "expected_current_dir"
-        )
-        successor["session_id_is_fresh"] = facts.session_id != parent_session
+        successor["observed_display_name"] = facts.session_name
+        successor["observed_chain_id"] = env_chain
+        successor["observed_generation"] = env_generation
+        successor["heartbeats"] = beats
+        successor["checks"] = checks
+        successor["failed_checks"] = failed
+        successor["model_matches"] = checks["model_matches"]
+        successor["effort_matches"] = checks["effort_matches"]
+        successor["cwd_matches"] = checks["cwd_matches"]
+        successor["session_id_is_fresh"] = checks["session_id_is_fresh"]
         if not successor.get("first_heartbeat_utc"):
             successor["first_heartbeat_utc"] = utc_stamp()
         if state == "completed":
@@ -1702,9 +2584,52 @@ def successor_heartbeat(facts):
             "parent_manifest": parent_manifest,
             "beats": beats,
             "state": state,
+            "failed_checks": failed,
             "ts": utc_stamp(),
         },
     )
+
+    transfer_file = resolve_transfer_file(env_transfer, parent_session)
+    if state == "completed":
+        record_chain_generation(
+            data.get("chain_id"),
+            env_generation or (data.get("successor") or {}).get("generation") or 2,
+            session_id=facts.session_id,
+            display_name=facts.session_name,
+        )
+        if transfer_file:
+            transfer_transition(
+                transfer_file,
+                TRANSFER_SUCCESSOR_VERIFIED,
+                reason=(
+                    "successor heartbeat validated: fresh session ID, required model, "
+                    "required effort, correct working directory, correct chain and generation"
+                ),
+                successor={
+                    "session_id": facts.session_id,
+                    "display_name": facts.session_name,
+                    "model_id": facts.model_id,
+                    "effort_level": facts.effort_level,
+                    "current_dir": facts.current_dir,
+                    "chain_id": env_chain,
+                    "generation": env_generation,
+                    "context_percentage": facts.percent,
+                    "heartbeats": beats,
+                    "checks": checks,
+                    "verified_utc": utc_stamp(),
+                },
+            )
+    elif failed and transfer_file:
+        update_transfer_fields(
+            transfer_file,
+            successor_rejected={
+                "session_id": facts.session_id,
+                "failed_checks": failed,
+                "checks": checks,
+                "observed_utc": utc_stamp(),
+            },
+        )
+
     if parent_session:
         set_state(parent_session, state, successor_session_id=facts.session_id)
     log_event(
@@ -1715,8 +2640,350 @@ def successor_heartbeat(facts):
         beats=beats,
         model_id=facts.model_id,
         effort_level=facts.effort_level,
+        failed_checks=failed,
     )
     return state
+
+
+# ---------------------------------------------------------------------------
+# Parent shutdown supervisor
+# ---------------------------------------------------------------------------
+
+
+def supervisor_lock_path(parent_session_id):
+    return th_path("transfers", "%s.supervisor.lock" % parent_session_id)
+
+
+def claim_supervisor(parent_session_id):
+    """One supervisor per transfer, claimed atomically.
+
+    Duplicate status-line invocations, a retried launch or a second supervisor
+    process can therefore never produce a second shutdown attempt.
+    """
+    ensure_dirs()
+    path = supervisor_lock_path(parent_session_id)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            return False
+        raise
+    try:
+        os.write(
+            fd,
+            json.dumps({"pid": os.getpid(), "claimed_utc": utc_stamp()}, sort_keys=True).encode(
+                "utf-8"
+            ),
+        )
+    finally:
+        os.close(fd)
+    return True
+
+
+def parent_process_gone(binding):
+    """True when the exact bound process is no longer running."""
+    ok, _ = verify_parent_binding(binding)
+    return not ok
+
+
+def request_parent_stop(path, record):
+    """Send one graceful stop request to the exact bound parent process.
+
+    Never SIGKILL, never a process group, never a name match. If the binding
+    cannot be re-proved, nothing is signalled and the transfer fails closed
+    with the parent left fully operational.
+    """
+    binding = record.get("parent_process")
+    chain_id = record.get("chain_id")
+    generation = record.get("parent_generation")
+    parent_session_id = record.get("parent_session_id")
+
+    ok, reason = verify_parent_binding(
+        binding, chain_id=chain_id, generation=generation, session_id=parent_session_id
+    )
+    if not ok:
+        transfer_transition(
+            path,
+            TRANSFER_FAILED,
+            reason="parent process identity could not be re-proved: %s" % reason,
+            parent_stopped=False,
+        )
+        log_event(
+            "parent_stop_refused",
+            parent_session_id=parent_session_id,
+            chain_id=chain_id,
+            reason=reason,
+        )
+        return False, reason
+
+    moved, _ = transfer_transition(
+        path,
+        TRANSFER_PARENT_STOP_REQUESTED,
+        reason="successor verified; requesting graceful parent shutdown",
+        stop_requested_utc=utc_stamp(),
+    )
+    if not moved:
+        # Another supervisor already owns the shutdown, or the transfer moved
+        # on. Never signal twice.
+        log_event(
+            "parent_stop_skipped",
+            parent_session_id=parent_session_id,
+            reason="transfer was not in %s" % TRANSFER_SUCCESSOR_VERIFIED,
+        )
+        return False, "transfer already past SUCCESSOR_VERIFIED"
+
+    simulated = env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE") or env_flag(
+        "CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN"
+    )
+    pid = int(binding["pid"])
+    attempts = 0
+    grace = stop_grace_seconds()
+    budget = stop_attempts()
+
+    if simulated:
+        update_transfer_fields(
+            path,
+            stop={
+                "enabled": True,
+                "signal": PARENT_STOP_SIGNAL_NAME,
+                "escalates": False,
+                "attempts": 0,
+                "simulated": True,
+                "pid": pid,
+            },
+        )
+        transfer_transition(
+            path,
+            TRANSFER_COMPLETE,
+            reason="test mode: parent shutdown simulated, no signal sent",
+            parent_stopped=False,
+            parent_stop_simulated=True,
+        )
+        log_event("parent_stop_simulated", parent_session_id=parent_session_id, pid=pid)
+        return True, None
+
+    while attempts < budget:
+        # Re-prove immediately before every signal: the identity check and the
+        # signal must not be separated by a wait.
+        ok, reason = verify_parent_binding(
+            binding, chain_id=chain_id, generation=generation, session_id=parent_session_id
+        )
+        if not ok:
+            if attempts > 0:
+                break  # the parent exited between attempts: that is success
+            transfer_transition(
+                path,
+                TRANSFER_FAILED,
+                reason="parent process identity changed before signalling: %s" % reason,
+                parent_stopped=False,
+            )
+            log_event("parent_stop_refused", parent_session_id=parent_session_id, reason=reason)
+            return False, reason
+        attempts += 1
+        try:
+            os.kill(pid, PARENT_STOP_SIGNAL)
+        except OSError as exc:
+            transfer_transition(
+                path,
+                TRANSFER_FAILED,
+                reason="could not signal parent pid %d: %s" % (pid, exc),
+                parent_stopped=False,
+            )
+            log_event(
+                "parent_stop_failed", parent_session_id=parent_session_id, pid=pid, error=str(exc)
+            )
+            return False, str(exc)
+        log_event(
+            "parent_stop_signalled",
+            parent_session_id=parent_session_id,
+            chain_id=chain_id,
+            pid=pid,
+            signal=PARENT_STOP_SIGNAL_NAME,
+            attempt=attempts,
+        )
+        deadline = time.time() + grace
+        while time.time() < deadline:
+            if parent_process_gone(binding):
+                update_transfer_fields(
+                    path,
+                    stop={
+                        "enabled": True,
+                        "signal": PARENT_STOP_SIGNAL_NAME,
+                        "escalates": False,
+                        "attempts": attempts,
+                        "pid": pid,
+                    },
+                )
+                transfer_transition(
+                    path,
+                    TRANSFER_COMPLETE,
+                    reason="parent Claude session stopped gracefully; its Terminal remains open",
+                    parent_stopped=True,
+                    parent_stopped_utc=utc_stamp(),
+                )
+                set_state(
+                    parent_session_id,
+                    "completed",
+                    reason="successor verified; parent stopped gracefully",
+                    parent_stopped=True,
+                )
+                log_event(
+                    "parent_stopped",
+                    parent_session_id=parent_session_id,
+                    chain_id=chain_id,
+                    pid=pid,
+                    attempts=attempts,
+                )
+                return True, None
+            time.sleep(min(0.5, transfer_poll_seconds()))
+
+    if parent_process_gone(binding):
+        transfer_transition(
+            path,
+            TRANSFER_COMPLETE,
+            reason="parent Claude session stopped gracefully",
+            parent_stopped=True,
+            parent_stopped_utc=utc_stamp(),
+        )
+        log_event("parent_stopped", parent_session_id=parent_session_id, pid=pid, attempts=attempts)
+        return True, None
+
+    # The parent did not exit. Terminal Handoff does not escalate: it records
+    # the failure visibly and leaves the parent running.
+    update_transfer_fields(
+        path,
+        stop={
+            "enabled": True,
+            "signal": PARENT_STOP_SIGNAL_NAME,
+            "escalates": False,
+            "attempts": attempts,
+            "pid": pid,
+            "unconfirmed": True,
+        },
+    )
+    transfer_transition(
+        path,
+        TRANSFER_FAILED,
+        reason=(
+            "parent pid %d did not exit after %d %s request(s); it is still running and "
+            "Terminal Handoff will not escalate" % (pid, attempts, PARENT_STOP_SIGNAL_NAME)
+        ),
+        parent_stopped=False,
+    )
+    log_event(
+        "parent_stop_unconfirmed",
+        parent_session_id=parent_session_id,
+        chain_id=chain_id,
+        pid=pid,
+        attempts=attempts,
+    )
+    return False, "parent did not exit"
+
+
+def supervise_transfer(path, wait=True):
+    """Wait for a verified successor heartbeat, then stop the exact parent.
+
+    Runs detached from the status-line process. Every exit path is recorded in
+    the transfer record and the log.
+    """
+    ensure_dirs()
+    record = read_transfer(path)
+    if record is None:
+        log_event("supervisor_abort", reason="transfer record unreadable", transfer=path)
+        return 2
+
+    parent_session_id = record.get("parent_session_id")
+    if not parent_session_id:
+        log_event("supervisor_abort", reason="transfer record has no parent session")
+        return 2
+    if not claim_supervisor(parent_session_id):
+        log_event("supervisor_skipped", parent_session_id=parent_session_id, reason="already claimed")
+        return 0
+
+    log_event(
+        "supervisor_started",
+        parent_session_id=parent_session_id,
+        chain_id=record.get("chain_id"),
+        successor_display_name=record.get("successor_display_name"),
+        stop_enabled=bool((record.get("stop") or {}).get("enabled")),
+    )
+
+    if not (record.get("stop") or {}).get("enabled", True):
+        transfer_transition(
+            path,
+            TRANSFER_FAILED,
+            reason="parent shutdown is disabled by configuration; parent left running",
+            parent_stopped=False,
+        )
+        return 0
+
+    if not record.get("parent_process_bound"):
+        transfer_transition(
+            path,
+            TRANSFER_FAILED,
+            reason=(
+                "the parent Claude process was not bound at trigger time; "
+                "the parent is left fully operational"
+            ),
+            parent_stopped=False,
+        )
+        log_event("parent_stop_refused", parent_session_id=parent_session_id, reason="unbound")
+        return 3
+
+    deadline = time.time() + heartbeat_timeout()
+    poll = transfer_poll_seconds()
+    while wait:
+        record = read_transfer(path) or record
+        state = record.get("state")
+        if state == TRANSFER_SUCCESSOR_VERIFIED:
+            break
+        if state in (TRANSFER_COMPLETE, TRANSFER_FAILED, TRANSFER_PARENT_STOP_REQUESTED):
+            log_event(
+                "supervisor_exit", parent_session_id=parent_session_id, state=state
+            )
+            return 0
+        if time.time() >= deadline:
+            transfer_transition(
+                path,
+                TRANSFER_FAILED,
+                reason=(
+                    "no verified successor heartbeat within %.0fs; the parent session is "
+                    "left fully operational" % heartbeat_timeout()
+                ),
+                parent_stopped=False,
+            )
+            log_event(
+                "successor_heartbeat_timeout",
+                parent_session_id=parent_session_id,
+                chain_id=record.get("chain_id"),
+                timeout_seconds=heartbeat_timeout(),
+            )
+            return 4
+        time.sleep(poll)
+
+    record = read_transfer(path) or record
+    if record.get("state") != TRANSFER_SUCCESSOR_VERIFIED:
+        return 0
+    ok, _ = request_parent_stop(path, record)
+    return 0 if ok else 5
+
+
+def spawn_supervisor(transfer_file):
+    """Spawn the detached shutdown supervisor for one transfer."""
+    try:
+        devnull = open(os.devnull, "wb")
+        subprocess.Popen(
+            [preferred_python(), os.path.abspath(__file__), "supervise", "--transfer", transfer_file],
+            stdin=subprocess.DEVNULL,
+            stdout=devnull,
+            stderr=devnull,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return True
+    except Exception as exc:
+        log_event("supervisor_spawn_failed", transfer=transfer_file, error=str(exc)[:300])
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1814,6 +3081,14 @@ def cmd_statusline(args):
         if decision.get("trigger"):
             session_id = decision.get("session_id")
             if session_id and claim_trigger(session_id):
+                # The Claude Code session process is an ancestor of this
+                # status-line process and of nothing else Terminal Handoff can
+                # see later, so it is bound here and only here.
+                binding, bind_reason = None, "parent shutdown disabled by configuration"
+                if stop_parent_enabled():
+                    binding, bind_reason = bind_parent_claude_process(
+                        session_id, _dget(payload, "workspace", "current_dir")
+                    )
                 log_event(
                     "trigger_claimed",
                     session_id=session_id,
@@ -1823,8 +3098,12 @@ def cmd_statusline(args):
                     generation=decision.get("generation"),
                     model_id=decision.get("model_id"),
                     effort_level=decision.get("effort_level"),
+                    successor_display_name=decision.get("successor_display_name"),
+                    parent_process_bound=bool(binding),
+                    parent_pid=(binding or {}).get("pid"),
+                    parent_bind_reason=bind_reason,
                 )
-                spawn_launcher(payload)
+                spawn_launcher(payload, binding)
                 decision["state"] = "launching"
             else:
                 decision["state"] = "handed_off"
@@ -2404,9 +3683,44 @@ def cmd_status(args):
         "triggered_sessions": len(os.listdir(th_path("triggered"))) if os.path.isdir(th_path("triggered")) else 0,
         "manifests": len([f for f in os.listdir(th_path("handoffs"))]) if os.path.isdir(th_path("handoffs")) else 0,
         "recent_launches_in_window": len(recent_launch_times(storm_window)),
+        "stop_parent_enabled": stop_parent_enabled(),
+        "parent_stop_signal": PARENT_STOP_SIGNAL_NAME,
+        "heartbeat_timeout_seconds": heartbeat_timeout(),
+        "stop_grace_seconds": stop_grace_seconds(),
+        "stop_attempts": stop_attempts(),
+        "transfers": transfer_summary(),
     }
     print(json.dumps(info, indent=2, default=str))
     return 0
+
+
+def transfer_summary():
+    """Current state of every recorded transfer of ownership."""
+    directory = th_path("transfers")
+    rows = []
+    if not os.path.isdir(directory):
+        return rows
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".json"):
+            continue
+        record = read_json(os.path.join(directory, name))
+        if not isinstance(record, dict):
+            continue
+        rows.append(
+            {
+                "parent_session_id": record.get("parent_session_id"),
+                "chain_id": record.get("chain_id"),
+                "state": record.get("state"),
+                "owner": record.get("owner"),
+                "successor_display_name": record.get("successor_display_name"),
+                "parent_stopped": record.get("parent_stopped"),
+            }
+        )
+    return rows
+
+
+def cmd_supervise(args):
+    return supervise_transfer(args.transfer)
 
 
 def cmd_reset_circuit(args):
@@ -2464,6 +3778,16 @@ def main(argv=None):
     p = sub.add_parser("launch", help="Detached launcher (internal)")
     p.add_argument("--payload", required=True)
     p.set_defaults(func=cmd_launch)
+
+    p = sub.add_parser(
+        "supervise",
+        help=(
+            "Detached shutdown supervisor (internal): wait for a verified successor "
+            "heartbeat, then gracefully stop the exact bound parent Claude process"
+        ),
+    )
+    p.add_argument("--transfer", required=True)
+    p.set_defaults(func=cmd_supervise)
 
     p = sub.add_parser("build-command", help="Print the successor launch argv for a manifest")
     p.add_argument("--manifest", required=True)

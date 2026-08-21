@@ -40,7 +40,7 @@ jobs:
           sw_vers || true
 
       - name: Compile all sources
-        run: python3 -m compileall -q src tests
+        run: python3 -m compileall -q src tests scripts
 
       - name: Run the test suite
         env:
@@ -96,4 +96,4 @@ jobs:
         run: pip install 'ruff==0.6.9'
 
       - name: Lint
-        run: ruff check src tests
+        run: ruff check src tests scripts
