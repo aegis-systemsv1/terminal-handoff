@@ -166,8 +166,15 @@ A single atomic state machine — `LAUNCHING`, `SUCCESSOR_VERIFIED`,
 `PARENT_STOP_REQUESTED`, `TRANSFER_COMPLETE`, `TRANSFER_FAILED` — decides who
 owns continuation. Transitions are taken under an exclusive lock, refused when
 illegal, and appended to a history with a reason and the requesting PID. A
-supervisor is claimed with `O_CREAT|O_EXCL` per transfer, so duplicate
-status-line invocations cannot produce a second shutdown attempt.
+supervisor holds a non-blocking `flock` lease per transfer, so duplicate
+status-line invocations cannot produce a second shutdown attempt and the kernel
+releases the lease if its process crashes. Later status refreshes self-heal a
+missing supervisor.
+
+The parent owns `LAUNCHING` and `SUCCESSOR_VERIFIED`.
+`PARENT_STOP_REQUESTED` has no owner: both sessions must remain read-only while
+the parent can still be alive. Only confirmed `TRANSFER_COMPLETE` gives the
+successor ownership. This removes the previous graceful-stop overlap window.
 
 In test mode, and under `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN`, the entire path
 runs and no signal is ever sent.
@@ -413,9 +420,13 @@ that command nor derives any part of it from untrusted input.
 
 - Directories: `0700`
 - Manifests, prompts, logs, state: `0600`
-- Writes are atomic: private temporary file, `fsync`, then `os.replace`
+- Writes are atomic: private temporary file, file `fsync`, `os.replace`, then
+  directory `fsync` where the platform permits it
 - The one-shot trigger claim uses `O_CREAT|O_EXCL`, so concurrency cannot
   produce two launches
+- Notification configuration, outbox and delivery ledgers are private; webhook
+  secrets are read from a named environment variable or macOS Keychain and are
+  never written to them
 - Log rotation is bounded: 1 MB, 5 files
 
 ## What is never recorded
@@ -451,8 +462,21 @@ security control.
 
 ## Network
 
-There is none. Terminal Handoff contains no network code and transmits nothing
-off the machine.
+There is no network access in the detector, launcher, manifest, heartbeat or
+parent-shutdown paths. Network delivery exists only in the explicitly enabled
+HTTPS webhook adapter. The URL must be HTTPS; each canonical JSON body carries
+a timestamp, deterministic idempotency key and HMAC-SHA256 signature. A missing
+secret fails delivery and leaves the event in the bounded retry outbox.
+
+The outbound schema is privacy-minimised. It contains display names,
+generations, chain ID, terminal state, owner, urgency, explicit presence state
+and a concise reason. It never contains transcript contents or paths, prompts,
+repository paths, file contents, environment dumps, credentials or the signing
+secret. Local and Messages adapters use separate `osascript` argv elements and
+escaped AppleScript string literals; neither invokes a shell.
+
+External delivery is off by default. Enabling it is an intentional change to
+the trust boundary, documented in [NOTIFICATIONS.md](NOTIFICATIONS.md).
 
 ## Failure philosophy
 

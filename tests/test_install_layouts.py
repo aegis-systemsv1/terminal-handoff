@@ -283,6 +283,56 @@ class TestConfigurationStates(LayoutTestCase):
         run_th(["uninstall", "--apply", "--settings", settings, "--skip-claude-md"], "", self.env())
         self.assertEqual(before, text_file(settings))
 
+    def test_new_statusline_uses_a_responsive_refresh_interval(self):
+        settings = self.settings_at("fresh-refresh.json", {"theme": "light"})
+        code, out, err = run_th(
+            ["install", "--settings", settings, "--skip-claude-md"], "", self.env()
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json_file(settings)["statusLine"]["refreshInterval"], 5)
+
+    def test_upgrade_adds_refresh_interval_without_rewrapping(self):
+        legacy = "%s statusline --marker terminal-handoff" % TH_SCRIPT
+        settings = self.settings_at(
+            "upgrade-refresh.json",
+            {"theme": "dark", "statusLine": {"type": "command", "command": legacy}},
+        )
+        code, out, err = run_th(
+            ["install", "--settings", settings, "--skip-claude-md"], "", self.env()
+        )
+        self.assertEqual(code, 0, err)
+        statusline = json_file(settings)["statusLine"]
+        self.assertEqual(statusline["command"], legacy)
+        self.assertEqual(statusline["refreshInterval"], 5)
+        self.assertNotIn("--wrap", statusline["command"])
+
+    def test_existing_statusline_options_are_all_preserved(self):
+        original_statusline = {
+            "type": "command",
+            "command": THIRD_PARTY,
+            "padding": 2,
+            "refreshInterval": 11,
+            "futureClaudeOption": {"compact": True},
+        }
+        settings = self.settings_at(
+            "preserve-options.json", {"theme": "dark", "statusLine": original_statusline}
+        )
+        before = text_file(settings)
+        code, out, err = run_th(
+            ["install", "--settings", settings, "--skip-claude-md"], "", self.env()
+        )
+        self.assertEqual(code, 0, err)
+        installed = json_file(settings)["statusLine"]
+        self.assertEqual(installed["padding"], 2)
+        self.assertEqual(installed["refreshInterval"], 11)
+        self.assertEqual(installed["futureClaudeOption"], {"compact": True})
+        run_th(
+            ["uninstall", "--apply", "--settings", settings, "--skip-claude-md"],
+            "",
+            self.env(),
+        )
+        self.assertEqual(text_file(settings), before)
+
     def test_malformed_settings_json_is_refused_and_left_untouched(self):
         path = os.path.join(self.tmp, "broken.json")
         broken = '{ "theme": "light", oops '

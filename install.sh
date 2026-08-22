@@ -118,6 +118,7 @@ printf '\nProposed changes\n'
 note "install runtime to:   $PREFIX"
 note "configure statusLine: $SETTINGS"
 note "append instructions:  $HOME/.claude/CLAUDE.md"
+note "enable local alerts:  $PREFIX/notifications.json"
 
 if [ -f "$SETTINGS" ]; then
     EXISTING=$("$PY" - "$SETTINGS" <<'PYEOF'
@@ -205,5 +206,6 @@ printf 'Verify with:\n'
 printf '  %s %s/terminal-handoff.py version\n' "$PY" "$PREFIX"
 printf '  %s %s/terminal-handoff.py status\n' "$PY" "$PREFIX"
 printf '  %s %s/terminal-handoff.py coverage\n' "$PY" "$PREFIX"
+printf '  %s %s/terminal-handoff.py notifications test --channel local\n' "$PY" "$PREFIX"
 printf '\nStart a new Claude Code session to see the status line.\n'
 printf 'Uninstall with: %s/uninstall.sh\n' "$PREFIX"

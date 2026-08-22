@@ -22,6 +22,7 @@ from __future__ import print_function
 import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -30,11 +31,15 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.1.1"
+TERMINAL_HANDOFF_VERSION = "1.2.0"
 MANIFEST_SCHEMA_VERSION = 2
+NOTIFICATION_SCHEMA_VERSION = 1
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -93,6 +98,11 @@ STATE_DIRS = (
     "state",
     "chains",
     "transfers",
+    "outbox",
+    "outbox/pending",
+    "outbox/delivered",
+    "outbox/dead",
+    "notifications",
 )
 
 TRUTHY = ("1", "true", "yes", "on")
@@ -221,6 +231,16 @@ def write_private(path, data, mode=0o600):
         os.chmod(path, mode)
     except OSError:
         pass
+    # Persist the rename as well as the file contents. This matters for the
+    # transfer ledger and notification outbox after an unexpected power loss.
+    try:
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        pass
     return path
 
 
@@ -289,6 +309,636 @@ def log_event(event, **fields):
             os.close(fd)
     except Exception:
         pass  # Logging must never break the status line.
+
+
+# ---------------------------------------------------------------------------
+# Durable notifications
+# ---------------------------------------------------------------------------
+
+NOTIFICATION_MAX_MESSAGE = 500
+NOTIFICATION_DEFAULT_MAX_ATTEMPTS = 6
+NOTIFICATION_DEFAULT_RETRY_SECONDS = 30
+NOTIFICATION_MAX_RETRY_SECONDS = 1800
+NOTIFICATION_WORKER_SPAWN_INTERVAL = 20
+NOTIFICATION_SECRET_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+
+
+def default_notification_config():
+    """Safe defaults: local macOS alerts work; external delivery is opt-in."""
+    return {
+        "schema_version": NOTIFICATION_SCHEMA_VERSION,
+        "enabled": True,
+        "local": {"enabled": True, "on": ["complete", "failed"]},
+        "webhook": {
+            "enabled": False,
+            "url": "",
+            "secret_env": "TERMINAL_HANDOFF_WEBHOOK_SECRET",
+            "keychain_service": "terminal-handoff-webhook",
+            "keychain_account": "terminal-handoff",
+            "timeout_seconds": 8,
+            "on": ["complete", "failed"],
+        },
+        "messages": {
+            "enabled": False,
+            "recipient": "",
+            "when": "away_or_critical",
+            "on": ["complete", "failed"],
+        },
+        "retry": {
+            "max_attempts": NOTIFICATION_DEFAULT_MAX_ATTEMPTS,
+            "base_seconds": NOTIFICATION_DEFAULT_RETRY_SECONDS,
+        },
+    }
+
+
+def notification_config_path():
+    return th_path("notifications.json")
+
+
+def notification_presence_path():
+    return th_path("notifications", "presence.json")
+
+
+def _merge_config(defaults, supplied):
+    result = dict(defaults)
+    if not isinstance(supplied, dict):
+        return result
+    for key, value in supplied.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_config(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_notification_config():
+    return _merge_config(default_notification_config(), read_json(notification_config_path(), {}))
+
+
+def save_notification_config(config):
+    ensure_dirs()
+    merged = _merge_config(default_notification_config(), config)
+    merged["schema_version"] = NOTIFICATION_SCHEMA_VERSION
+    write_json_private(notification_config_path(), merged)
+    return merged
+
+
+def notification_presence():
+    """Return home, away or unknown without network or location tracking."""
+    override = os.environ.get("TERMINAL_HANDOFF_PRESENCE", "").strip().lower()
+    if override in ("home", "away", "unknown"):
+        return override
+    record = read_json(notification_presence_path(), {}) or {}
+    state = str(record.get("state", "home")).strip().lower()
+    return state if state in ("home", "away", "unknown") else "unknown"
+
+
+def set_notification_presence(state, source="cli"):
+    state = str(state).strip().lower()
+    if state not in ("home", "away", "unknown"):
+        raise ValueError("presence must be home, away or unknown")
+    record = {"state": state, "source": source, "updated_utc": utc_stamp()}
+    write_json_private(notification_presence_path(), record)
+    log_event("notification_presence", state=state, source=source)
+    return record
+
+
+def _safe_notification_text(value, limit=NOTIFICATION_MAX_MESSAGE):
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", str(value or ""))
+    text = " ".join(text.split())
+    return text[:limit]
+
+
+def _notification_event_id(*parts):
+    canonical = "\x00".join(str(part or "") for part in parts)
+    return hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def transfer_notification_event(record, target, reason=None):
+    parent = _safe_notification_text(record.get("parent_display_name") or "Session A", 120)
+    successor = _safe_notification_text(record.get("successor_display_name") or "Session B", 120)
+    failed = target == "TRANSFER_FAILED"
+    kind = "failed" if failed else "complete"
+    if failed:
+        message = "Handoff failed: %s could not transfer to %s. %s remains owner." % (
+            parent,
+            successor,
+            parent,
+        )
+        clean_reason = _safe_notification_text(reason, 240)
+        if clean_reason:
+            message += " Reason: %s" % clean_reason
+    else:
+        message = "Handoff complete: %s → %s. %s now owns the work." % (
+            parent,
+            successor,
+            successor,
+        )
+    event_id = _notification_event_id(
+        "transfer", record.get("parent_session_id"), target
+    )
+    return {
+        "schema_version": NOTIFICATION_SCHEMA_VERSION,
+        "event_id": event_id,
+        "event_type": "terminal_handoff.%s" % kind,
+        "kind": kind,
+        "title": "Terminal Handoff %s" % ("failed" if failed else "complete"),
+        "message": _safe_notification_text(message),
+        "urgency": "critical" if failed else "informational",
+        "chain_id": _safe_notification_text(record.get("chain_id"), 32),
+        "parent_generation": record.get("parent_generation"),
+        "successor_generation": record.get("successor_generation"),
+        "parent_display_name": parent,
+        "successor_display_name": successor,
+        "owner": record.get("owner"),
+        "suggested_channels": ["local", "push", "sms"],
+        "routing_hint": "sms_when_away_or_unknown" if failed else "sms_when_away",
+        "created_utc": utc_stamp(),
+        "created_epoch": time.time(),
+    }
+
+
+def launch_failure_notification_event(session_id, reason):
+    message = "Handoff failed before the successor could start. The current session remains owner."
+    clean_reason = _safe_notification_text(reason, 240)
+    if clean_reason:
+        message += " Reason: %s" % clean_reason
+    return {
+        "schema_version": NOTIFICATION_SCHEMA_VERSION,
+        "event_id": _notification_event_id("launch", session_id, "failed"),
+        "event_type": "terminal_handoff.failed",
+        "kind": "failed",
+        "title": "Terminal Handoff failed",
+        "message": _safe_notification_text(message),
+        "urgency": "critical",
+        "chain_id": None,
+        "parent_generation": None,
+        "successor_generation": None,
+        "parent_display_name": "Current session",
+        "successor_display_name": "Successor",
+        "owner": "parent",
+        "suggested_channels": ["local", "push", "sms"],
+        "routing_hint": "sms_when_away_or_unknown",
+        "created_utc": utc_stamp(),
+        "created_epoch": time.time(),
+    }
+
+
+def notification_outbox_path(state, event_id):
+    return th_path("outbox", state, "%s.json" % event_id)
+
+
+def notification_event_exists(event_id):
+    return any(
+        os.path.exists(notification_outbox_path(state, event_id))
+        for state in ("pending", "delivered", "dead")
+    )
+
+
+def enqueue_notification(event, spawn=True):
+    """Commit one idempotent event to the private outbox before delivery."""
+    ensure_dirs()
+    event_id = str((event or {}).get("event_id") or "")
+    if not re.match(r"^[a-f0-9]{32}$", event_id):
+        raise ValueError("notification event_id is invalid")
+    for state in ("pending", "delivered", "dead"):
+        existing = notification_outbox_path(state, event_id)
+        if os.path.exists(existing):
+            return existing
+    path = notification_outbox_path("pending", event_id)
+    write_json_private(
+        path,
+        {
+            "event": event,
+            "selected_channels": None,
+            "deliveries": {},
+            "attempts": 0,
+            "next_attempt_epoch": 0,
+            "queued_utc": utc_stamp(),
+        },
+    )
+    log_event("notification_queued", event_id=event_id, event_type=event.get("event_type"))
+    if spawn and not env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE"):
+        maybe_spawn_notification_worker(force=True)
+    return path
+
+
+def reconcile_notification_outbox(limit=100):
+    """Recreate a missing event after a crash between state commit and enqueue.
+
+    Only records created by this notification-capable release are considered,
+    so upgrading does not suddenly alert on historical 1.0/1.1 handoffs.
+    """
+    ensure_dirs()
+    repaired = 0
+    transfers_dir = th_path("transfers")
+    try:
+        names = [name for name in sorted(os.listdir(transfers_dir)) if name.endswith(".json")]
+    except OSError:
+        names = []
+    for name in names[: max(1, min(1000, int(limit)))]:
+        record = read_json(os.path.join(transfers_dir, name))
+        if not isinstance(record, dict):
+            continue
+        if record.get("terminal_handoff_version") != TERMINAL_HANDOFF_VERSION:
+            continue
+        state = record.get("state")
+        if state not in ("TRANSFER_COMPLETE", "TRANSFER_FAILED"):
+            continue
+        history = record.get("history") or []
+        reason = None
+        for entry in reversed(history):
+            if isinstance(entry, dict) and entry.get("state") == state:
+                reason = entry.get("reason")
+                break
+        event = transfer_notification_event(record, state, reason)
+        if not notification_event_exists(event["event_id"]):
+            enqueue_notification(event, spawn=False)
+            repaired += 1
+
+    failed_dir = th_path("failed")
+    try:
+        names = [name for name in sorted(os.listdir(failed_dir)) if name.endswith(".json")]
+    except OSError:
+        names = []
+    remaining = max(0, int(limit) - repaired)
+    for name in names[:remaining]:
+        record = read_json(os.path.join(failed_dir, name))
+        if not isinstance(record, dict):
+            continue
+        if record.get("terminal_handoff_version") != TERMINAL_HANDOFF_VERSION:
+            continue
+        session_id = record.get("session_id")
+        transfer = read_transfer(transfer_path(session_id)) if session_id else None
+        if isinstance(transfer, dict) and transfer.get("state") in (
+            "TRANSFER_COMPLETE",
+            "TRANSFER_FAILED",
+        ):
+            continue
+        event = launch_failure_notification_event(session_id, record.get("reason"))
+        if not notification_event_exists(event["event_id"]):
+            enqueue_notification(event, spawn=False)
+            repaired += 1
+    if repaired:
+        log_event("notification_outbox_reconciled", repaired=repaired)
+    return repaired
+
+
+def _event_enabled(channel_config, event):
+    allowed = channel_config.get("on", ["complete", "failed"])
+    return isinstance(allowed, list) and event.get("kind") in allowed
+
+
+def selected_notification_channels(config, event, presence=None):
+    test_channel = event.get("test_channel")
+    if test_channel in ("local", "webhook", "messages"):
+        return [test_channel]
+    if not config.get("enabled", True):
+        return []
+    presence = presence or notification_presence()
+    selected = []
+    local = config.get("local") or {}
+    if local.get("enabled") and _event_enabled(local, event):
+        selected.append("local")
+    webhook = config.get("webhook") or {}
+    if webhook.get("enabled") and _event_enabled(webhook, event):
+        selected.append("webhook")
+    messages = config.get("messages") or {}
+    if messages.get("enabled") and _event_enabled(messages, event):
+        when = str(messages.get("when", "away_or_critical"))
+        send = when == "always"
+        send = send or (when == "failed" and event.get("kind") == "failed")
+        send = send or (when == "away" and presence == "away")
+        send = send or (
+            when == "away_or_critical"
+            and (presence == "away" or (presence == "unknown" and event.get("kind") == "failed"))
+        )
+        if send:
+            selected.append("messages")
+    return selected
+
+
+def _applescript_literal(value):
+    value = _safe_notification_text(value)
+    value = value.replace("\\", "\\\\").replace('"', '\\"')
+    return '"%s"' % value
+
+
+def deliver_local_notification(event):
+    if sys.platform != "darwin":
+        return "skipped", "local notifications require macOS"
+    if not os.path.isfile("/usr/bin/osascript"):
+        return "failed", "osascript is unavailable"
+    script = "display notification %s with title %s" % (
+        _applescript_literal(event.get("message")),
+        _applescript_literal(event.get("title") or "Terminal Handoff"),
+    )
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8,
+            check=False,
+        )
+    except Exception as exc:
+        return "failed", _safe_notification_text(exc, 240)
+    if proc.returncode == 0:
+        return "delivered", "macOS accepted the notification"
+    return "failed", _safe_notification_text(proc.stderr.decode("utf-8", "replace"), 240)
+
+
+def deliver_messages_notification(event, channel_config):
+    if sys.platform != "darwin":
+        return "failed", "Messages delivery requires macOS"
+    recipient = _safe_notification_text(channel_config.get("recipient"), 256)
+    if not recipient:
+        return "failed", "Messages recipient is not configured"
+    if not os.path.isfile("/usr/bin/osascript"):
+        return "failed", "osascript is unavailable"
+    script = "\n".join(
+        [
+            'tell application "Messages"',
+            "set targetService to first service whose service type = iMessage",
+            "set targetBuddy to buddy %s of targetService" % _applescript_literal(recipient),
+            "send %s to targetBuddy" % _applescript_literal(event.get("message")),
+            "end tell",
+        ]
+    )
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        return "failed", _safe_notification_text(exc, 240)
+    if proc.returncode == 0:
+        return "delivered", "Messages accepted the send request"
+    return "failed", _safe_notification_text(proc.stderr.decode("utf-8", "replace"), 240)
+
+
+def deliver_webhook_notification(event, channel_config, opener=None):
+    url = str(channel_config.get("url") or "").strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return "failed", "webhook URL must be HTTPS"
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return "failed", "webhook URL must not contain credentials, query or fragment"
+    secret_env = str(channel_config.get("secret_env") or "")
+    if not NOTIFICATION_SECRET_ENV_RE.match(secret_env):
+        return "failed", "webhook secret environment variable name is invalid"
+    secret = os.environ.get(secret_env, "")
+    if not secret and sys.platform == "darwin" and os.path.isfile("/usr/bin/security"):
+        service = _safe_notification_text(channel_config.get("keychain_service"), 128)
+        account = _safe_notification_text(channel_config.get("keychain_account"), 128)
+        if service and account:
+            try:
+                proc = subprocess.run(
+                    [
+                        "/usr/bin/security",
+                        "find-generic-password",
+                        "-s",
+                        service,
+                        "-a",
+                        account,
+                        "-w",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+                if proc.returncode == 0:
+                    secret = proc.stdout.decode("utf-8", "replace").rstrip("\r\n")
+            except Exception:
+                secret = ""
+    if not secret:
+        return "failed", "webhook signing secret is unavailable from environment or Keychain"
+    body = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    timestamp = str(int(time.time()))
+    signature = hmac.new(
+        secret.encode("utf-8"), timestamp.encode("ascii") + b"." + body, hashlib.sha256
+    ).hexdigest()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Terminal-Handoff/%s" % TERMINAL_HANDOFF_VERSION,
+            "Idempotency-Key": event.get("event_id", ""),
+            "X-Terminal-Handoff-Event": event.get("event_type", ""),
+            "X-Terminal-Handoff-Timestamp": timestamp,
+            "X-Terminal-Handoff-Signature": "sha256=%s" % signature,
+        },
+        method="POST",
+    )
+    timeout = channel_config.get("timeout_seconds", 8)
+    try:
+        timeout = max(1, min(30, int(timeout)))
+    except (TypeError, ValueError):
+        timeout = 8
+    try:
+        response = (opener or urllib.request.urlopen)(request, timeout=timeout)
+        try:
+            status = int(getattr(response, "status", response.getcode()))
+            response.read(1024)
+        finally:
+            response.close()
+    except Exception as exc:
+        # urllib exceptions may echo the full endpoint. The URL is private
+        # configuration and is intentionally absent from logs and ledgers.
+        return "failed", "webhook request failed (%s)" % exc.__class__.__name__
+    if 200 <= status < 300:
+        return "delivered", "webhook accepted with HTTP %d" % status
+    return "failed", "webhook returned HTTP %d" % status
+
+
+def _deliver_notification_channel(channel, event, config):
+    if channel == "local":
+        return deliver_local_notification(event)
+    if channel == "webhook":
+        return deliver_webhook_notification(event, config.get("webhook") or {})
+    if channel == "messages":
+        return deliver_messages_notification(event, config.get("messages") or {})
+    return "skipped", "unknown channel"
+
+
+def _move_outbox(path, target_state):
+    event_id = os.path.splitext(os.path.basename(path))[0]
+    destination = notification_outbox_path(target_state, event_id)
+    os.replace(path, destination)
+    return destination
+
+
+def deliver_pending_notification(path, config=None, now=None):
+    """Attempt one event. Successful channels are never called again."""
+    record = read_json(path)
+    if not isinstance(record, dict) or not isinstance(record.get("event"), dict):
+        return _move_outbox(path, "dead")
+    now = time.time() if now is None else float(now)
+    if float(record.get("next_attempt_epoch") or 0) > now:
+        return path
+    event = record["event"]
+    config = config or load_notification_config()
+    presence = notification_presence()
+    event["presence"] = presence
+    selected = record.get("selected_channels")
+    if not isinstance(selected, list):
+        selected = selected_notification_channels(config, event, presence)
+        record["selected_channels"] = selected
+
+    deliveries = record.setdefault("deliveries", {})
+    failed = False
+    for channel in selected:
+        prior = deliveries.get(channel) or {}
+        if prior.get("status") in ("delivered", "skipped"):
+            continue
+        status, detail = _deliver_notification_channel(channel, event, config)
+        deliveries[channel] = {
+            "status": status,
+            "detail": _safe_notification_text(detail, 240),
+            "attempted_utc": utc_stamp(),
+            "attempted_epoch": now,
+            "attempts": int(prior.get("attempts") or 0) + 1,
+        }
+        log_event(
+            "notification_delivery",
+            event_id=event.get("event_id"),
+            channel=channel,
+            status=status,
+            detail=_safe_notification_text(detail, 240),
+        )
+        if status == "failed":
+            failed = True
+
+    if not selected:
+        record["suppressed_reason"] = "no notification channel selected"
+
+    if not failed:
+        record["final_status"] = "delivered" if selected else "suppressed"
+        record["finished_utc"] = utc_stamp()
+        write_json_private(path, record)
+        return _move_outbox(path, "delivered")
+
+    record["attempts"] = int(record.get("attempts") or 0) + 1
+    retry = config.get("retry") or {}
+    try:
+        max_attempts = max(1, min(20, int(retry.get("max_attempts", 6))))
+    except (TypeError, ValueError):
+        max_attempts = NOTIFICATION_DEFAULT_MAX_ATTEMPTS
+    if record["attempts"] >= max_attempts:
+        record["final_status"] = "dead"
+        record["finished_utc"] = utc_stamp()
+        write_json_private(path, record)
+        return _move_outbox(path, "dead")
+    try:
+        base = max(5, min(600, int(retry.get("base_seconds", 30))))
+    except (TypeError, ValueError):
+        base = NOTIFICATION_DEFAULT_RETRY_SECONDS
+    delay = min(NOTIFICATION_MAX_RETRY_SECONDS, base * (2 ** (record["attempts"] - 1)))
+    record["next_attempt_epoch"] = now + delay
+    record["next_attempt_utc"] = utc_stamp(datetime.fromtimestamp(now + delay, timezone.utc))
+    write_json_private(path, record)
+    return path
+
+
+def notification_worker_lock_path():
+    return th_path("outbox", "worker.lock")
+
+
+def drain_notification_outbox(limit=25, now=None):
+    ensure_dirs()
+    lock_fd = os.open(notification_worker_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return {"processed": 0, "pending": len(os.listdir(th_path("outbox", "pending")))}
+            raise
+        config = load_notification_config()
+        names = [name for name in sorted(os.listdir(th_path("outbox", "pending"))) if name.endswith(".json")]
+        processed = 0
+        for name in names[: max(1, min(100, int(limit)))]:
+            path = th_path("outbox", "pending", name)
+            try:
+                before = os.path.exists(path)
+                deliver_pending_notification(path, config=config, now=now)
+                processed += int(before)
+            except Exception as exc:
+                log_event("notification_worker_error", file=name, error=str(exc)[:300])
+        pending = len(
+            [name for name in os.listdir(th_path("outbox", "pending")) if name.endswith(".json")]
+        )
+        return {"processed": processed, "pending": pending}
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
+
+
+def maybe_spawn_notification_worker(force=False):
+    if env_flag("CLAUDE_TERMINAL_HANDOFF_DISABLE_NOTIFICATIONS"):
+        return False
+    try:
+        reconcile_notification_outbox()
+    except Exception as exc:
+        log_event("notification_reconcile_failed", error=str(exc)[:300])
+    pending_dir = th_path("outbox", "pending")
+    try:
+        if not any(name.endswith(".json") for name in os.listdir(pending_dir)):
+            return False
+    except OSError:
+        return False
+    stamp_path = th_path("notifications", "worker-spawn.json")
+    last = read_json(stamp_path, {}) or {}
+    if not force and time.time() - float(last.get("epoch") or 0) < NOTIFICATION_WORKER_SPAWN_INTERVAL:
+        return False
+    write_json_private(stamp_path, {"epoch": time.time(), "ts": utc_stamp(), "pid": os.getpid()})
+    try:
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [preferred_python(), os.path.abspath(__file__), "notifications", "drain"],
+                stdin=subprocess.DEVNULL,
+                stdout=devnull,
+                stderr=devnull,
+                start_new_session=True,
+                close_fds=True,
+            )
+        return True
+    except Exception as exc:
+        log_event("notification_worker_spawn_failed", error=str(exc)[:300])
+        return False
+
+
+def notification_summary():
+    ensure_dirs()
+    counts = {}
+    for state in ("pending", "delivered", "dead"):
+        try:
+            counts[state] = len(
+                [name for name in os.listdir(th_path("outbox", state)) if name.endswith(".json")]
+            )
+        except OSError:
+            counts[state] = 0
+    config = load_notification_config()
+    return {
+        "enabled": bool(config.get("enabled", True)),
+        "presence": notification_presence(),
+        "channels": {
+            name: bool((config.get(name) or {}).get("enabled"))
+            for name in ("local", "webhook", "messages")
+        },
+        "outbox": counts,
+        "config_file": notification_config_path(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1551,7 @@ BADGES = {
     "trigger": "TH launching",
     "handed_off": "TH handed off",
     "launching": "TH launching",
+    "failed": "TH failed",
     "blocked": "TH blocked",
     "cooldown": "TH retrying",
     "circuit_open": "TH circuit open",
@@ -1477,8 +2128,9 @@ Transfer state: {{TRANSFER_PATH}}
 
 Your parent session may still be running and still own the work. Do not mutate
 any repository file until your heartbeat has been validated, your repository
-verification is complete, and the transfer state reads PARENT_STOP_REQUESTED or
-TRANSFER_COMPLETE. Reading and verifying are always allowed.
+verification is complete, and the transfer state reads TRANSFER_COMPLETE.
+PARENT_STOP_REQUESTED is read-only for both sessions. Reading and verifying are
+always allowed.
 
 Read the manifest, delegate parent-transcript analysis to a context-isolated
 subagent, verify repository state independently, then produce a TERMINAL HANDOFF
@@ -1892,9 +2544,10 @@ TRANSFER_STATES = (
     TRANSFER_FAILED,
 )
 
-# Before SUCCESSOR_VERIFIED the parent owns continuation. After
-# PARENT_STOP_REQUESTED the successor owns it. There is exactly one boundary,
-# and every transition is recorded.
+# The parent owns continuation until shutdown is confirmed. While shutdown is
+# being requested neither side may mutate. Only TRANSFER_COMPLETE gives the
+# successor ownership. This eliminates the overlap window in which the parent
+# could still be alive for the full graceful-stop budget.
 TRANSFER_TRANSITIONS = {
     TRANSFER_LAUNCHING: (TRANSFER_SUCCESSOR_VERIFIED, TRANSFER_FAILED),
     TRANSFER_SUCCESSOR_VERIFIED: (TRANSFER_PARENT_STOP_REQUESTED, TRANSFER_FAILED),
@@ -1906,7 +2559,7 @@ TRANSFER_TRANSITIONS = {
 TRANSFER_OWNER = {
     TRANSFER_LAUNCHING: "parent",
     TRANSFER_SUCCESSOR_VERIFIED: "parent",
-    TRANSFER_PARENT_STOP_REQUESTED: "successor",
+    TRANSFER_PARENT_STOP_REQUESTED: "none",
     TRANSFER_COMPLETE: "successor",
     TRANSFER_FAILED: "parent",
 }
@@ -2047,6 +2700,20 @@ def transfer_transition(path, target, reason=None, **fields):
             chain_id=(outcome["record"] or {}).get("chain_id"),
             parent_session_id=(outcome["record"] or {}).get("parent_session_id"),
         )
+        if target in (TRANSFER_COMPLETE, TRANSFER_FAILED):
+            try:
+                enqueue_notification(
+                    transfer_notification_event(outcome["record"] or {}, target, reason)
+                )
+            except Exception as exc:
+                # The committed transfer is authoritative. Notification
+                # failures are visible but may never roll it back.
+                log_event(
+                    "notification_enqueue_failed",
+                    transfer=os.path.basename(path),
+                    state=target,
+                    error=str(exc)[:300],
+                )
     return outcome["ok"], outcome["record"]
 
 
@@ -2099,7 +2766,12 @@ def set_state(session_id, state, **extra):
     """Record the handoff lifecycle state: eligible -> launching -> launched ->
     successor_started -> completed (or failed)."""
     ensure_dirs()
-    record = {"session_id": session_id, "state": state, "ts": utc_stamp()}
+    record = {
+        "session_id": session_id,
+        "state": state,
+        "ts": utc_stamp(),
+        "terminal_handoff_version": TERMINAL_HANDOFF_VERSION,
+    }
     record.update(extra)
     directory = {
         "launching": "launching",
@@ -2170,6 +2842,23 @@ def fail_launch(session_id, reason, detail=None, allow_retry=True, manifest_file
         retry_released=released,
         retry_exhausted=(not released and allow_retry),
     )
+    # If a transfer record already emitted a terminal event, do not produce a
+    # second alert for the same failure. Early launcher failures have no
+    # transfer record and need their own durable event.
+    transfer = read_transfer(transfer_path(session_id))
+    if not isinstance(transfer, dict) or transfer.get("state") not in (
+        TRANSFER_COMPLETE,
+        TRANSFER_FAILED,
+    ):
+        try:
+            enqueue_notification(launch_failure_notification_event(session_id, reason))
+        except Exception as exc:
+            log_event(
+                "notification_enqueue_failed",
+                session_id=session_id,
+                state="launch_failed",
+                error=str(exc)[:300],
+            )
     return released
 
 
@@ -2432,15 +3121,15 @@ def spawn_launcher(payload, parent_binding=None):
         write_json_private(parent_binding_path(session_id), parent_binding)
     self_path = os.path.abspath(__file__)
     try:
-        devnull = open(os.devnull, "wb")
-        subprocess.Popen(
-            [preferred_python(), self_path, "launch", "--payload", payload_file],
-            stdin=subprocess.DEVNULL,
-            stdout=devnull,
-            stderr=devnull,
-            start_new_session=True,
-            close_fds=True,
-        )
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [preferred_python(), self_path, "launch", "--payload", payload_file],
+                stdin=subprocess.DEVNULL,
+                stdout=devnull,
+                stderr=devnull,
+                start_new_session=True,
+                close_fds=True,
+            )
         return True
     except Exception as exc:
         log_event("spawn_failed", session_id=session_id, error=str(exc)[:300])
@@ -2660,36 +3349,224 @@ def supervisor_lock_path(parent_session_id):
     return th_path("transfers", "%s.supervisor.lock" % parent_session_id)
 
 
-def claim_supervisor(parent_session_id):
-    """One supervisor per transfer, claimed atomically.
+def acquire_supervisor_lease(parent_session_id):
+    """Acquire the recoverable, process-lifetime lease for one supervisor.
 
-    Duplicate status-line invocations, a retried launch or a second supervisor
-    process can therefore never produce a second shutdown attempt.
+    The old implementation used a permanent O_EXCL marker. If that supervisor
+    crashed, the marker survived forever and no replacement could recover the
+    transfer. ``flock`` is released by the kernel when the process exits, while
+    still excluding every concurrent supervisor.
     """
     ensure_dirs()
     path = supervisor_lock_path(parent_session_id)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
-        if exc.errno == errno.EEXIST:
-            return False
+        os.close(fd)
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            return None
         raise
     try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
         os.write(
             fd,
-            json.dumps({"pid": os.getpid(), "claimed_utc": utc_stamp()}, sort_keys=True).encode(
+            json.dumps({"pid": os.getpid(), "leased_utc": utc_stamp()}, sort_keys=True).encode(
                 "utf-8"
             ),
         )
+        os.fsync(fd)
+    except BaseException:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        raise
+    return fd
+
+
+def release_supervisor_lease(fd):
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
     finally:
         os.close(fd)
+
+
+_COMPAT_SUPERVISOR_LEASES = {}
+
+
+def claim_supervisor(parent_session_id):
+    """Compatibility boolean API; keep the acquired lease for this process."""
+    lease = acquire_supervisor_lease(parent_session_id)
+    if lease is None:
+        return False
+    old = _COMPAT_SUPERVISOR_LEASES.pop(parent_session_id, None)
+    release_supervisor_lease(old)
+    _COMPAT_SUPERVISOR_LEASES[parent_session_id] = lease
     return True
 
 
 def parent_process_gone(binding):
     """True when the exact bound process is no longer running."""
-    ok, _ = verify_parent_binding(binding)
-    return not ok
+    return bound_parent_process_state(binding) == "gone"
+
+
+def bound_parent_process_present(binding):
+    """Whether the originally bound process identity still occupies its PID.
+
+    This deliberately ignores mutable metadata such as cwd and transfer IDs.
+    Those must match before signalling, but a cwd change after SIGTERM must not
+    be mistaken for process exit and hand ownership to the successor early.
+    """
+    return bound_parent_process_state(binding) == "present"
+
+
+def process_exists(pid):
+    """Tri-state liveness probe: True, False, or None when ps itself failed."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 1:
+        return False
+    try:
+        proc = subprocess.Popen(
+            [PS_BIN, "-p", str(pid), "-o", "pid="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        out, _ = proc.communicate(timeout=PS_TIMEOUT)
+    except Exception:
+        return None
+    if proc.returncode == 0 and out.decode("utf-8", "replace").strip() == str(pid):
+        return True
+    if proc.returncode in (0, 1) and not out.strip():
+        return False
+    return None
+
+
+def bound_parent_process_state(binding):
+    """Return present, gone or unknown for the exact bound process identity."""
+    if not isinstance(binding, dict):
+        return "unknown"
+    try:
+        pid = int(binding.get("pid"))
+    except (TypeError, ValueError):
+        return "unknown"
+    identity = process_identity(pid)
+    if not isinstance(identity, dict):
+        state = (_ps_field(pid, "stat=") or "").strip()
+        if state.startswith("Z"):
+            return "gone"  # exited but not yet reaped by its own parent
+        if state:
+            return "unknown"  # live, but its stable identity could not be parsed
+        exists = process_exists(pid)
+        return "gone" if exists is False else "unknown"
+    for key in ("pid", "start", "uid", "tty", "name"):
+        recorded = binding.get(key)
+        if recorded is not None and identity.get(key) != recorded:
+            return "gone"  # the PID is live, but the originally bound process is not
+    return "present"
+
+
+def recover_parent_stop_requested(path, record):
+    """Resolve an interrupted stop request without ever signalling again."""
+    binding = record.get("parent_process") or {}
+    parent_session_id = record.get("parent_session_id")
+    chain_id = record.get("chain_id")
+    try:
+        pid = int(binding.get("pid"))
+    except (TypeError, ValueError):
+        pid = None
+
+    process_state = bound_parent_process_state(binding)
+    if process_state == "gone":
+        transfer_transition(
+            path,
+            TRANSFER_COMPLETE,
+            reason="recovered supervisor confirmed that the bound parent had exited",
+            parent_stopped=True,
+            parent_stopped_utc=utc_stamp(),
+            supervisor_recovered=True,
+        )
+        set_state(
+            parent_session_id,
+            "completed",
+            reason="recovered supervisor confirmed parent exit",
+            parent_stopped=True,
+        )
+        log_event(
+            "parent_stop_recovered_complete",
+            parent_session_id=parent_session_id,
+            chain_id=chain_id,
+            pid=pid,
+        )
+        return True, None
+    if process_state == "unknown":
+        transfer_transition(
+            path,
+            TRANSFER_FAILED,
+            reason=(
+                "recovered supervisor could not prove whether the bound parent still exists; "
+                "ownership remains with the parent"
+            ),
+            parent_stopped=False,
+            supervisor_recovered=True,
+        )
+        return False, "parent process liveness is unknown"
+
+    ok, reason = verify_parent_binding(
+        binding,
+        chain_id=chain_id,
+        generation=record.get("parent_generation"),
+        session_id=parent_session_id,
+    )
+    if not ok:
+        transfer_transition(
+            path,
+            TRANSFER_FAILED,
+            reason="recovered supervisor could not re-prove the live parent: %s" % reason,
+            parent_stopped=False,
+            supervisor_recovered=True,
+        )
+        return False, reason
+
+    now = time.time()
+    try:
+        requested = float(record.get("stop_requested_epoch"))
+    except (TypeError, ValueError):
+        requested = now
+    deadline = requested + (stop_grace_seconds() * stop_attempts())
+    while time.time() < deadline:
+        if bound_parent_process_state(binding) == "gone":
+            return recover_parent_stop_requested(path, read_transfer(path) or record)
+        time.sleep(min(0.5, transfer_poll_seconds()))
+
+    # The previous supervisor may already have sent SIGTERM. Repeating it after
+    # a crash would make the at-most-once request unprovable, so recovery fails
+    # closed with the live parent retaining ownership.
+    transfer_transition(
+        path,
+        TRANSFER_FAILED,
+        reason=(
+            "supervisor recovered after the stop request, but parent pid %s is still running; "
+            "no second signal was sent" % (pid if pid is not None else "unknown")
+        ),
+        parent_stopped=False,
+        supervisor_recovered=True,
+    )
+    log_event(
+        "parent_stop_recovered_unconfirmed",
+        parent_session_id=parent_session_id,
+        chain_id=chain_id,
+        pid=pid,
+    )
+    return False, "parent still running after recovered stop request"
 
 
 def request_parent_stop(path, record):
@@ -2727,6 +3604,7 @@ def request_parent_stop(path, record):
         TRANSFER_PARENT_STOP_REQUESTED,
         reason="successor verified; requesting graceful parent shutdown",
         stop_requested_utc=utc_stamp(),
+        stop_requested_epoch=time.time(),
     )
     if not moved:
         # Another supervisor already owns the shutdown, or the transfer moved
@@ -2789,6 +3667,27 @@ def request_parent_stop(path, record):
         try:
             os.kill(pid, PARENT_STOP_SIGNAL)
         except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                transfer_transition(
+                    path,
+                    TRANSFER_COMPLETE,
+                    reason="parent exited before the graceful signal could be delivered",
+                    parent_stopped=True,
+                    parent_stopped_utc=utc_stamp(),
+                )
+                set_state(
+                    parent_session_id,
+                    "completed",
+                    reason="successor verified; parent had already exited",
+                    parent_stopped=True,
+                )
+                log_event(
+                    "parent_already_stopped",
+                    parent_session_id=parent_session_id,
+                    chain_id=chain_id,
+                    pid=pid,
+                )
+                return True, None
             transfer_transition(
                 path,
                 TRANSFER_FAILED,
@@ -2886,26 +3785,11 @@ def request_parent_stop(path, record):
     return False, "parent did not exit"
 
 
-def supervise_transfer(path, wait=True):
+def _supervise_transfer_claimed(path, wait, record, parent_session_id):
     """Wait for a verified successor heartbeat, then stop the exact parent.
 
-    Runs detached from the status-line process. Every exit path is recorded in
-    the transfer record and the log.
+    Called only while the caller holds the recoverable supervisor lease.
     """
-    ensure_dirs()
-    record = read_transfer(path)
-    if record is None:
-        log_event("supervisor_abort", reason="transfer record unreadable", transfer=path)
-        return 2
-
-    parent_session_id = record.get("parent_session_id")
-    if not parent_session_id:
-        log_event("supervisor_abort", reason="transfer record has no parent session")
-        return 2
-    if not claim_supervisor(parent_session_id):
-        log_event("supervisor_skipped", parent_session_id=parent_session_id, reason="already claimed")
-        return 0
-
     log_event(
         "supervisor_started",
         parent_session_id=parent_session_id,
@@ -2936,6 +3820,11 @@ def supervise_transfer(path, wait=True):
         log_event("parent_stop_refused", parent_session_id=parent_session_id, reason="unbound")
         return 3
 
+    record = read_transfer(path) or record
+    if record.get("state") == TRANSFER_PARENT_STOP_REQUESTED:
+        ok, _ = recover_parent_stop_requested(path, record)
+        return 0 if ok else 5
+
     deadline = time.time() + heartbeat_timeout()
     poll = transfer_poll_seconds()
     while wait:
@@ -2943,7 +3832,7 @@ def supervise_transfer(path, wait=True):
         state = record.get("state")
         if state == TRANSFER_SUCCESSOR_VERIFIED:
             break
-        if state in (TRANSFER_COMPLETE, TRANSFER_FAILED, TRANSFER_PARENT_STOP_REQUESTED):
+        if state in (TRANSFER_COMPLETE, TRANSFER_FAILED):
             log_event(
                 "supervisor_exit", parent_session_id=parent_session_id, state=state
             )
@@ -2974,22 +3863,97 @@ def supervise_transfer(path, wait=True):
     return 0 if ok else 5
 
 
+def supervise_transfer(path, wait=True):
+    """Run one crash-recoverable supervisor for a transfer."""
+    ensure_dirs()
+    record = read_transfer(path)
+    if record is None:
+        log_event("supervisor_abort", reason="transfer record unreadable", transfer=path)
+        return 2
+
+    parent_session_id = record.get("parent_session_id")
+    if not parent_session_id:
+        log_event("supervisor_abort", reason="transfer record has no parent session")
+        return 2
+
+    lease = acquire_supervisor_lease(parent_session_id)
+    if lease is None:
+        log_event("supervisor_skipped", parent_session_id=parent_session_id, reason="lease held")
+        return 0
+    try:
+        return _supervise_transfer_claimed(path, wait, record, parent_session_id)
+    finally:
+        release_supervisor_lease(lease)
+
+
 def spawn_supervisor(transfer_file):
     """Spawn the detached shutdown supervisor for one transfer."""
     try:
-        devnull = open(os.devnull, "wb")
-        subprocess.Popen(
-            [preferred_python(), os.path.abspath(__file__), "supervise", "--transfer", transfer_file],
-            stdin=subprocess.DEVNULL,
-            stdout=devnull,
-            stderr=devnull,
-            start_new_session=True,
-            close_fds=True,
-        )
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [
+                    preferred_python(),
+                    os.path.abspath(__file__),
+                    "supervise",
+                    "--transfer",
+                    transfer_file,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=devnull,
+                stderr=devnull,
+                start_new_session=True,
+                close_fds=True,
+            )
         return True
     except Exception as exc:
         log_event("supervisor_spawn_failed", transfer=transfer_file, error=str(exc)[:300])
         return False
+
+
+def ensure_supervisor_running(transfer_file):
+    """Self-heal a missing supervisor without ever creating two signal owners."""
+    if env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE"):
+        return False
+    try:
+        candidate = os.path.realpath(os.path.abspath(transfer_file))
+        transfer_dir = os.path.realpath(th_path("transfers"))
+        if os.path.dirname(candidate) != transfer_dir:
+            return False
+    except Exception:
+        return False
+    record = read_transfer(candidate)
+    if not isinstance(record, dict):
+        return False
+    if record.get("state") in (
+        TRANSFER_COMPLETE,
+        TRANSFER_FAILED,
+    ):
+        return False
+    if not (record.get("stop") or {}).get("enabled", True):
+        return False
+    parent_session_id = record.get("parent_session_id")
+    if not parent_session_id:
+        return False
+
+    # Probe the kernel lease. Failure means a live supervisor owns it. Success
+    # means no process owns it; release the probe before spawning the recovery.
+    lease = acquire_supervisor_lease(parent_session_id)
+    if lease is None:
+        return True
+    release_supervisor_lease(lease)
+    spawned = spawn_supervisor(candidate)
+    if spawned:
+        update_transfer_fields(
+            candidate,
+            supervisor_spawned=True,
+            supervisor_recovered_utc=utc_stamp(),
+        )
+        log_event(
+            "supervisor_recovered",
+            parent_session_id=parent_session_id,
+            chain_id=record.get("chain_id"),
+        )
+    return spawned
 
 
 # ---------------------------------------------------------------------------
@@ -3077,13 +4041,36 @@ def cmd_statusline(args):
     decision = {"state": "invalid", "percent": None}
     try:
         ensure_dirs()
+        if not env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE"):
+            maybe_spawn_notification_worker()
         decision = decide(payload, validate_files=True)
         facts = extract_facts(payload, validate_files=True) if payload else None
         if facts is not None:
             try:
                 successor_heartbeat(facts)
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event(
+                    "successor_heartbeat_error",
+                    session_id=getattr(facts, "session_id", None),
+                    error=str(exc)[:300],
+                )
+            # Both sides can restart a crashed supervisor. The parent derives
+            # its transfer path from its session ID; the successor receives the
+            # exact path in its validated launch environment.
+            candidates = [transfer_path(facts.session_id)]
+            successor_transfer = os.environ.get("CLAUDE_TERMINAL_HANDOFF_TRANSFER")
+            if successor_transfer:
+                candidates.append(successor_transfer)
+            for candidate in set(candidates):
+                try:
+                    if os.path.isfile(candidate):
+                        ensure_supervisor_running(candidate)
+                except Exception as exc:
+                    log_event(
+                        "supervisor_recovery_error",
+                        session_id=facts.session_id,
+                        error=str(exc)[:300],
+                    )
         if decision.get("trigger"):
             session_id = decision.get("session_id")
             if session_id and claim_trigger(session_id):
@@ -3109,8 +4096,16 @@ def cmd_statusline(args):
                     parent_pid=(binding or {}).get("pid"),
                     parent_bind_reason=bind_reason,
                 )
-                spawn_launcher(payload, binding)
-                decision["state"] = "launching"
+                if spawn_launcher(payload, binding):
+                    decision["state"] = "launching"
+                else:
+                    fail_launch(
+                        session_id,
+                        "detached launcher could not be started",
+                        allow_retry=True,
+                        state="failed_spawn",
+                    )
+                    decision["state"] = "failed"
             else:
                 decision["state"] = "handed_off"
         elif decision.get("state") == "blocked":
@@ -3275,6 +4270,26 @@ def install_statusline(settings_file, tag):
     existing = settings.get("statusLine")
 
     if isinstance(existing, dict) and is_terminal_handoff_command(existing.get("command", "")):
+        if "refreshInterval" not in existing:
+            backup = backup_file(settings_file, tag) if not created else None
+            existing["refreshInterval"] = 5
+            serialized = _serialize_settings(settings, original_text)
+            json.loads(serialized)
+            mode = 0o600 if created else (os.stat(settings_file).st_mode & 0o777)
+            write_private(settings_file, serialized, mode=mode)
+            log_event(
+                "statusline_refresh_interval_added",
+                settings_file=settings_file,
+                refresh_interval=5,
+                backup=backup,
+            )
+            return {
+                "ok": True,
+                "already_installed": True,
+                "settings_file": settings_file,
+                "refresh_interval_added": True,
+                "backup": backup,
+            }
         return {"ok": True, "already_installed": True, "settings_file": settings_file}
 
     backup = backup_file(settings_file, tag) if not created else None
@@ -3298,9 +4313,15 @@ def install_statusline(settings_file, tag):
 
     new_statusline = {"type": "command", "command": th_statusline_command(wrap_command)}
     if isinstance(original, dict):
-        for key in ("padding",):
-            if key in original:
-                new_statusline[key] = original[key]
+        # Keep every presentation or scheduling option Claude Code knows now
+        # or adds later. Only the executable type and command belong to us.
+        for key, value in original.items():
+            if key not in ("type", "command"):
+                new_statusline[key] = value
+    else:
+        # Two validated heartbeats are required. Five seconds keeps that gate
+        # responsive without turning the status line into a hot polling loop.
+        new_statusline["refreshInterval"] = 5
 
     settings["statusLine"] = new_statusline
     serialized = _serialize_settings(settings, original_text)
@@ -3616,7 +4637,11 @@ def cmd_build_command(args):
 
 def cmd_install(args):
     ensure_dirs()
-    results = {"targets": [], "claude_md": None}
+    if not os.path.isfile(notification_config_path()):
+        save_notification_config(default_notification_config())
+    if not os.path.isfile(notification_presence_path()):
+        set_notification_presence("home", source="install")
+    results = {"targets": [], "claude_md": None, "notifications": notification_summary()}
     for settings_file in args.settings:
         results["targets"].append(install_statusline(os.path.abspath(os.path.expanduser(settings_file)), args.tag))
     if not args.skip_claude_md:
@@ -3637,7 +4662,11 @@ def cmd_uninstall(args):
         "handoffs": th_path("handoffs"),
         "logs": th_path("logs"),
         "backups": th_path("backups"),
-        "note": "Manifests, logs and backups are preserved. Transcripts are never touched.",
+        "notifications": th_path("outbox"),
+        "note": (
+            "Manifests, logs, backups and notification history are preserved. "
+            "Transcripts are never touched."
+        ),
     }
     print(json.dumps(results, indent=2, default=str))
     return 0
@@ -3695,6 +4724,7 @@ def cmd_status(args):
         "stop_grace_seconds": stop_grace_seconds(),
         "stop_attempts": stop_attempts(),
         "transfers": transfer_summary(),
+        "notifications": notification_summary(),
     }
     print(json.dumps(info, indent=2, default=str))
     return 0
@@ -3712,12 +4742,15 @@ def transfer_summary():
         record = read_json(os.path.join(directory, name))
         if not isinstance(record, dict):
             continue
+        state = record.get("state")
         rows.append(
             {
                 "parent_session_id": record.get("parent_session_id"),
                 "chain_id": record.get("chain_id"),
-                "state": record.get("state"),
-                "owner": record.get("owner"),
+                "state": state,
+                # Normalise pre-1.2 records that labelled an in-flight stop as
+                # successor-owned. The state is authoritative.
+                "owner": TRANSFER_OWNER.get(state, record.get("owner")),
                 "successor_display_name": record.get("successor_display_name"),
                 "parent_stopped": record.get("parent_stopped"),
             }
@@ -3727,6 +4760,205 @@ def transfer_summary():
 
 def cmd_supervise(args):
     return supervise_transfer(args.transfer)
+
+
+def _redacted_notification_config(config):
+    result = json.loads(json.dumps(config))
+    webhook = result.get("webhook") or {}
+    webhook["url_configured"] = bool(webhook.get("url"))
+    webhook.pop("url", None)
+    messages = result.get("messages") or {}
+    messages["recipient_configured"] = bool(messages.get("recipient"))
+    messages.pop("recipient", None)
+    return result
+
+
+def _notification_test_event(channel):
+    event_id = _notification_event_id("test", channel, uuid.uuid4().hex)
+    return {
+        "schema_version": NOTIFICATION_SCHEMA_VERSION,
+        "event_id": event_id,
+        "event_type": "terminal_handoff.test",
+        "kind": "complete",
+        "test_channel": channel,
+        "title": "Terminal Handoff test",
+        "message": "Terminal Handoff %s notification test succeeded." % channel,
+        "urgency": "informational",
+        "chain_id": "test",
+        "parent_generation": 0,
+        "successor_generation": 1,
+        "parent_display_name": "Session A",
+        "successor_display_name": "Session B",
+        "owner": "successor",
+        "suggested_channels": [channel],
+        "created_utc": utc_stamp(),
+        "created_epoch": time.time(),
+    }
+
+
+def retry_dead_notifications(event_id=None):
+    ensure_dirs()
+    names = ["%s.json" % event_id] if event_id else sorted(os.listdir(th_path("outbox", "dead")))
+    moved = 0
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        source = th_path("outbox", "dead", name)
+        record = read_json(source)
+        if not isinstance(record, dict) or not os.path.isfile(source):
+            continue
+        record["attempts"] = 0
+        record["next_attempt_epoch"] = 0
+        record.pop("next_attempt_utc", None)
+        record.pop("final_status", None)
+        for delivery in (record.get("deliveries") or {}).values():
+            if delivery.get("status") == "failed":
+                delivery["status"] = "retrying"
+        write_json_private(source, record)
+        os.replace(source, th_path("outbox", "pending", name))
+        moved += 1
+    return moved
+
+
+def cmd_notifications(args):
+    ensure_dirs()
+    action = args.action
+    if action == "init":
+        created = False
+        if not os.path.isfile(notification_config_path()):
+            save_notification_config(default_notification_config())
+            created = True
+        if not os.path.isfile(notification_presence_path()):
+            set_notification_presence("home", source="init")
+        print(json.dumps({"created": created, "notifications": notification_summary()}, indent=2))
+        return 0
+
+    if action == "status":
+        print(
+            json.dumps(
+                {
+                    "summary": notification_summary(),
+                    "config": _redacted_notification_config(load_notification_config()),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if action == "presence":
+        if args.presence:
+            set_notification_presence(args.presence)
+        print(
+            json.dumps(
+                read_json(notification_presence_path(), {"state": notification_presence()}),
+                indent=2,
+            )
+        )
+        return 0
+
+    if action == "configure":
+        config = load_notification_config()
+        if args.enable_local:
+            config["local"]["enabled"] = True
+        if args.disable_local:
+            config["local"]["enabled"] = False
+        if args.webhook_url is not None:
+            config["webhook"]["url"] = args.webhook_url
+        if args.webhook_secret_env is not None:
+            config["webhook"]["secret_env"] = args.webhook_secret_env
+        if args.webhook_keychain_service is not None:
+            config["webhook"]["keychain_service"] = args.webhook_keychain_service
+        if args.webhook_keychain_account is not None:
+            config["webhook"]["keychain_account"] = args.webhook_keychain_account
+        if args.enable_webhook:
+            config["webhook"]["enabled"] = True
+        if args.disable_webhook:
+            config["webhook"]["enabled"] = False
+        if args.messages_recipient is not None:
+            config["messages"]["recipient"] = args.messages_recipient
+        if args.messages_when is not None:
+            config["messages"]["when"] = args.messages_when
+        if args.enable_messages:
+            config["messages"]["enabled"] = True
+        if args.disable_messages:
+            config["messages"]["enabled"] = False
+        if config["webhook"].get("enabled"):
+            parsed = urllib.parse.urlparse(str(config["webhook"].get("url") or ""))
+            if (
+                parsed.scheme != "https"
+                or not parsed.netloc
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+            ):
+                print(
+                    "Terminal Handoff: webhook must be HTTPS without credentials, query or fragment.",
+                    file=sys.stderr,
+                )
+                return 2
+            if not NOTIFICATION_SECRET_ENV_RE.match(
+                str(config["webhook"].get("secret_env") or "")
+            ):
+                print("Terminal Handoff: webhook secret_env is invalid.", file=sys.stderr)
+                return 2
+        if config["messages"].get("enabled") and not str(
+            config["messages"].get("recipient") or ""
+        ).strip():
+            print(
+                "Terminal Handoff: enabled Messages delivery requires a recipient.",
+                file=sys.stderr,
+            )
+            return 2
+        save_notification_config(config)
+        if args.presence:
+            set_notification_presence(args.presence)
+        print(
+            json.dumps(
+                {
+                    "summary": notification_summary(),
+                    "config": _redacted_notification_config(config),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if action == "test":
+        event = _notification_test_event(args.channel)
+        enqueue_notification(event, spawn=False)
+        drain_notification_outbox(limit=25, now=time.time())
+        delivered = os.path.isfile(notification_outbox_path("delivered", event["event_id"]))
+        dead = os.path.isfile(notification_outbox_path("dead", event["event_id"]))
+        state = "delivered" if delivered else ("dead" if dead else "pending")
+        path = notification_outbox_path(state, event["event_id"])
+        print(
+            json.dumps(
+                {
+                    "event_id": event["event_id"],
+                    "channel": args.channel,
+                    "state": state,
+                    "record": read_json(path),
+                },
+                indent=2,
+            )
+        )
+        return 0 if delivered else 1
+
+    if action == "drain":
+        result = drain_notification_outbox(limit=args.limit)
+        result["notifications"] = notification_summary()
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if action == "retry":
+        moved = retry_dead_notifications(args.event_id)
+        if moved:
+            maybe_spawn_notification_worker(force=True)
+        print(json.dumps({"retried": moved, "notifications": notification_summary()}, indent=2))
+        return 0
+
+    return 2
 
 
 def cmd_reset_circuit(args):
@@ -3818,6 +5050,36 @@ def main(argv=None):
 
     p = sub.add_parser("status", help="Show Terminal Handoff runtime state")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser(
+        "notifications",
+        help="Configure, test and inspect local, webhook and Messages alerts",
+    )
+    p.add_argument(
+        "action",
+        choices=("init", "status", "configure", "presence", "test", "drain", "retry"),
+    )
+    p.add_argument("--channel", choices=("local", "webhook", "messages"), default="local")
+    p.add_argument("--presence", choices=("home", "away", "unknown"), default=None)
+    p.add_argument("--enable-local", action="store_true")
+    p.add_argument("--disable-local", action="store_true")
+    p.add_argument("--enable-webhook", action="store_true")
+    p.add_argument("--disable-webhook", action="store_true")
+    p.add_argument("--webhook-url", default=None)
+    p.add_argument("--webhook-secret-env", default=None)
+    p.add_argument("--webhook-keychain-service", default=None)
+    p.add_argument("--webhook-keychain-account", default=None)
+    p.add_argument("--enable-messages", action="store_true")
+    p.add_argument("--disable-messages", action="store_true")
+    p.add_argument("--messages-recipient", default=None)
+    p.add_argument(
+        "--messages-when",
+        choices=("always", "failed", "away", "away_or_critical"),
+        default=None,
+    )
+    p.add_argument("--event-id", default=None)
+    p.add_argument("--limit", type=int, default=25)
+    p.set_defaults(func=cmd_notifications)
 
     p = sub.add_parser("reset-circuit", help="Reset the storm circuit breaker")
     p.set_defaults(func=cmd_reset_circuit)

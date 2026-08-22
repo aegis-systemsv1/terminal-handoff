@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "local": {
+    "enabled": true,
+    "on": [
+      "complete",
+      "failed"
+    ]
+  },
+  "webhook": {
+    "enabled": false,
+    "url": "",
+    "secret_env": "TERMINAL_HANDOFF_WEBHOOK_SECRET",
+    "keychain_service": "terminal-handoff-webhook",
+    "keychain_account": "terminal-handoff",
+    "timeout_seconds": 8,
+    "on": [
+      "complete",
+      "failed"
+    ]
+  },
+  "messages": {
+    "enabled": false,
+    "recipient": "",
+    "when": "away_or_critical",
+    "on": [
+      "complete",
+      "failed"
+    ]
+  },
+  "retry": {
+    "max_attempts": 6,
+    "base_seconds": 30
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "event_id": "0123456789abcdef0123456789abcdef",
+  "event_type": "terminal_handoff.complete",
+  "kind": "complete",
+  "title": "Terminal Handoff complete",
+  "message": "Handoff complete: Ranger → Ranger 2. Ranger 2 now owns the work.",
+  "urgency": "informational",
+  "chain_id": "abcdef012345",
+  "parent_generation": 1,
+  "successor_generation": 2,
+  "parent_display_name": "Ranger",
+  "successor_display_name": "Ranger 2",
+  "owner": "successor",
+  "presence": "away",
+  "routing_hint": "sms_when_away",
+  "suggested_channels": [
+    "local",
+    "push",
+    "sms"
+  ],
+  "created_utc": "2026-08-22T00:00:00Z",
+  "created_epoch": 1787356800
+}

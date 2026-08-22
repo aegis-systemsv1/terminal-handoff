@@ -137,6 +137,23 @@ but that is a strong prompt, not an enforcement mechanism.
 Treat a successor like a capable colleague who has read a good handover note:
 worth trusting, still worth checking.
 
+## 11. Notification acceptance is not human receipt
+
+The outbox can prove that macOS, Messages or an HTTPS endpoint accepted a
+delivery request. It cannot prove a carrier delivered an SMS, that a push
+provider reached a device, or that a person read the alert. Webhook delivery is
+at least once and consumers must deduplicate `event_id`; a crash after provider
+acceptance but before the local ledger write can repeat an event.
+
+Presence is explicit rather than inferred. Set it through the CLI or connect an
+existing presence service. Terminal Handoff does not inspect GPS, Wi-Fi, camera,
+keyboard activity or private home-automation state.
+
+Messages delivery depends on macOS Automation permission and, for non-iMessage
+recipients, iPhone Text Message Forwarding, carrier and region support. A signed
+webhook to a private gateway is the more controllable option for production SMS
+or messaging apps.
+
 ## What Terminal Handoff explicitly does not do
 
 - bypass Claude Code permissions
@@ -145,4 +162,5 @@ worth trusting, still worth checking.
 - run destructive Git commands
 - modify shell startup files
 - modify application repositories
-- transmit anything off the machine
+- transmit anything off the machine unless the user explicitly enables the
+  signed webhook or Messages notification adapter

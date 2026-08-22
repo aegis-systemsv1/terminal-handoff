@@ -5,6 +5,68 @@ All notable changes to Terminal Handoff are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-22
+
+### Added
+
+- **Durable handoff notifications.** A committed `TRANSFER_COMPLETE` or
+  `TRANSFER_FAILED` transition now creates one deterministic event in a private
+  transactional outbox. Local macOS alerts are enabled by default. Signed HTTPS
+  webhooks and Messages/iMessage/SMS relay are explicit opt-ins.
+- **Presence-aware routing.** Presence is an explicit `home`, `away` or
+  `unknown` state, never inferred from location or activity. Messages can be
+  limited to away/critical events while a private webhook gateway routes web
+  push, SMS or a messaging app.
+- **Delivery guarantees and operations.** Per-channel ledgers, HMAC-SHA256,
+  idempotency keys, bounded exponential retry, dead-letter storage, worker
+  self-recovery, commit/outbox reconciliation, redacted status, channel tests
+  and explicit retry commands.
+- **macOS Keychain webhook secrets.** Multi-generation chains can retrieve a
+  signing secret by service/account without storing it in configuration or a
+  generated successor launch script.
+- A package-facing `terminal_handoff.notifications` API and dedicated
+  notification, routing, privacy, signing, retry and CLI tests.
+
+### Fixed
+
+- **Closed the ownership-overlap window.** `PARENT_STOP_REQUESTED` previously
+  gave ownership to the successor even though the parent could remain alive
+  through two graceful-stop periods. It now has owner `none`; both sessions are
+  read-only until the parent's exit is confirmed and `TRANSFER_COMPLETE` is
+  committed. The successor repeats critical Git checks at that boundary.
+- **Supervisor crashes are recoverable.** A permanent `O_EXCL` marker could
+  strand a transfer forever. Supervisors now hold a kernel-released `flock`
+  lease. Parent and successor status refreshes detect and respawn a missing
+  supervisor; concurrent replacements still cannot signal twice. A crash after
+  `PARENT_STOP_REQUESTED` is resolved by observing the exact parent through the
+  original grace budget, never by sending an unprovable second signal.
+- A detached-launcher `Popen` failure is no longer ignored. It produces
+  `TH failed`, a durable failure event and a bounded retry instead of leaving a
+  session stuck in `launching`.
+- A parent that exits naturally between identity verification and `os.kill`
+  returning `ESRCH` is recorded as a successful completed transfer.
+- Successor-heartbeat exceptions are now visible in the structured log.
+- Detached child redirection handles are closed after spawning.
+
+### Changed
+
+- New status-line installs use a five-second `refreshInterval` for responsive
+  two-heartbeat verification. Existing `refreshInterval`, `padding` and unknown
+  future status-line options are all preserved rather than silently dropped.
+- Atomic private writes now `fsync` the containing directory after `os.replace`
+  where the platform supports it.
+- Runtime, package metadata and documentation advance to 1.2.0.
+
+### Security
+
+- Outbound events deliberately exclude transcript contents and paths, prompt
+  and repository paths, file contents, environment dumps, credentials and
+  secrets. Webhook delivery requires HTTPS and a signing secret; external
+  channels are disabled by default.
+- Messages recipient and AppleScript content are escaped as data and passed to
+  `osascript` as separate argv elements. No shell is used for notification
+  delivery.
+
 ## [1.1.1] - 2026-08-22
 
 ### Fixed

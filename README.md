@@ -13,6 +13,7 @@ When your session fills up, Terminal Handoff opens a new Terminal window running
 - analyses the parent transcript through an **isolated subagent**, not in its own context
 - **independently verifies** repository state before trusting anything
 - continues authorised work
+- sends a durable local alert, with optional signed-webhook and Messages/SMS routing
 - can later hand off to another generation, indefinitely
 
 Once the successor has proved it started correctly, the parent Claude session is asked to exit gracefully, so exactly one session continues the work. Its Terminal window stays open at a shell prompt, and if the successor cannot be verified the parent keeps running. Unrelated Claude sessions and Terminal windows are never touched.
@@ -67,6 +68,7 @@ flowchart TD
     P -- no --> Q[parent keeps running,<br/>transfer recorded as failed]
     P -- yes --> R[graceful SIGTERM to the exact<br/>bound parent Claude process]
     R --> S[parent Terminal stays open<br/>at its shell prompt]
+    S --> T[durable handoff event:<br/>local, webhook, Messages]
 ```
 
 The status line stays responsive: below the threshold it parses JSON, renders, and returns. All expensive work — Git capture, manifest building, the Terminal launch — happens in a **detached** process that outlives the short-lived status-line invocation.
@@ -82,6 +84,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full state machine.
 - **Claude Code** with `--model` and `--effort` support (developed against 2.1.234)
 - **Python 3.9+** — the macOS system Python is sufficient; there are no third-party dependencies
 - `osascript` (ships with macOS) and Automation permission to control Terminal
+- optional: Messages permission and iPhone Text Message Forwarding for direct SMS/RCS relay
 
 ## Supported environment
 
@@ -98,7 +101,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full state machine.
 ## Installation
 
 ```sh
-git clone <your-repo-url> Terminal-Handoff
+git clone https://github.com/aegis-systemsv1/terminal-handoff.git Terminal-Handoff
 cd Terminal-Handoff
 
 ./install.sh              # dry run: prints every proposed change, changes nothing
@@ -121,6 +124,9 @@ Verify without consuming a real context window:
 # 1. Run the suite (no Terminal window opens, no Claude session starts)
 python3 -m unittest discover -s tests -v
 
+# Test the installed local alert after installation
+python3 ~/.claude/terminal-handoff/terminal-handoff.py notifications test --channel local
+
 # 2. Simulate a trigger end to end, with the real launcher, in test mode
 export CLAUDE_TERMINAL_HANDOFF_TEST_MODE=1
 python3 src/terminal_handoff/core.py evaluate < tests/fixtures/at_threshold.json
@@ -142,7 +148,10 @@ See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full procedure and [doc
 
 ## Configuration
 
-All configuration is environment variables. Terminal Handoff is enabled by default at 80% with unlimited generations.
+Handoff behaviour uses environment variables. Notification routing uses the
+private `~/.claude/terminal-handoff/notifications.json` file and the
+`notifications` CLI. Terminal Handoff is enabled by default at 80% with
+unlimited generations; local macOS alerts are enabled by default.
 
 | Variable | Effect | Default |
 |---|---|---|
@@ -162,8 +171,14 @@ All configuration is environment variables. Terminal Handoff is enabled by defau
 | `CLAUDE_TERMINAL_HANDOFF_STOP_GRACE` | Seconds to wait for the parent to exit after each `SIGTERM` | `20` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_ATTEMPTS` | `SIGTERM` requests before giving up (never escalates) | `2` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN=1` | Run the whole shutdown path but send no signal | unset |
+| `CLAUDE_TERMINAL_HANDOFF_DISABLE_NOTIFICATIONS=1` | Leave events queued but do not spawn the delivery worker | unset |
+| `TERMINAL_HANDOFF_PRESENCE` | Routing state: `home`, `away`, or `unknown` | presence file, then `home` |
+| `TERMINAL_HANDOFF_WEBHOOK_SECRET` | Ephemeral webhook HMAC secret; Keychain is preferred | unset |
 
 Every `CLAUDE_TERMINAL_HANDOFF_*` variable set when a handoff is triggered is carried into the successor's Terminal window, so a chain keeps the configuration you started it with.
+
+See [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md) for local alerts, macOS
+Messages/SMS relay, signed webhooks, presence routing, retry and Keychain setup.
 
 > The status-line process inherits the environment of the Claude Code session that started it. Exporting a variable in one shell does **not** affect sessions that are already running. Set it before starting `claude`, or restart the session. Terminal Handoff does not edit your shell startup files; see [docs/CONFIGURATION.md](docs/CONFIGURATION.md) if you want a setting to persist.
 
@@ -214,7 +229,12 @@ LAUNCHING  ->  SUCCESSOR_VERIFIED  ->  PARENT_STOP_REQUESTED  ->  TRANSFER_COMPL
      +------------------+------------------------+---------->  TRANSFER_FAILED
 ```
 
-Before `PARENT_STOP_REQUESTED` the **parent** owns continuation. After it, the **successor** does. Transitions are atomic, recorded with a reason, and refused if illegal — which is what stops a duplicate status-line invocation or a second supervisor from requesting a second shutdown.
+`LAUNCHING` and `SUCCESSOR_VERIFIED` mean the **parent** owns continuation.
+`PARENT_STOP_REQUESTED` is deliberately quiescent: neither session may mutate
+while the parent can still be alive. Only `TRANSFER_COMPLETE`, after the exit is
+confirmed, gives the **successor** ownership. Transitions are atomic, recorded
+with a reason, and refused if illegal. The supervisor uses a kernel-released
+lease and is respawned by later status refreshes if it crashes.
 
 The successor is only verified when **all** of these hold, proved from its own live status-line JSON across two heartbeats:
 
@@ -237,6 +257,31 @@ The binding records the PID, the process start time, the controlling terminal, t
 Terminal Handoff does **not** use `pkill`, `killall`, process-name pattern matching, process groups, unverified PID files, Terminal front-window assumptions or generated shell commands. It sends exactly one signal type — `SIGTERM` — to exactly one PID, at most twice, and **never escalates to `SIGKILL`**. If the parent does not exit, that is recorded and logged as a visible failure rather than forced.
 
 The parent's Terminal window and its shell are never signalled: the window remains open at its shell prompt.
+
+## Notifications and out-of-office alerts
+
+Every `TRANSFER_COMPLETE` or `TRANSFER_FAILED` transition creates one
+idempotent event in a private durable outbox. State commits first, so an alert
+failure can never roll back or delay a handoff. Successful channels are not
+repeated while another channel retries.
+
+- Local Notification Center alerts are on by default.
+- A generic HTTPS webhook is HMAC-signed and carries an idempotency key, so a
+  private presence-aware gateway can route to web push, SMS, Messenger, Slack,
+  Signal or another provider.
+- The optional Messages adapter can send an iMessage or use the iPhone's Text
+  Message Forwarding for SMS/RCS when presence is `away`.
+- Transcript contents and paths, prompts, repository paths, environment dumps
+  and secrets are never included in outbound events.
+
+```sh
+TH="$HOME/.claude/terminal-handoff/terminal-handoff.py"
+python3 "$TH" notifications status
+python3 "$TH" notifications test --channel local
+python3 "$TH" notifications presence --presence away
+```
+
+Full setup and routing policy: [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
 
 ## The continuous generation loop
 
@@ -368,11 +413,13 @@ python3 tests/test_detector.py                # one module
 
 The suite runs entirely against synthetic status-line fixtures in isolated temporary directories. It opens no Terminal window, starts no Claude session, consumes no context window and modifies no real repository — Git tests build throwaway repositories under `/tmp`.
 
-See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the decision records in [docs/decisions/](docs/decisions/0001-parent-shutdown-and-successor-naming.md).
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md),
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the
+[decision records](docs/decisions/0002-exclusive-ownership-and-notification-outbox.md).
 
 ## Version
 
-**1.1.1** — see [CHANGELOG.md](CHANGELOG.md).
+**1.2.0** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Licence
 

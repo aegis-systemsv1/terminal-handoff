@@ -4,6 +4,7 @@
 
 | Version | Supported |
 |---|---|
+| 1.2.x | Yes |
 | 1.1.x | Yes |
 | 1.0.x | Security fixes only |
 
@@ -47,6 +48,12 @@ Terminal window. Every one of those is treated as an untrusted boundary.
 - **No secrets are stored.** Manifests and logs contain no credentials, API
   keys, tokens, environment dumps, file contents, transcript contents or shell
   history.
+- **External alerts are explicit and minimised.** Local notifications are the
+  default. Webhook and Messages delivery are opt-in. Webhooks require HTTPS,
+  HMAC-SHA256 signing and an idempotency key; their secret is obtained from a
+  named environment variable or macOS Keychain and is never stored by Terminal
+  Handoff. Outbound events exclude transcript and repository paths, prompt and
+  file contents, environment dumps and credentials.
 - **No permission escalation.** The successor runs in the user's normal
   permission mode. Terminal Handoff never passes
   `--dangerously-skip-permissions`, never changes the permission mode, and never
@@ -76,7 +83,10 @@ Terminal window. Every one of those is treated as an untrusted boundary.
   running.
 - It does not modify shell startup files.
 - It does not modify application repositories.
-- It does not transmit anything off the machine. There is no network code.
+- It does not transmit anything off the machine unless the user explicitly
+  enables the signed HTTPS webhook or Messages adapter. The core handoff path
+  has no network dependency, and alert delivery can never delay or roll back a
+  transfer.
 
 ## Automation permission
 

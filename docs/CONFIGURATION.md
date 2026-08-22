@@ -1,8 +1,8 @@
 # Configuration
 
-Everything is configured through environment variables. There is no
-configuration file to edit, and Terminal Handoff never edits your shell startup
-files.
+Handoff behaviour is configured through environment variables. Notification
+routing is kept in a private configuration file managed by the
+`notifications` CLI. Terminal Handoff never edits your shell startup files.
 
 ## Variables
 
@@ -25,6 +25,9 @@ files.
 | `CLAUDE_TERMINAL_HANDOFF_STOP_ATTEMPTS` | `SIGTERM` requests before giving up; never escalates | `2` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN` | `1` runs the whole shutdown path but sends no signal | unset |
 | `CLAUDE_TERMINAL_HANDOFF_TRANSFER_POLL` | supervisor poll interval in seconds | `2` |
+| `CLAUDE_TERMINAL_HANDOFF_DISABLE_NOTIFICATIONS` | `1` leaves events queued but does not spawn the delivery worker | unset |
+| `TERMINAL_HANDOFF_PRESENCE` | notification routing state: `home`, `away`, `unknown` | presence file, then `home` |
+| `TERMINAL_HANDOFF_WEBHOOK_SECRET` | ephemeral webhook signing secret | Keychain lookup |
 
 Invalid values fall back to the default rather than failing: a non-numeric
 threshold, or one outside 0-100, is ignored and 80 is used.
@@ -58,6 +61,10 @@ Apple Terminal starts a fresh login shell that does not inherit the launcher's
 environment, so every `CLAUDE_TERMINAL_HANDOFF_*` variable that is set when a
 handoff triggers is written into the successor's launch script explicitly. A
 chain therefore keeps the settings you started it with, for every generation.
+
+Webhook secrets use the separate `TERMINAL_HANDOFF_WEBHOOK_SECRET` name and are
+never copied into a generated launch script. Store a multi-generation secret in
+macOS Keychain; see [NOTIFICATIONS.md](NOTIFICATIONS.md).
 
 ## The scope gotcha
 
@@ -147,4 +154,23 @@ let already-counted launches re-trip it immediately.
 ```sh
 python3 ~/.claude/terminal-handoff/terminal-handoff.py status
 python3 ~/.claude/terminal-handoff/terminal-handoff.py coverage
+python3 ~/.claude/terminal-handoff/terminal-handoff.py notifications status
 ```
+
+## Notification configuration
+
+The installer creates `~/.claude/terminal-handoff/notifications.json` with
+mode `0600`. Local macOS alerts are enabled; webhook and Messages delivery are
+disabled until explicitly configured.
+
+```sh
+TH="$HOME/.claude/terminal-handoff/terminal-handoff.py"
+python3 "$TH" notifications configure --enable-local
+python3 "$TH" notifications presence --presence away
+python3 "$TH" notifications test --channel local
+```
+
+Use the CLI instead of placing credentials in the file. It records only a
+Keychain service/account reference or an environment-variable name, never the
+webhook secret itself. Full channel, retry, presence and SMS setup is in
+[NOTIFICATIONS.md](NOTIFICATIONS.md).

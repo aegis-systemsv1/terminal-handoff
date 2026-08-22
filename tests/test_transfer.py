@@ -261,6 +261,12 @@ class TestFailedHeartbeatsNeverStopTheParent(TransferTestCase):
 
 
 class TestSuccessorPromptOwnership(THTestCase):
+    def test_fallback_prompt_has_the_same_exclusive_boundary(self):
+        fallback = CORE.FALLBACK_PROMPT_TEMPLATE
+        self.assertIn("transfer state reads TRANSFER_COMPLETE", fallback)
+        self.assertIn("PARENT_STOP_REQUESTED is read-only", fallback)
+        self.assertNotIn("PARENT_STOP_REQUESTED or", fallback)
+
     def test_the_prompt_states_the_ownership_boundary(self):
         payload = self.payload(percent=90.0, session_name="Ranger")
         ok, _ = self.trigger_and_wait(payload)
@@ -271,6 +277,13 @@ class TestSuccessorPromptOwnership(THTestCase):
         self.assertIn("heartbeat", prompt)
         self.assertIn("PARENT_STOP_REQUESTED", prompt)
         self.assertIn("TRANSFER_COMPLETE", prompt)
+        self.assertIn('Only `"state": "TRANSFER_COMPLETE"` means you own', prompt)
+        self.assertIn("neither session may mutate", prompt.replace("\n     ", " "))
+        self.assertNotIn(
+            '`"state": "PARENT_STOP_REQUESTED"` or `"TRANSFER_COMPLETE"` means you own',
+            prompt,
+        )
+        self.assertIn("repeat pwd", prompt)
         self.assertIn(self.transfer(payload["_session_id"]), prompt)
         self.assertIn("Ranger 2", prompt)
         bootstrap = record["argv"][-1]
