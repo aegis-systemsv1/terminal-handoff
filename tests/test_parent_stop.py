@@ -373,7 +373,7 @@ class TestTransferStateMachine(THTestCase):
             os.environ, {"CLAUDE_TERMINAL_HANDOFF_TEST_MODE": ""}
         ), mock.patch.object(CORE, "spawn_supervisor", return_value=True) as spawn:
             self.assertTrue(CORE.ensure_supervisor_running(path))
-            spawn.assert_called_once_with(path)
+            spawn.assert_called_once_with(os.path.realpath(path))
 
     def test_a_crashed_supervisor_releases_its_lease_for_recovery(self):
         """The kernel, not a permanent marker, owns the supervisor lease."""
@@ -411,7 +411,7 @@ class TestTransferStateMachine(THTestCase):
             os.environ, {"CLAUDE_TERMINAL_HANDOFF_TEST_MODE": ""}
         ), mock.patch.object(CORE, "spawn_supervisor", return_value=True) as spawn:
             self.assertTrue(CORE.ensure_supervisor_running(path))
-            spawn.assert_called_once_with(path)
+            spawn.assert_called_once_with(os.path.realpath(path))
         second = CORE.supervise_transfer(path, wait=False)
         self.assertEqual(second, 3)
         self.assertEqual(json_file(path)["state"], "TRANSFER_FAILED")
