@@ -118,6 +118,7 @@ printf '\nProposed changes\n'
 note "install runtime to:   $PREFIX"
 note "configure statusLine: $SETTINGS"
 note "append instructions:  $HOME/.claude/CLAUDE.md"
+note "install manual skill:  $HOME/.claude/skills/handoff (provides /handoff)"
 note "enable local alerts:  $PREFIX/notifications.json"
 
 if [ -f "$SETTINGS" ]; then
@@ -176,21 +177,30 @@ printf '\nInstalling\n'
 umask 077
 mkdir -p "$PREFIX"
 chmod 700 "$PREFIX"
+mkdir -p "$PREFIX/handoff-skill"
+chmod 700 "$PREFIX/handoff-skill"
 
 cp "$SRC_DIR/src/terminal_handoff/core.py" "$PREFIX/terminal-handoff.py"
 cp "$SRC_DIR/src/terminal_handoff/templates/successor-prompt.md" "$PREFIX/successor-prompt.md"
+cp "$SRC_DIR/src/terminal_handoff/templates/handoff/SKILL.md" "$PREFIX/handoff-skill/SKILL.md"
+cp "$SRC_DIR/src/terminal_handoff/templates/handoff/manual-handoff.py" "$PREFIX/handoff-skill/manual-handoff.py"
 cp "$SRC_DIR/uninstall.sh" "$PREFIX/uninstall.sh"
 cp "$SRC_DIR/README.md" "$PREFIX/README.md" 2>/dev/null || true
 cp "$SRC_DIR/VERSION" "$PREFIX/VERSION" 2>/dev/null || true
 cp "$SRC_DIR/CHANGELOG.md" "$PREFIX/CHANGELOG.md" 2>/dev/null || true
 chmod 700 "$PREFIX/terminal-handoff.py" "$PREFIX/uninstall.sh"
 chmod 600 "$PREFIX/successor-prompt.md"
+chmod 600 "$PREFIX/handoff-skill/SKILL.md"
+chmod 700 "$PREFIX/handoff-skill/manual-handoff.py"
 [ -f "$PREFIX/VERSION" ] && chmod 600 "$PREFIX/VERSION"
 [ -f "$PREFIX/CHANGELOG.md" ] && chmod 600 "$PREFIX/CHANGELOG.md"
 note "runtime installed to $PREFIX"
 
 mkdir -p "$(dirname "$SETTINGS")"
-"$PY" "$PREFIX/terminal-handoff.py" install --settings "$SETTINGS" --tag install || \
+"$PY" "$PREFIX/terminal-handoff.py" install \
+    --settings "$SETTINGS" \
+    --tag install \
+    --handoff-skill-source "$PREFIX/handoff-skill" || \
     fail "configuration step failed; see the output above."
 
 "$PY" - "$SETTINGS" <<'PYEOF' || exit 1
@@ -207,5 +217,6 @@ printf '  %s %s/terminal-handoff.py version\n' "$PY" "$PREFIX"
 printf '  %s %s/terminal-handoff.py status\n' "$PY" "$PREFIX"
 printf '  %s %s/terminal-handoff.py coverage\n' "$PY" "$PREFIX"
 printf '  %s %s/terminal-handoff.py notifications test --channel local\n' "$PY" "$PREFIX"
+printf '  /handoff inside Claude Code (manual fail-safe)\n'
 printf '\nStart a new Claude Code session to see the status line.\n'
 printf 'Uninstall with: %s/uninstall.sh\n' "$PREFIX"

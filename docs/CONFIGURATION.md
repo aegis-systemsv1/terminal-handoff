@@ -23,6 +23,8 @@ routing is kept in a private configuration file managed by the
 | `CLAUDE_TERMINAL_HANDOFF_HEARTBEAT_TIMEOUT` | seconds to wait for a verified successor heartbeat | `300` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_GRACE` | seconds to wait for the parent to exit after each `SIGTERM` | `20` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_ATTEMPTS` | `SIGTERM` requests before giving up; never escalates | `2` |
+| `CLAUDE_TERMINAL_HANDOFF_LIVE_SESSION_MAX_AGE` | maximum snapshot age accepted by manual `/handoff`, seconds | `30` |
+| `CLAUDE_TERMINAL_HANDOFF_ORPHAN_CLAIM_SECONDS` | age before manual recovery may replace a claim with no transfer record; minimum 60 seconds | `90` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN` | `1` runs the whole shutdown path but sends no signal | unset |
 | `CLAUDE_TERMINAL_HANDOFF_TRANSFER_POLL` | supervisor poll interval in seconds | `2` |
 | `CLAUDE_TERMINAL_HANDOFF_DISABLE_NOTIFICATIONS` | `1` leaves events queued but does not spawn the delivery worker | unset |

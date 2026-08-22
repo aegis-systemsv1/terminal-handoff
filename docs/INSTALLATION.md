@@ -44,6 +44,7 @@ It fails closed if any of these is not satisfied:
 | `~/.claude/terminal-handoff/notifications.json` | private channel configuration; local alerts enabled (`0600`) |
 | `~/.claude/settings.json` | `statusLine` added, or an existing one wrapped |
 | `~/.claude/CLAUDE.md` | Terminal Handoff instructions appended, idempotently |
+| `~/.claude/skills/handoff/` | managed personal skill providing `/handoff` in every local project |
 
 Every file is backed up to `~/.claude/terminal-handoff/backups/` with a
 timestamped name and a `.source` sidecar before it is touched. Unrelated keys in
@@ -52,6 +53,11 @@ file's existing trailing-newline convention.
 
 It does **not** modify shell startup files, application repositories, or any
 permission mode.
+
+If `~/.claude/skills/handoff/` already contains a skill that was not installed
+by Terminal Handoff, installation stops and leaves it untouched. Rename or
+remove that skill yourself only if you deliberately want Terminal Handoff to
+own the `/handoff` command.
 
 ### Custom locations
 
@@ -76,6 +82,10 @@ project defining its own `statusLine`; see below.
 
 Then start a new Claude Code session. The status line should end with a badge
 such as `TH 12%`.
+
+Run `/skills` and confirm `handoff` appears under personal skills. `/handoff`
+is a side-effecting fail-safe and is user-invocable only; Claude cannot decide
+to run it by itself.
 
 The notification test should also create one local macOS alert. Signed webhook,
 presence-aware routing and Messages/SMS relay remain disabled until you opt in;
@@ -203,7 +213,8 @@ python3 ~/.claude/terminal-handoff/terminal-handoff.py coverage
 ```
 
 Running Claude Code sessions pick up the new runtime on their next status
-refresh. There is nothing to restart.
+refresh. If `~/.claude/skills/` did not exist when a session started, start a
+new Claude Code session so it discovers the new `/handoff` skill.
 
 ## Rolling back
 

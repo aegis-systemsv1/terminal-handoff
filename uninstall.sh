@@ -3,7 +3,8 @@
 #
 # Removes Terminal Handoff from every Claude settings file it modified,
 # restoring any pre-existing status line exactly, and removes the Terminal
-# Handoff section from ~/.claude/CLAUDE.md.
+# Handoff section from ~/.claude/CLAUDE.md, and removes only the managed
+# ~/.claude/skills/handoff files installed by Terminal Handoff.
 #
 # Preserved unless you delete them yourself:
 #   - handoff manifests   (~/.claude/terminal-handoff/handoffs/)
@@ -66,7 +67,7 @@ fi
 status=$?
 print ""
 if [[ $status -eq 0 ]]; then
-  print "Terminal Handoff removed from Claude configuration."
+  print "Terminal Handoff and its managed /handoff skill removed from Claude configuration."
   print "Retained: manifests, logs, backups and notification history under $TH_DIR"
   print "To remove those too: rm -rf $TH_DIR"
 else

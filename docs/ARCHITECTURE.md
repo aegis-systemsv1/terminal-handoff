@@ -2,7 +2,8 @@
 
 > Behavioural decisions with a rationale worth keeping are recorded in
 > [decision 1](decisions/0001-parent-shutdown-and-successor-naming.md) and
-> [decision 2](decisions/0002-exclusive-ownership-and-notification-outbox.md).
+> [decision 2](decisions/0002-exclusive-ownership-and-notification-outbox.md), and
+> [decision 3](decisions/0003-manual-handoff-recovery.md).
 
 Terminal Handoff has one job: notice that a Claude Code session is nearly full, and hand its work to a fresh session that can verify what it inherits.
 
@@ -97,6 +98,30 @@ os.open(th_path("triggered", session_id), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 
 `O_EXCL` gives exactly one winner. Every loser gets `EEXIST` and renders `TH handed off`.
 
 The key is `session_id` — never PID, shell PID, process start time, working directory or repository name. A successor has a different session ID, so it cannot inherit its parent's claim; that single choice is what makes "one trigger per session" and "unlimited generations per chain" coexist.
+
+## 3a. Manual `/handoff` recovery
+
+Every valid status refresh writes a private, minimal snapshot under
+`sessions/<session-id>.json`. It contains only the verified launch facts and no
+unknown status fields, transcript contents or environment dump. Claude Code's
+personal `/handoff` skill supplies `${CLAUDE_SESSION_ID}` directly to the
+runtime, so recovery never selects a session by terminal order, directory name
+or model judgement.
+
+The manual path requires a snapshot no older than 30 seconds and binds the
+exact current Claude ancestor before claiming a launch. It takes the same
+per-session trigger lock as the automatic path. Active and completed transfers
+are refused. A `TRANSFER_FAILED` attempt is written to
+`recoveries/<session-id>/` before its claim is replaced. From that point the
+normal manifest, launcher, heartbeat, ownership and notification paths are
+reused. Manual recovery bypasses only the context threshold and observation
+count; it does not bypass process binding, generation ceiling, storm breaker,
+argv validation, successor verification or ownership transfer.
+
+A trigger claim with no transfer or launch record can be a launcher crash. It
+is not replaced inside the normal launcher race window. After 90 seconds, with
+no completed launch record, `/handoff` treats it as an orphan, archives it and
+claims one recovery attempt. The lower bound is always 60 seconds.
 
 ## 4. Manifest creation
 

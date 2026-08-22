@@ -122,6 +122,19 @@ class TestNotificationEvents(NotificationTestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(os.listdir(CORE.th_path("outbox", "pending"))), 1)
 
+    def test_distinct_launch_attempts_get_distinct_idempotency_keys(self):
+        first_record = self.transfer_record()
+        second_record = self.transfer_record()
+        first_record["attempt_id"] = "attempt-one"
+        second_record["attempt_id"] = "attempt-two"
+        first = CORE.transfer_notification_event(
+            first_record, "TRANSFER_FAILED", "heartbeat timeout"
+        )
+        second = CORE.transfer_notification_event(
+            second_record, "TRANSFER_FAILED", "heartbeat timeout"
+        )
+        self.assertNotEqual(first["event_id"], second["event_id"])
+
     def test_reconciliation_repairs_commit_then_crash_gap(self):
         self.write_transfer(
             "reconcile-12345678",
