@@ -5,6 +5,43 @@ All notable changes to Terminal Handoff are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-08-22
+
+### Added
+
+- A global personal Claude Code **`/handoff` skill** for deliberate manual
+  recovery after an automatic transfer fails. It is user-invocable only and is
+  installed under `~/.claude/skills/handoff/` without modifying application
+  repositories.
+- A `manual-handoff --session-id` runtime command. Claude Code supplies the
+  exact session ID; the runtime reuses the existing manifest, launcher,
+  heartbeat, ownership, parent-stop and notification paths.
+- Private minimal live-session snapshots and archived failed-attempt records.
+  Unknown status fields, transcript contents and environment dumps are not
+  copied into the snapshot.
+- Per-attempt notification idempotency keys, so a failed automatic attempt and
+  a later failed manual retry can each produce their own durable alert.
+- Dedicated tests for snapshot privacy and freshness, duplicate refusal,
+  failed-attempt archival, exact-parent refusal, safe skill collision handling,
+  idempotent installation and managed uninstall.
+
+### Security
+
+- Manual recovery refuses stale or invalid status, a disabled parent-stop
+  policy, an unprovable parent process, an active transfer and a completed
+  transfer. A terminally failed attempt is archived and replaced under the same
+  per-session lock used by automatic triggers.
+- A trigger claim with no transfer or launch record is protected through a
+  90-second launcher race window, then may be archived and recovered as an
+  orphan. The safety floor is 60 seconds.
+- The skill helper calls the runtime with `os.execv` and fixed argv. User skill
+  arguments never reach a shell or the runtime. A user-owned `/handoff` skill
+  is never overwritten or removed.
+
+### Changed
+
+- Runtime, package metadata and documentation advance to 1.2.1.
+
 ## [1.2.0] - 2026-08-22
 
 ### Added

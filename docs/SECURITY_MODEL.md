@@ -20,6 +20,22 @@ each boundary does about it.
 | A bound parent process | **Verified, never assumed** | PID, start time, TTY, UID, executable name and working directory re-proved immediately before any signal |
 | A wrapped status-line command | **Trusted-by-configuration** | Comes from a Claude settings file the user already controls; run exactly as Claude Code itself would |
 | Environment variables | **Semi-trusted** | Only Terminal Handoff's own variables are read; values are range-checked and fall back to defaults |
+| `/handoff` session substitution | **Trusted identity, revalidated state** | Claude Code supplies `${CLAUDE_SESSION_ID}`; the runtime requires a fresh private snapshot and an exact process-ancestry binding |
+
+## Manual recovery
+
+The personal `/handoff` skill is user-invocable only. Its dynamic command calls
+a fixed helper with Claude Code's own session-ID substitution. The helper uses
+`os.execv` with a fixed interpreter and runtime path; it does not invoke a shell
+or pass skill arguments to the runtime.
+
+The status snapshot used for recovery is `0600`, at most 30 seconds old by
+default, and stores only recognised, verified fields. Unknown status-line
+fields, transcript contents and environment data are excluded. The manual path
+refuses an unbound parent, an active transfer and a completed transfer. Before
+retrying a terminally failed transfer, it archives the prior authoritative
+records and atomically replaces the trigger claim under the same lock used by
+the automatic status-line path.
 
 ## The transcript
 

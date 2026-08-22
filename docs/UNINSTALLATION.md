@@ -18,6 +18,7 @@ do.
 | `~/.claude/settings.json` | removes the `statusLine` key, or restores whatever was there before |
 | project `settings.json` files it integrated | restores the original `statusLine` exactly |
 | `~/.claude/CLAUDE.md` | removes only the delimited Terminal Handoff block |
+| `~/.claude/skills/handoff/` | removes only files carrying Terminal Handoff's managed markers |
 
 Restoration is exact. The original `statusLine` object is recorded at install
 time, including its key order and the file's trailing-newline convention, so an
@@ -31,6 +32,7 @@ validated before it is written.
 - configuration backups (`backups/`)
 - notification configuration and presence (`notifications.json`, `notifications/`)
 - notification delivery history (`outbox/`)
+- archived failed attempts used by manual recovery (`recoveries/`)
 
 These are retained deliberately: they are the record of what happened and what
 your configuration looked like beforehand. Remove them yourself when you are
@@ -69,12 +71,15 @@ If you prefer to do it by hand, or the uninstaller is unavailable:
    <!-- END TERMINAL HANDOFF -->
    ```
 
-4. **Validate** the JSON you edited:
+4. **`/handoff` skill** — remove `~/.claude/skills/handoff/` only after
+   confirming its `SKILL.md` contains the Terminal Handoff managed marker.
+
+5. **Validate** the JSON you edited:
    ```sh
    python3 -m json.tool ~/.claude/settings.json > /dev/null && echo valid
    ```
 
-5. **Remove the runtime**, optionally:
+6. **Remove the runtime**, optionally:
    ```sh
    rm -rf ~/.claude/terminal-handoff
    ```

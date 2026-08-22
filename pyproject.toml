@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "terminal-handoff"
-version = "1.2.0"
+version = "1.2.1"
 description = "Automatically hand off long Claude Code sessions to a fresh Terminal context while preserving model, effort and verified working state."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -41,7 +41,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-terminal_handoff = ["templates/*.md"]
+terminal_handoff = ["templates/*.md", "templates/handoff/*.md", "templates/handoff/*.py"]
 
 [tool.ruff]
 line-length = 100

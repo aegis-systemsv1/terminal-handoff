@@ -37,7 +37,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.2.0"
+TERMINAL_HANDOFF_VERSION = "1.2.1"
 MANIFEST_SCHEMA_VERSION = 2
 NOTIFICATION_SCHEMA_VERSION = 1
 
@@ -53,6 +53,8 @@ DEFAULT_STORM_WINDOW_SECONDS = 600
 DEFAULT_CIRCUIT_OPEN_SECONDS = 1800
 WRAPPED_STATUSLINE_TIMEOUT = 3.0
 GIT_TIMEOUT = 5.0
+DEFAULT_LIVE_SESSION_MAX_AGE = 30.0
+DEFAULT_ORPHAN_CLAIM_SECONDS = 90.0
 
 # Effort levels accepted by Claude Code 2.1.x, as reported by `.effort.level`
 # in the official status-line JSON and validated by `claude --effort`.
@@ -103,6 +105,8 @@ STATE_DIRS = (
     "outbox/delivered",
     "outbox/dead",
     "notifications",
+    "sessions",
+    "recoveries",
 )
 
 TRUTHY = ("1", "true", "yes", "on")
@@ -435,7 +439,7 @@ def transfer_notification_event(record, target, reason=None):
             successor,
         )
     event_id = _notification_event_id(
-        "transfer", record.get("parent_session_id"), target
+        "transfer", record.get("parent_session_id"), record.get("attempt_id"), target
     )
     return {
         "schema_version": NOTIFICATION_SCHEMA_VERSION,
@@ -458,14 +462,14 @@ def transfer_notification_event(record, target, reason=None):
     }
 
 
-def launch_failure_notification_event(session_id, reason):
+def launch_failure_notification_event(session_id, reason, attempt_id=None):
     message = "Handoff failed before the successor could start. The current session remains owner."
     clean_reason = _safe_notification_text(reason, 240)
     if clean_reason:
         message += " Reason: %s" % clean_reason
     return {
         "schema_version": NOTIFICATION_SCHEMA_VERSION,
-        "event_id": _notification_event_id("launch", session_id, "failed"),
+        "event_id": _notification_event_id("launch", session_id, attempt_id, "failed"),
         "event_type": "terminal_handoff.failed",
         "kind": "failed",
         "title": "Terminal Handoff failed",
@@ -1144,6 +1148,99 @@ def extract_facts(payload, validate_files=True):
 
     facts.ok = not facts.errors
     return facts
+
+
+def live_session_path(session_id):
+    return th_path("sessions", "%s.json" % session_id)
+
+
+def minimal_status_payload(facts):
+    """Return only the verified fields needed to launch a successor.
+
+    The live-session cache deliberately excludes arbitrary status-line fields,
+    environment data and transcript contents. It is a private continuity
+    record, not a copy of Claude Code's full status payload.
+    """
+    payload = {
+        "version": facts.cc_version,
+        "session_id": facts.session_id,
+        "transcript_path": facts.transcript_path,
+        "cwd": facts.cwd,
+        "workspace": {
+            "current_dir": facts.current_dir,
+            "project_dir": facts.project_dir,
+            "git_worktree": facts.git_worktree,
+        },
+        "model": {
+            "id": facts.model_id,
+            "display_name": facts.model_display_name,
+        },
+        "context_window": {"used_percentage": facts.percent},
+    }
+    if facts.session_name:
+        payload["session_name"] = facts.session_name
+    if facts.worktree_name or facts.worktree_path:
+        payload["worktree"] = {
+            "name": facts.worktree_name,
+            "path": facts.worktree_path,
+        }
+    if facts.effort_available:
+        payload["effort"] = {"level": facts.effort_level}
+    return payload
+
+
+def record_live_session(facts, now=None):
+    """Persist a fresh, minimal status snapshot for the manual /handoff skill."""
+    if not isinstance(facts, Facts) or not facts.ok or not facts.session_id:
+        return None
+    now = time.time() if now is None else float(now)
+    record = {
+        "schema_version": 1,
+        "terminal_handoff_version": TERMINAL_HANDOFF_VERSION,
+        "session_id": facts.session_id,
+        "observed_epoch": now,
+        "observed_utc": utc_stamp(),
+        "payload": minimal_status_payload(facts),
+        "privacy": {
+            "stores_transcript_contents": False,
+            "stores_environment_dump": False,
+            "stores_unrecognised_status_fields": False,
+        },
+    }
+    write_json_private(live_session_path(facts.session_id), record)
+    return record
+
+
+def load_live_session(session_id, now=None, max_age=None):
+    """Load and revalidate the current status snapshot for one exact session."""
+    if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
+        return None, None, "session ID is missing or invalid"
+    record = read_json(live_session_path(session_id))
+    if not isinstance(record, dict) or record.get("session_id") != session_id:
+        return None, None, (
+            "no trusted live status snapshot exists for this session; wait for the "
+            "status line to refresh, then run /handoff again"
+        )
+    now = time.time() if now is None else float(now)
+    max_age = (
+        env_float("CLAUDE_TERMINAL_HANDOFF_LIVE_SESSION_MAX_AGE", DEFAULT_LIVE_SESSION_MAX_AGE)
+        if max_age is None
+        else float(max_age)
+    )
+    try:
+        age = now - float(record.get("observed_epoch"))
+    except (TypeError, ValueError):
+        return None, None, "the trusted live status snapshot has no valid timestamp"
+    if age < -5 or age > max_age:
+        return None, None, (
+            "the trusted live status snapshot is stale (%.1fs old); wait for the "
+            "status line to refresh, then run /handoff again" % age
+        )
+    payload = record.get("payload")
+    facts = extract_facts(payload, validate_files=True)
+    if not facts.ok or facts.session_id != session_id:
+        return None, None, "the trusted live status snapshot no longer validates"
+    return record, facts, None
 
 
 # ---------------------------------------------------------------------------
@@ -1916,6 +2013,7 @@ def build_manifest(facts, decision, now=None):
             ),
         },
         "trigger": {
+            "attempt_id": uuid.uuid4().hex,
             "context_used_percentage": facts.percent,
             "configured_threshold": decision.get("threshold"),
             "timestamp_utc": utc_stamp(),
@@ -2623,6 +2721,7 @@ def build_transfer_record(manifest, binding, now=None):
         "state": TRANSFER_LAUNCHING,
         "owner": TRANSFER_OWNER[TRANSFER_LAUNCHING],
         "chain_id": manifest.get("chain_id"),
+        "attempt_id": (manifest.get("trigger") or {}).get("attempt_id"),
         "parent_generation": manifest.get("generation"),
         "successor_generation": successor.get("generation"),
         "parent_session_id": outgoing.get("session_id"),
@@ -2735,14 +2834,11 @@ def update_transfer_fields(path, **fields):
 # ---------------------------------------------------------------------------
 
 
-def claim_trigger(session_id):
-    """Atomically claim the one-shot trigger for this session.
+def trigger_lock_path(session_id):
+    return th_path("state", "trigger-%s.lock" % session_id)
 
-    Uses O_CREAT|O_EXCL so concurrent status-line processes produce exactly one
-    launch. Keyed by session_id, never by PID, cwd or generation, so a successor
-    never inherits its parent's claim.
-    """
-    ensure_dirs()
+
+def _write_trigger_claim_unlocked(session_id, mode):
     path = th_path("triggered", session_id)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -2753,13 +2849,183 @@ def claim_trigger(session_id):
     try:
         os.write(
             fd,
-            json.dumps({"claimed_utc": utc_stamp(), "pid": os.getpid()}, sort_keys=True).encode(
-                "utf-8"
-            ),
+            json.dumps(
+                {
+                    "claimed_epoch": time.time(),
+                    "claimed_utc": utc_stamp(),
+                    "pid": os.getpid(),
+                    "mode": mode,
+                },
+                sort_keys=True,
+            ).encode("utf-8"),
         )
     finally:
         os.close(fd)
     return True
+
+
+def claim_trigger(session_id):
+    """Atomically claim the one-shot automatic trigger for this session.
+
+    The advisory lock also closes the retry race with the manual /handoff path.
+    O_CREAT|O_EXCL remains the final duplicate-launch boundary.
+    """
+    ensure_dirs()
+    lock_fd = os.open(trigger_lock_path(session_id), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return _write_trigger_claim_unlocked(session_id, "automatic")
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def archive_failed_handoff(session_id, reason=None):
+    """Save the prior terminal attempt before a deliberate manual retry."""
+    recovery_id = "%s-%s" % (file_stamp(), uuid.uuid4().hex[:8])
+    sources = {
+        "trigger_claim": th_path("triggered", session_id),
+        "transfer": transfer_path(session_id),
+        "manifest": manifest_path(session_id),
+        "launch_record": th_path("completed", "%s.launch.json" % session_id),
+        "failed_state": th_path("failed", "%s.json" % session_id),
+        "launching_state": th_path("launching", "%s.json" % session_id),
+        "retry_count": th_path("failed", "%s.retries" % session_id),
+        "parent_binding": parent_binding_path(session_id),
+    }
+    prior = {}
+    for name, path in sources.items():
+        data = read_json(path)
+        if data is not None:
+            prior[name] = data
+    record = {
+        "schema_version": 1,
+        "recovery_id": recovery_id,
+        "session_id": session_id,
+        "archived_utc": utc_stamp(),
+        "reason": reason or "manual /handoff retry after a terminal failure",
+        "prior": prior,
+    }
+    destination = th_path("recoveries", session_id, "%s.json" % recovery_id)
+    write_json_private(destination, record)
+    return destination
+
+
+def record_epoch(record, epoch_key, utc_key):
+    if not isinstance(record, dict):
+        return None
+    try:
+        return float(record.get(epoch_key))
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = datetime.strptime(str(record.get(utc_key)), "%Y-%m-%dT%H:%M:%SZ")
+        return parsed.replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def claim_manual_trigger(session_id):
+    """Claim one manual retry without duplicating a live or completed transfer.
+
+    A terminally failed attempt may be replaced only after its authoritative
+    records are archived. An in-flight or completed transfer is never reused.
+    """
+    ensure_dirs()
+    lock_fd = os.open(trigger_lock_path(session_id), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        transfer = read_transfer(transfer_path(session_id))
+        transfer_state = transfer.get("state") if isinstance(transfer, dict) else None
+        if transfer_state in (
+            TRANSFER_LAUNCHING,
+            TRANSFER_SUCCESSOR_VERIFIED,
+            TRANSFER_PARENT_STOP_REQUESTED,
+        ):
+            return {
+                "ok": False,
+                "state": "in_progress",
+                "reason": "a handoff is already in progress (%s); no second successor was opened"
+                % transfer_state,
+            }
+        if transfer_state == TRANSFER_COMPLETE:
+            return {
+                "ok": False,
+                "state": "already_complete",
+                "reason": "this session has already completed its handoff",
+            }
+
+        claim_path = th_path("triggered", session_id)
+        failed_state = read_json(th_path("failed", "%s.json" % session_id))
+        launching_state = read_json(th_path("launching", "%s.json" % session_id))
+        claim_record = read_json(claim_path)
+        has_claim = os.path.exists(claim_path)
+        may_replace = transfer_state == TRANSFER_FAILED or (
+            isinstance(failed_state, dict) and failed_state.get("state") == "failed"
+        )
+        recovery_reason = "manual /handoff retry after a terminal failure"
+        if has_claim and not may_replace and transfer_state is None:
+            now = time.time()
+            grace = max(
+                60.0,
+                env_float(
+                    "CLAUDE_TERMINAL_HANDOFF_ORPHAN_CLAIM_SECONDS",
+                    DEFAULT_ORPHAN_CLAIM_SECONDS,
+                ),
+            )
+            claim_epoch = record_epoch(claim_record, "claimed_epoch", "claimed_utc")
+            launch_epoch = record_epoch(launching_state, "epoch", "ts")
+            claim_age = now - claim_epoch if claim_epoch is not None else -1
+            launch_age = now - launch_epoch if launch_epoch is not None else claim_age
+            no_launch_record = not os.path.isfile(
+                th_path("completed", "%s.launch.json" % session_id)
+            )
+            if (
+                claim_age >= grace
+                and launch_age >= grace
+                and no_launch_record
+            ):
+                may_replace = True
+                recovery_reason = (
+                    "manual /handoff retry after a stale orphaned trigger claim"
+                )
+        archive = None
+        if has_claim and not may_replace:
+            return {
+                "ok": False,
+                "state": "claimed",
+                "reason": (
+                    "this session already has a nonterminal handoff claim; no second "
+                    "successor was opened"
+                ),
+            }
+        if may_replace:
+            archive = archive_failed_handoff(session_id, recovery_reason)
+            for stale in (
+                transfer_path(session_id),
+                manifest_path(session_id),
+                th_path("completed", "%s.launch.json" % session_id),
+                th_path("failed", "%s.json" % session_id),
+                th_path("failed", "%s.retries" % session_id),
+                parent_binding_path(session_id),
+                th_path("launching", "%s.json" % session_id),
+            ):
+                try:
+                    os.unlink(stale)
+                except OSError:
+                    pass
+        if has_claim:
+            os.unlink(claim_path)
+        if not _write_trigger_claim_unlocked(session_id, "manual"):
+            return {
+                "ok": False,
+                "state": "race_lost",
+                "reason": "another handoff claimed this session first",
+            }
+        return {"ok": True, "state": "claimed", "archive": archive}
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def set_state(session_id, state, **extra):
@@ -2769,6 +3035,7 @@ def set_state(session_id, state, **extra):
     record = {
         "session_id": session_id,
         "state": state,
+        "epoch": time.time(),
         "ts": utc_stamp(),
         "terminal_handoff_version": TERMINAL_HANDOFF_VERSION,
     }
@@ -2801,7 +3068,10 @@ def fail_launch(session_id, reason, detail=None, allow_retry=True, manifest_file
     while the retry budget lasts, and applies the launch cooldown so a failing
     session cannot spin.
     """
+    attempt_id = None
     if manifest_file and os.path.isfile(manifest_file):
+        existing_manifest = read_json(manifest_file, {}) or {}
+        attempt_id = (existing_manifest.get("trigger") or {}).get("attempt_id")
         update_manifest(
             manifest_file,
             lambda m: m.setdefault("successor", {}).update(
@@ -2851,7 +3121,9 @@ def fail_launch(session_id, reason, detail=None, allow_retry=True, manifest_file
         TRANSFER_FAILED,
     ):
         try:
-            enqueue_notification(launch_failure_notification_event(session_id, reason))
+            enqueue_notification(
+                launch_failure_notification_event(session_id, reason, attempt_id=attempt_id)
+            )
         except Exception as exc:
             log_event(
                 "notification_enqueue_failed",
@@ -2862,7 +3134,7 @@ def fail_launch(session_id, reason, detail=None, allow_retry=True, manifest_file
     return released
 
 
-def perform_launch(payload_file):
+def perform_launch(payload_file, launch_mode="automatic", launch_identity=None):
     """Detached child process: build manifest, render prompt, open Terminal.
 
     Runs independently of the short-lived status-line process.
@@ -2885,9 +3157,12 @@ def perform_launch(payload_file):
 
     decision = decide(payload, validate_files=True, record=False)
     session_id = facts.session_id
-    chain_id, generation, parent_manifest, parent_session = chain_identity(
-        facts.session_id, facts.session_name
-    )
+    if launch_identity is None:
+        chain_id, generation, parent_manifest, parent_session = chain_identity(
+            facts.session_id, facts.session_name
+        )
+    else:
+        chain_id, generation, parent_manifest, parent_session = launch_identity
     base_name, base_source = resolve_base_display_name(chain_id, generation, facts.session_name)
     decision["chain_id"] = chain_id
     decision["generation"] = generation
@@ -2895,9 +3170,20 @@ def perform_launch(payload_file):
     decision["parent_session_id"] = parent_session
     decision["base_display_name"] = base_name
     decision["base_name_source"] = base_source
+    decision["reason"] = (
+        "manual recovery requested with /handoff"
+        if launch_mode == "manual"
+        else decision.get("reason")
+    )
 
     test_mode = env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE")
-    set_state(session_id, "launching", chain_id=chain_id, generation=generation)
+    set_state(
+        session_id,
+        "launching",
+        chain_id=chain_id,
+        generation=generation,
+        launch_mode=launch_mode,
+    )
     log_event(
         "launch_begin",
         session_id=session_id,
@@ -2907,10 +3193,12 @@ def perform_launch(payload_file):
         model_id=facts.model_id,
         effort_level=facts.effort_level,
         effort_available=facts.effort_available,
+        launch_mode=launch_mode,
         test_mode=test_mode,
     )
 
     manifest = build_manifest(facts, decision)
+    manifest.setdefault("trigger", {})["mode"] = launch_mode
     mpath = manifest_path(session_id)
     write_json_private(mpath, manifest)
 
@@ -3012,6 +3300,7 @@ def perform_launch(payload_file):
 
     launch_record = {
         "session_id": session_id,
+        "attempt_id": (manifest.get("trigger") or {}).get("attempt_id"),
         "chain_id": chain_id,
         "generation": generation,
         "successor_generation": generation + 1,
@@ -3029,6 +3318,7 @@ def perform_launch(payload_file):
         "parent_pid": (binding or {}).get("pid"),
         "title": title,
         "test_mode": test_mode,
+        "launch_mode": launch_mode,
         "result": dict((k, v) for k, v in result.items() if k != "applescript"),
         "applescript": result.get("applescript"),
         "ts": utc_stamp(),
@@ -3134,6 +3424,146 @@ def spawn_launcher(payload, parent_binding=None):
     except Exception as exc:
         log_event("spawn_failed", session_id=session_id, error=str(exc)[:300])
         return False
+
+
+def run_manual_handoff(session_id):
+    """Execute the user-invoked /handoff recovery path for one exact session."""
+    ensure_dirs()
+    record, facts, error = load_live_session(session_id)
+    if error:
+        return {"ok": False, "state": "refused", "reason": error}
+    if not stop_parent_enabled():
+        return {
+            "ok": False,
+            "state": "refused",
+            "reason": (
+                "parent shutdown is disabled; manual handoff requires verified ownership "
+                "transfer and will not open an unmanaged duplicate session"
+            ),
+        }
+
+    launch_identity = chain_identity(facts.session_id, facts.session_name)
+    chain_id, generation, _, _ = launch_identity
+    ceiling = max_generations()
+    if ceiling is not None and generation >= ceiling:
+        return {
+            "ok": False,
+            "state": "refused",
+            "reason": "generation %d has reached the configured ceiling of %d"
+            % (generation, ceiling),
+        }
+
+    binding, bind_reason = bind_parent_claude_process(session_id, facts.current_dir)
+    if binding is None:
+        return {
+            "ok": False,
+            "state": "refused",
+            "reason": (
+                "the exact current Claude process could not be proven; the parent remains "
+                "owner and no successor was opened: %s" % (bind_reason or "unknown reason")
+            ),
+        }
+    binding["chain_id"] = chain_id
+    binding["generation"] = generation
+    verified, verify_reason = verify_parent_binding(
+        binding, chain_id=chain_id, generation=generation, session_id=session_id
+    )
+    if not verified:
+        return {
+            "ok": False,
+            "state": "refused",
+            "reason": "the current Claude process binding did not verify: %s" % verify_reason,
+        }
+
+    claim = claim_manual_trigger(session_id)
+    if not claim.get("ok"):
+        result = dict(claim)
+        result["session_id"] = session_id
+        return result
+
+    payload_file = th_path("launching", "%s.payload.json" % session_id)
+    try:
+        write_json_private(payload_file, record["payload"])
+        write_json_private(parent_binding_path(session_id), binding)
+    except Exception as exc:
+        fail_launch(
+            session_id,
+            "manual handoff preparation failed",
+            detail=exc,
+            allow_retry=True,
+            state="failed_manual_prepare",
+        )
+        return {
+            "ok": False,
+            "state": "failed",
+            "session_id": session_id,
+            "reason": "manual handoff preparation failed: %s" % str(exc)[:300],
+        }
+
+    log_event(
+        "manual_handoff_claimed",
+        session_id=session_id,
+        chain_id=chain_id,
+        generation=generation,
+        parent_pid=binding.get("pid"),
+        archived_attempt=claim.get("archive"),
+    )
+    code = perform_launch(
+        payload_file,
+        launch_mode="manual",
+        launch_identity=launch_identity,
+    )
+    transfer = read_transfer(transfer_path(session_id))
+    transfer_state = transfer.get("state") if isinstance(transfer, dict) else None
+    launch = read_json(th_path("completed", "%s.launch.json" % session_id), {}) or {}
+    simulated = bool(launch.get("test_mode"))
+    ok = code == 0 and (simulated or transfer_state in (
+        TRANSFER_LAUNCHING,
+        TRANSFER_SUCCESSOR_VERIFIED,
+        TRANSFER_PARENT_STOP_REQUESTED,
+        TRANSFER_COMPLETE,
+    ))
+    if transfer_state == TRANSFER_FAILED:
+        ok = False
+    result = {
+        "ok": ok,
+        "state": (
+            "simulated"
+            if simulated and code == 0
+            else ("launched_pending_verification" if ok else "failed")
+        ),
+        "session_id": session_id,
+        "chain_id": launch.get("chain_id") or chain_id,
+        "generation": launch.get("generation") or generation,
+        "successor_generation": launch.get("successor_generation") or (generation + 1),
+        "successor_display_name": launch.get("successor_display_name"),
+        "transfer_state": transfer_state,
+        "owner": (
+            TRANSFER_OWNER.get(transfer_state)
+            if transfer_state in TRANSFER_OWNER
+            else "parent"
+        ),
+        "parent_pid": binding.get("pid"),
+        "archived_failed_attempt": claim.get("archive"),
+        "message": (
+            "Successor opened. The current session remains owner until the successor "
+            "passes verification."
+            if ok and not simulated
+            else (
+                "Manual handoff launch simulated successfully."
+                if simulated and code == 0
+                else "Manual handoff failed; the current session remains owner."
+            )
+        ),
+    }
+    if not ok:
+        failed = read_json(th_path("failed", "%s.json" % session_id), {}) or {}
+        result["reason"] = (
+            (transfer or {}).get("reason")
+            or failed.get("reason")
+            or "launcher exited with code %d" % code
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -4046,6 +4476,15 @@ def cmd_statusline(args):
         decision = decide(payload, validate_files=True)
         facts = extract_facts(payload, validate_files=True) if payload else None
         if facts is not None:
+            if facts.ok:
+                try:
+                    record_live_session(facts)
+                except Exception as exc:
+                    log_event(
+                        "live_session_record_error",
+                        session_id=getattr(facts, "session_id", None),
+                        error=str(exc)[:300],
+                    )
             try:
                 successor_heartbeat(facts)
             except Exception as exc:
@@ -4476,7 +4915,9 @@ When you are started as a Terminal Handoff successor:
 
 Do not disable, bypass or modify Terminal Handoff unless the user explicitly
 requests it. Do not manually launch a second successor if the current session
-has already been handed off.
+has already been handed off. If an automatic transfer is terminally failed and
+the user invokes `/handoff`, let the installed runtime perform the recovery;
+never improvise a Claude, shell or AppleScript launch.
 %s
 """ % (
     CLAUDE_MD_BEGIN,
@@ -4519,6 +4960,133 @@ def uninstall_claude_md(path=None, dry_run=True):
     write_private(path, cleaned, mode=os.stat(path).st_mode & 0o777)
     log_event("claude_md_uninstalled", path=path)
     return {"ok": True, "path": path, "bytes_removed": end - start}
+
+
+HANDOFF_SKILL_MARKER = "<!-- Terminal Handoff managed /handoff skill. -->"
+HANDOFF_HELPER_MARKER = "# Terminal Handoff managed /handoff skill helper."
+
+
+def handoff_skill_path():
+    return os.path.join(os.path.expanduser("~"), ".claude", "skills", "handoff")
+
+
+def handoff_skill_status():
+    path = handoff_skill_path()
+    try:
+        with open(os.path.join(path, "SKILL.md"), "r") as handle:
+            managed = HANDOFF_SKILL_MARKER in handle.read()
+    except IOError:
+        managed = False
+    return {"installed": managed, "path": path, "command": "/handoff"}
+
+
+def install_handoff_skill(source_dir, destination=None):
+    """Install the personal /handoff skill without replacing user-owned work."""
+    destination = destination or handoff_skill_path()
+    source_skill = os.path.join(source_dir, "SKILL.md")
+    source_helper = os.path.join(source_dir, "manual-handoff.py")
+    try:
+        with open(source_skill, "r") as handle:
+            skill_text = handle.read()
+        with open(source_helper, "r") as handle:
+            helper_text = handle.read()
+    except IOError as exc:
+        return {"ok": False, "path": destination, "error": "skill source unreadable: %s" % exc}
+    if HANDOFF_SKILL_MARKER not in skill_text or HANDOFF_HELPER_MARKER not in helper_text:
+        return {"ok": False, "path": destination, "error": "skill source is not trusted"}
+
+    existing_skill = os.path.join(destination, "SKILL.md")
+    existing_helper = os.path.join(destination, "manual-handoff.py")
+    if os.path.isdir(destination):
+        existing_text = ""
+        try:
+            with open(existing_skill, "r") as handle:
+                existing_text = handle.read()
+        except IOError:
+            pass
+        if HANDOFF_SKILL_MARKER not in existing_text:
+            return {
+                "ok": False,
+                "path": destination,
+                "error": (
+                    "a user-owned /handoff skill already exists; Terminal Handoff refused "
+                    "to replace it"
+                ),
+            }
+        for name in os.listdir(destination):
+            if name not in ("SKILL.md", "manual-handoff.py"):
+                return {
+                    "ok": False,
+                    "path": destination,
+                    "error": (
+                        "the existing managed /handoff directory contains an unrecognised "
+                        "file; Terminal Handoff refused to overwrite it"
+                    ),
+                }
+    elif os.path.exists(destination):
+        return {"ok": False, "path": destination, "error": "the /handoff path is not a directory"}
+
+    _mkdir_private(destination)
+    write_private(existing_skill, skill_text, mode=0o600)
+    write_private(existing_helper, helper_text, mode=0o700)
+    registry = load_registry()
+    registry["handoff_skill"] = {
+        "path": destination,
+        "installed_at": utc_stamp(),
+        "files": ["SKILL.md", "manual-handoff.py"],
+    }
+    save_registry(registry)
+    log_event("handoff_skill_installed", path=destination)
+    return {"ok": True, "path": destination, "command": "/handoff"}
+
+
+def uninstall_handoff_skill(dry_run=True):
+    registry = load_registry()
+    entry = registry.get("handoff_skill")
+    if not isinstance(entry, dict) or not entry.get("path"):
+        return {"ok": True, "note": "no managed /handoff skill is registered"}
+    destination = entry["path"]
+    skill_file = os.path.join(destination, "SKILL.md")
+    helper_file = os.path.join(destination, "manual-handoff.py")
+    if not os.path.isdir(destination):
+        return {"ok": True, "path": destination, "note": "managed /handoff skill not present"}
+    try:
+        with open(skill_file, "r") as handle:
+            skill_text = handle.read()
+    except IOError:
+        skill_text = ""
+    if HANDOFF_SKILL_MARKER not in skill_text:
+        return {
+            "ok": True,
+            "path": destination,
+            "note": "the /handoff skill is not Terminal Handoff-managed and was preserved",
+        }
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "path": destination,
+            "action": "remove the Terminal Handoff-managed /handoff skill files",
+        }
+    for path, marker in (
+        (skill_file, HANDOFF_SKILL_MARKER),
+        (helper_file, HANDOFF_HELPER_MARKER),
+    ):
+        try:
+            with open(path, "r") as handle:
+                managed = marker in handle.read()
+        except IOError:
+            managed = False
+        if managed:
+            os.unlink(path)
+    try:
+        os.rmdir(destination)
+    except OSError:
+        pass
+    registry.pop("handoff_skill", None)
+    save_registry(registry)
+    log_event("handoff_skill_uninstalled", path=destination)
+    return {"ok": True, "path": destination, "action": "removed managed /handoff skill"}
 
 
 # ---------------------------------------------------------------------------
@@ -4610,6 +5178,12 @@ def cmd_launch(args):
     return perform_launch(args.payload)
 
 
+def cmd_manual_handoff(args):
+    result = run_manual_handoff(args.session_id)
+    print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    return 0 if result.get("ok") else 1
+
+
 def cmd_build_command(args):
     manifest = read_json(args.manifest)
     if manifest is None:
@@ -4641,23 +5215,44 @@ def cmd_install(args):
         save_notification_config(default_notification_config())
     if not os.path.isfile(notification_presence_path()):
         set_notification_presence("home", source="install")
-    results = {"targets": [], "claude_md": None, "notifications": notification_summary()}
+    results = {
+        "targets": [],
+        "claude_md": None,
+        "handoff_skill": None,
+        "notifications": notification_summary(),
+    }
+    if args.handoff_skill_source:
+        results["handoff_skill"] = install_handoff_skill(
+            os.path.abspath(os.path.expanduser(args.handoff_skill_source))
+        )
+        if not results["handoff_skill"].get("ok"):
+            print(json.dumps(results, indent=2, default=str))
+            return 1
     for settings_file in args.settings:
         results["targets"].append(install_statusline(os.path.abspath(os.path.expanduser(settings_file)), args.tag))
     if not args.skip_claude_md:
         results["claude_md"] = install_claude_md()
     print(json.dumps(results, indent=2, default=str))
-    return 0 if all(t.get("ok") for t in results["targets"]) else 1
+    targets_ok = all(t.get("ok") for t in results["targets"])
+    skill_ok = results["handoff_skill"] is None or results["handoff_skill"].get("ok")
+    return 0 if targets_ok and skill_ok else 1
 
 
 def cmd_uninstall(args):
     registry = load_registry()
     targets = args.settings or sorted((registry.get("targets") or {}).keys())
-    results = {"dry_run": not args.apply, "targets": [], "claude_md": None}
+    results = {
+        "dry_run": not args.apply,
+        "targets": [],
+        "claude_md": None,
+        "handoff_skill": None,
+    }
     for settings_file in targets:
         results["targets"].append(uninstall_statusline(os.path.abspath(os.path.expanduser(settings_file)), dry_run=not args.apply))
     if not args.skip_claude_md:
         results["claude_md"] = uninstall_claude_md(dry_run=not args.apply)
+    if not args.skip_handoff_skill:
+        results["handoff_skill"] = uninstall_handoff_skill(dry_run=not args.apply)
     results["retained"] = {
         "handoffs": th_path("handoffs"),
         "logs": th_path("logs"),
@@ -4715,7 +5310,9 @@ def cmd_status(args):
         "circuit_open": open_now,
         "circuit": circuit,
         "claude_executable": find_claude_executable(),
-        "triggered_sessions": len(os.listdir(th_path("triggered"))) if os.path.isdir(th_path("triggered")) else 0,
+        "triggered_sessions": len(
+            [name for name in os.listdir(th_path("triggered")) if not name.startswith(".")]
+        ) if os.path.isdir(th_path("triggered")) else 0,
         "manifests": len([f for f in os.listdir(th_path("handoffs"))]) if os.path.isdir(th_path("handoffs")) else 0,
         "recent_launches_in_window": len(recent_launch_times(storm_window)),
         "stop_parent_enabled": stop_parent_enabled(),
@@ -4725,6 +5322,7 @@ def cmd_status(args):
         "stop_attempts": stop_attempts(),
         "transfers": transfer_summary(),
         "notifications": notification_summary(),
+        "manual_handoff_skill": handoff_skill_status(),
     }
     print(json.dumps(info, indent=2, default=str))
     return 0
@@ -5018,6 +5616,13 @@ def main(argv=None):
     p.set_defaults(func=cmd_launch)
 
     p = sub.add_parser(
+        "manual-handoff",
+        help="Safely launch a verified successor for the exact current Claude session",
+    )
+    p.add_argument("--session-id", required=True)
+    p.set_defaults(func=cmd_manual_handoff)
+
+    p = sub.add_parser(
         "supervise",
         help=(
             "Detached shutdown supervisor (internal): wait for a verified successor "
@@ -5036,12 +5641,14 @@ def main(argv=None):
     p.add_argument("--settings", nargs="+", required=True)
     p.add_argument("--tag", default="install")
     p.add_argument("--skip-claude-md", action="store_true")
+    p.add_argument("--handoff-skill-source", default=None)
     p.set_defaults(func=cmd_install)
 
     p = sub.add_parser("uninstall", help="Remove Terminal Handoff from settings files")
     p.add_argument("--settings", nargs="*", default=None)
     p.add_argument("--apply", action="store_true", help="Actually apply (default is a dry run)")
     p.add_argument("--skip-claude-md", action="store_true")
+    p.add_argument("--skip-handoff-skill", action="store_true")
     p.set_defaults(func=cmd_uninstall)
 
     p = sub.add_parser("coverage", help="Report status-line coverage across all Claude settings")

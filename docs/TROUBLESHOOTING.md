@@ -187,9 +187,37 @@ real bug.
 
 ## `TH handed off` but I want another successor
 
-One trigger per session, by design. Continue in the successor, or start a fresh
-session. Deleting the marker in `triggered/` is possible but defeats the
-protection that stops runaway windows.
+First inspect the transfer:
+
+```sh
+python3 ~/.claude/terminal-handoff/terminal-handoff.py status
+```
+
+If it is `TRANSFER_COMPLETE`, continue in the successor. If it is still
+`LAUNCHING`, `SUCCESSOR_VERIFIED`, or `PARENT_STOP_REQUESTED`, do not open a
+second successor; wait for the recorded transfer to settle. If it is
+`TRANSFER_FAILED`, return to the still-owning parent session and type
+`/handoff`. The manual recovery path archives the failed attempt and safely
+tries once more.
+
+Never delete a file from `triggered/` by hand. That defeats the atomic
+duplicate-launch boundary.
+
+## `/handoff` is missing or refuses to run
+
+Run `/skills` in Claude Code. If `handoff` is absent, upgrade by re-running
+`./install.sh --apply` from the Terminal Handoff checkout, then start a new
+Claude Code session. A session that started before the first creation of
+`~/.claude/skills/` may not discover the directory until restart.
+
+Refusal is deliberate and states the exact reason. Common cases are a status
+snapshot older than 30 seconds, an active or completed transfer, a disabled
+parent-shutdown policy, or inability to prove the exact current Claude process.
+For a stale snapshot, wait for the status line to refresh and invoke `/handoff`
+again. A claim with no transfer record is protected for 90 seconds in case the
+automatic launcher is still starting; after that it is archived as orphaned and
+can be recovered. Do not replace it with a hand-written `claude` or `osascript`
+command.
 
 ## The successor started with the wrong model or effort
 

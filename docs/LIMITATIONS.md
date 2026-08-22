@@ -41,6 +41,18 @@ The human-facing base name is captured once, at generation 1, from
 3 to. Generation numbers are never inferred from a visible name, so a session
 legitimately called `Project 42` hands off to `Project 42 2`.
 
+## 0b. Manual `/handoff` requires a fresh status refresh
+
+The fail-safe does not ask Claude to reconstruct its own launch facts. It uses
+the latest minimal snapshot written by the status line for Claude Code's exact
+`${CLAUDE_SESSION_ID}`. A snapshot older than 30 seconds is refused. Wait for
+the status line to refresh and invoke `/handoff` again.
+
+Unlike the automatic path, manual recovery also refuses to open a successor if
+the exact parent Claude process cannot be bound. This avoids turning a recovery
+command into an unmanaged duplicate session. `/handoff` is a local personal
+skill; Claude cloud sessions do not read skills from your Mac.
+
 ## 1. `ultracode` cannot be preserved
 
 `claude --effort ultracode` is accepted by the CLI, but it is not an effort

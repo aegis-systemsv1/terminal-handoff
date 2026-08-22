@@ -14,6 +14,7 @@ When your session fills up, Terminal Handoff opens a new Terminal window running
 - **independently verifies** repository state before trusting anything
 - continues authorised work
 - sends a durable local alert, with optional signed-webhook and Messages/SMS routing
+- provides a global **`/handoff` manual fail-safe** when an automatic transfer fails
 - can later hand off to another generation, indefinitely
 
 Once the successor has proved it started correctly, the parent Claude session is asked to exit gracefully, so exactly one session continues the work. Its Terminal window stays open at a shell prompt, and if the successor cannot be verified the parent keeps running. Unrelated Claude sessions and Terminal windows are never touched.
@@ -108,7 +109,7 @@ cd Terminal-Handoff
 ./install.sh --apply      # install, with a confirmation prompt
 ```
 
-The installer checks macOS, Python 3.9+, Claude Code, `--model`/`--effort` support, `osascript` and Apple Terminal, and **fails closed** if any prerequisite is missing. It backs up every file before modifying it, merges into your existing `~/.claude/settings.json` without disturbing unrelated keys, validates the resulting JSON, and appends its instructions to `~/.claude/CLAUDE.md` idempotently.
+The installer checks macOS, Python 3.9+, Claude Code, `--model`/`--effort` support, `osascript` and Apple Terminal, and **fails closed** if any prerequisite is missing. It backs up every file before modifying it, merges into your existing `~/.claude/settings.json` without disturbing unrelated keys, validates the resulting JSON, appends its instructions to `~/.claude/CLAUDE.md` idempotently, and installs the personal `~/.claude/skills/handoff/` skill so `/handoff` is available in every local Claude Code project. A user-owned skill at that path is never overwritten.
 
 It never modifies a shell startup file, never touches an application repository, and never enables a permission bypass.
 
@@ -144,6 +145,29 @@ python3 scripts/live-handoff-test.py
 
 See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full procedure and [docs/LIVE_TEST_EVIDENCE.md](docs/LIVE_TEST_EVIDENCE.md) for a recorded run.
 
+### Manual recovery with `/handoff`
+
+If an automatic transfer reports `TRANSFER_FAILED`, return to the parent Claude
+Code session and type:
+
+```text
+/handoff
+```
+
+This is an independent recovery path, not a request for Claude to improvise a
+launch command. Claude Code supplies its trusted session ID to the installed
+skill, and the runtime uses a fresh private status snapshot from that exact
+session. It preserves the live model, effort, working directory, transcript
+path, display name, chain and generation.
+
+The command refuses to run when a transfer is still active, when a transfer
+already completed, when the status snapshot is stale, or when the exact parent
+Claude process cannot be proven. A terminally failed attempt is archived before
+one new successor is opened. The parent remains owner until the new successor
+passes the same heartbeat checks as an automatic handoff; only then can the
+verified parent process receive `SIGTERM`. The skill never edits, commits,
+pushes or otherwise changes the application repository.
+
 ---
 
 ## Configuration
@@ -170,6 +194,8 @@ unlimited generations; local macOS alerts are enabled by default.
 | `CLAUDE_TERMINAL_HANDOFF_HEARTBEAT_TIMEOUT` | Seconds to wait for a verified successor heartbeat before giving up and leaving the parent running | `300` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_GRACE` | Seconds to wait for the parent to exit after each `SIGTERM` | `20` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_ATTEMPTS` | `SIGTERM` requests before giving up (never escalates) | `2` |
+| `CLAUDE_TERMINAL_HANDOFF_LIVE_SESSION_MAX_AGE` | Maximum snapshot age accepted by `/handoff`, seconds | `30` |
+| `CLAUDE_TERMINAL_HANDOFF_ORPHAN_CLAIM_SECONDS` | Age before `/handoff` may replace a claim with no transfer record; minimum 60 seconds | `90` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN=1` | Run the whole shutdown path but send no signal | unset |
 | `CLAUDE_TERMINAL_HANDOFF_DISABLE_NOTIFICATIONS=1` | Leave events queued but do not spawn the delivery worker | unset |
 | `TERMINAL_HANDOFF_PRESENCE` | Routing state: `home`, `away`, or `unknown` | presence file, then `home` |
