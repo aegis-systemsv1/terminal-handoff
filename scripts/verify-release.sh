@@ -69,8 +69,10 @@ for f in README.md LICENSE CHANGELOG.md SECURITY.md CONTRIBUTING.md CODE_OF_COND
          pyproject.toml .gitignore .editorconfig install.sh uninstall.sh \
          src/terminal_handoff/core.py src/terminal_handoff/templates/successor-prompt.md \
          src/terminal_handoff/naming.py src/terminal_handoff/transfer.py \
+         src/terminal_handoff/notifications.py docs/NOTIFICATIONS.md \
          scripts/live-handoff-test.py docs/LIVE_TEST_EVIDENCE.md \
-         docs/decisions/0001-parent-shutdown-and-successor-naming.md; do
+         docs/decisions/0001-parent-shutdown-and-successor-naming.md \
+         docs/decisions/0002-exclusive-ownership-and-notification-outbox.md; do
     if [ -f "$f" ]; then ok "$f"; else report "missing: $f"; fi
 done
 

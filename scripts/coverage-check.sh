@@ -57,7 +57,7 @@ scan "$K6" "RSA private keys"
 scan "$K7" "OpenSSH private keys"
 
 printf '\nOperational data that must never be committed\n'
-for pattern in handoffs triggered launching completed failed logs prompts state backups livetest; do
+for pattern in handoffs triggered launching completed failed logs prompts state backups outbox notifications livetest; do
     if [ -d "$pattern" ]; then
         report "runtime directory present: $pattern/"
     fi

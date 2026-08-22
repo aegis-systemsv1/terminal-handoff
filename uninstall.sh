@@ -9,6 +9,7 @@
 #   - handoff manifests   (~/.claude/terminal-handoff/handoffs/)
 #   - logs                (~/.claude/terminal-handoff/logs/)
 #   - configuration backups (~/.claude/terminal-handoff/backups/)
+#   - notification config and delivery history (notifications.json, outbox/)
 #
 # Never touched: transcripts, repositories, unrelated Claude settings.
 #
@@ -66,7 +67,7 @@ status=$?
 print ""
 if [[ $status -eq 0 ]]; then
   print "Terminal Handoff removed from Claude configuration."
-  print "Retained: manifests, logs and backups under $TH_DIR"
+  print "Retained: manifests, logs, backups and notification history under $TH_DIR"
   print "To remove those too: rm -rf $TH_DIR"
 else
   print -u2 "Terminal Handoff: uninstall reported errors (exit $status)."

@@ -1,7 +1,8 @@
 # Architecture
 
 > Behavioural decisions with a rationale worth keeping are recorded in
-> [decisions/](decisions/0001-parent-shutdown-and-successor-naming.md).
+> [decision 1](decisions/0001-parent-shutdown-and-successor-naming.md) and
+> [decision 2](decisions/0002-exclusive-ownership-and-notification-outbox.md).
 
 Terminal Handoff has one job: notice that a Claude Code session is nearly full, and hand its work to a fresh session that can verify what it inherits.
 
@@ -214,15 +215,32 @@ stateDiagram-v2
     TRANSFER_FAILED --> [*]
 ```
 
-`LAUNCHING` and `SUCCESSOR_VERIFIED` mean the **parent** owns continuation. `PARENT_STOP_REQUESTED` and `TRANSFER_COMPLETE` mean the **successor** does. `TRANSFER_FAILED` returns ownership to the parent, which is still running.
+`LAUNCHING` and `SUCCESSOR_VERIFIED` mean the **parent** owns continuation.
+`PARENT_STOP_REQUESTED` has owner `none`: shutdown was requested but the parent
+may still be alive, so neither session may mutate. Only `TRANSFER_COMPLETE`
+gives the **successor** ownership. `TRANSFER_FAILED` gives ownership back to the
+parent, which is still running.
 
-Transitions happen under an exclusive lock, are refused when illegal, and append to a history carrying the reason and the requesting PID. Repeating a transition is refused, which is precisely what stops a duplicate status-line invocation or a second supervisor from requesting a second shutdown; a supervisor is additionally claimed per transfer with `O_CREAT|O_EXCL`.
+Transitions happen under an exclusive lock, are refused when illegal, and
+append to a history carrying the reason and requesting PID. Repeating a
+transition is refused. A supervisor additionally holds a non-blocking `flock`
+lease for its process lifetime. The kernel releases it after a clean exit or a
+crash. Parent and successor status refreshes probe the lease and respawn a
+missing supervisor, while concurrent replacements lose the same lease and exit
+without signalling.
 
 **Binding the parent.** The Claude process is bound inside the status-line process at trigger time, because the detached launcher starts its own session and has no ancestry to trace. `ps` walks upward to the nearest process whose executable file is named exactly `claude`; the candidate must be within six levels, owned by the same UID, not this process, and working in the same directory as the session in the payload. PID, start time, TTY, UID, executable name, working directory, session, chain and generation are all recorded.
 
 **Stopping it.** A detached supervisor waits for `SUCCESSOR_VERIFIED`, re-proves every recorded value with no wait between the check and the signal, then sends one `SIGTERM` — at most twice, never `SIGKILL`, never to a process group, never by name. The parent's shell and Terminal window are untouched, so the window stays open at a prompt.
 
-**Restart is deterministic.** Running the supervisor again from any state does the same thing: it resumes waiting from `LAUNCHING`, stops from `SUCCESSOR_VERIFIED`, and exits without signalling from `PARENT_STOP_REQUESTED`, `TRANSFER_COMPLETE` or `TRANSFER_FAILED`.
+**Restart is deterministic.** Running the supervisor again from any state does
+the same thing: it resumes waiting from `LAUNCHING`, stops from
+`SUCCESSOR_VERIFIED`, observes without re-signalling from
+`PARENT_STOP_REQUESTED`, and exits without signalling from `TRANSFER_COMPLETE`
+or `TRANSFER_FAILED`. From an interrupted stop request it completes if the
+exact parent is gone, or fails back to the still-live parent after the original
+grace budget. A later status refresh performs that restart automatically after
+a crash.
 
 ## 10. Multi-generation continuation
 
@@ -246,13 +264,56 @@ Notably, an unpreservable model or effort is a *failure*, not a fallback. Termin
 
 Three launches within ten minutes trips the breaker: launching is suspended for thirty minutes, the event is logged, and the status line shows `TH circuit open`. Activation is never hidden. `reset-circuit` clears both the flag and the counting window — resetting the flag alone would let already-counted launches re-trip it immediately.
 
+## 13. Durable notification outbox
+
+Notifications follow a transactional-outbox boundary:
+
+```mermaid
+flowchart TD
+    T[terminal transfer state] --> C{terminal transition committed?}
+    C -- no --> X[no event]
+    C -- yes --> O[write idempotent event to private outbox]
+    O --> W[detached worker]
+    W --> L[macOS local]
+    W --> H[signed HTTPS webhook]
+    W --> M[Messages or SMS relay]
+    H --> R{accepted?}
+    M --> R
+    L --> R
+    R -- no --> B[bounded exponential backoff]
+    R -- yes --> D[delivery ledger]
+```
+
+The transfer write is authoritative and always happens first. Enqueue or
+delivery failure cannot roll it back. Every later status refresh reconciles
+terminal 1.2 records against the outbox, repairing a crash in the narrow gap
+between state commit and event creation without alerting on pre-1.2 history.
+Events are keyed deterministically by the parent session and terminal state, so
+repeated code paths create one outbox record. Webhooks carry the same ID as
+`Idempotency-Key` and an HMAC-SHA256 over timestamp plus canonical JSON.
+
+The ledger is per channel. If local delivery succeeds and the webhook fails,
+only the webhook is retried. Exhausted events move to `outbox/dead` and can be
+explicitly retried. This provides at-least-once delivery with deduplication,
+not a false exactly-once claim.
+
+Outbound events contain human display names, generations, ownership, urgency,
+presence and the concise message. They contain no transcript contents or
+paths, prompt, repository path, environment dump, credential or secret.
+
 ---
 
 ## Why the implementation is a single core module
 
-The repository presents `core.py` plus eight thin facade modules (`detector`, `manifest`, `launcher`, `naming`, `statusline`, `security`, `state`, `transfer`) that re-export the public API by concern.
+The repository presents `core.py` plus nine thin facade modules (`detector`,
+`manifest`, `launcher`, `naming`, `notifications`, `statusline`, `security`,
+`state`, `transfer`) that re-export the public API by concern.
 
-`core.py` is the exact implementation that was built, tested and live-verified for 1.0.0, and hardened in place since. Mechanically splitting a 3,000-line module across six files for appearance would mean rewriting import graphs and shared state handling — real risk, no behavioural gain, against code whose value is precisely that it has been proven end to end.
+`core.py` preserves the single-file installed runtime that was built,
+live-verified for 1.0.0 and hardened in place since. Mechanically splitting a
+large runtime across many installed files for appearance would rewrite import
+graphs and shared state handling, adding real deployment risk without a
+behavioural gain.
 
 So the split is deliberately a **naming layer**, not a rewrite:
 

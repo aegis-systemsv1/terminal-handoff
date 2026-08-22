@@ -23,7 +23,7 @@ The `state` and the last `history` entry give the exact reason:
 |---|---|
 | `LAUNCHING` | no verified successor heartbeat yet; the parent still owns the work |
 | `SUCCESSOR_VERIFIED` | the successor is proved; the shutdown request is next |
-| `PARENT_STOP_REQUESTED` | `SIGTERM` sent; waiting for the parent to exit |
+| `PARENT_STOP_REQUESTED` | `SIGTERM` sent; neither session owns mutations while waiting for the parent to exit |
 | `TRANSFER_COMPLETE` | the parent stopped; the successor owns the work |
 | `TRANSFER_FAILED` | the parent is still running, and the reason says why |
 
@@ -135,6 +135,43 @@ osascript -e 'tell application "Terminal" to count windows'
   under the controlling application.
 
 Terminal Handoff will not attempt to work around this.
+
+## No local notification appeared
+
+Run a deterministic test and inspect the delivery record:
+
+```sh
+TH="$HOME/.claude/terminal-handoff/terminal-handoff.py"
+python3 "$TH" notifications test --channel local
+python3 "$TH" notifications status
+```
+
+If macOS prompted for notification permission, allow the controlling
+application in **System Settings → Notifications**. Delivery details also appear
+in `logs/terminal-handoff.log` under `notification_delivery`.
+
+## Webhook or Messages alerts remain pending
+
+```sh
+python3 "$TH" notifications status
+python3 "$TH" notifications drain
+tail -30 ~/.claude/terminal-handoff/logs/terminal-handoff.log
+```
+
+For webhooks, confirm the URL is HTTPS and the HMAC secret is available from
+the configured macOS Keychain service/account. An exported secret in the parent
+shell is intentionally not copied into successor launch scripts.
+
+For Messages, run `notifications test --channel messages` while at the Mac so
+you can approve Automation access. SMS/RCS relay requires iPhone Text Message
+Forwarding. Provider acceptance does not prove carrier delivery or human
+receipt. See [NOTIFICATIONS.md](NOTIFICATIONS.md).
+
+Dead events can be returned to the outbox after correcting the cause:
+
+```sh
+python3 "$TH" notifications retry
+```
 
 ## `TH circuit open`
 

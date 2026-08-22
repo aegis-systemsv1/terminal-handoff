@@ -1,7 +1,8 @@
 """Transfer of continuation ownership from a parent session to its successor.
 
-There is exactly one ownership boundary. Before a verified successor heartbeat
-the parent owns continuation; after the shutdown request the successor does.
+There is exactly one ownership boundary. Before shutdown is confirmed the
+parent owns continuation; while shutdown is requested neither session may
+mutate; only TRANSFER_COMPLETE gives the successor ownership.
 The parent Claude process is bound by tracing this process's real ancestry at
 trigger time, re-proved immediately before it is signalled, and asked to exit
 with a single SIGTERM. There is no SIGKILL path, no process-name matching, no
@@ -23,15 +24,22 @@ from terminal_handoff.core import (  # noqa: F401
     TRANSFER_TRANSITIONS,
     SUCCESSOR_CHECK_NAMES,
     bind_parent_claude_process,
+    bound_parent_process_present,
+    bound_parent_process_state,
     build_transfer_record,
+    acquire_supervisor_lease,
     claim_supervisor,
     evaluate_successor_checks,
+    ensure_supervisor_running,
     heartbeat_timeout,
     parent_binding_path,
     process_ancestry,
     process_cwd,
     process_identity,
+    process_exists,
     read_transfer,
+    recover_parent_stop_requested,
+    release_supervisor_lease,
     request_parent_stop,
     spawn_supervisor,
     stop_attempts,
@@ -58,15 +66,22 @@ __all__ = [
     "TRANSFER_TRANSITIONS",
     "SUCCESSOR_CHECK_NAMES",
     "bind_parent_claude_process",
+    "bound_parent_process_present",
+    "bound_parent_process_state",
     "build_transfer_record",
+    "acquire_supervisor_lease",
     "claim_supervisor",
     "evaluate_successor_checks",
+    "ensure_supervisor_running",
     "heartbeat_timeout",
     "parent_binding_path",
     "process_ancestry",
     "process_cwd",
     "process_identity",
+    "process_exists",
     "read_transfer",
+    "recover_parent_stop_requested",
+    "release_supervisor_lease",
     "request_parent_stop",
     "spawn_supervisor",
     "stop_attempts",

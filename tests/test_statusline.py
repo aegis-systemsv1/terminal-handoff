@@ -3,16 +3,20 @@
 Ported unchanged from the proven Terminal Handoff 1.0.0 suite.
 """
 import json
+import io
 import os
 import shutil
 import subprocess
 import sys
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _harness import (  # noqa: E402
+    CORE,
     THTestCase,
     json_file,
     run_th,
@@ -139,6 +143,38 @@ class TestStatusLineWrapping(THTestCase):
         elapsed = time.time() - started
         self.assertEqual(code, 0)
         self.assertLess(elapsed, 10, "status line hung on a slow wrapped command")
+
+    def test_detached_launcher_spawn_failure_is_visible_and_retryable(self):
+        payload = self.payload(percent=90.0)
+        session_id = payload.pop("_session_id")
+        raw = json.dumps(payload).encode("utf-8")
+
+        class Input(object):
+            buffer = io.BytesIO(raw)
+
+        output = io.StringIO()
+        env = self.env(CLAUDE_TERMINAL_HANDOFF_STOP_PARENT="0")
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            CORE, "spawn_launcher", return_value=False
+        ), mock.patch.object(CORE.sys, "stdin", Input()), mock.patch.object(
+            CORE.sys, "stdout", output
+        ):
+            code = CORE.cmd_statusline(SimpleNamespace(wrap=None))
+
+        self.assertEqual(code, 0)
+        self.assertIn("TH failed", output.getvalue())
+        failure = json_file(os.path.join(self.home, "failed", "%s.json" % session_id))
+        self.assertIn("detached launcher", failure["reason"])
+        pending = os.path.join(self.home, "outbox", "pending")
+        events = [name for name in os.listdir(pending) if name.endswith(".json")]
+        self.assertEqual(len(events), 1)
+        event = json_file(os.path.join(pending, events[0]))["event"]
+        self.assertEqual(event["event_type"], "terminal_handoff.failed")
+        self.assertEqual(event["owner"], "parent")
+        self.assertFalse(
+            os.path.exists(os.path.join(self.home, "triggered", session_id)),
+            "the failed claim was not released for a bounded retry",
+        )
 
 
 # ---------------------------------------------------------------------------

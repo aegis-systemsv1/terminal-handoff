@@ -15,7 +15,7 @@ There are no third-party Python dependencies.
 ## Install
 
 ```sh
-git clone <your-repo-url> Terminal-Handoff
+git clone https://github.com/aegis-systemsv1/terminal-handoff.git Terminal-Handoff
 cd Terminal-Handoff
 
 ./install.sh              # dry run - prints every proposed change, changes nothing
@@ -41,6 +41,7 @@ It fails closed if any of these is not satisfied:
 | Path | Change |
 |---|---|
 | `~/.claude/terminal-handoff/` | runtime installed here (`0700`) |
+| `~/.claude/terminal-handoff/notifications.json` | private channel configuration; local alerts enabled (`0600`) |
 | `~/.claude/settings.json` | `statusLine` added, or an existing one wrapped |
 | `~/.claude/CLAUDE.md` | Terminal Handoff instructions appended, idempotently |
 
@@ -66,6 +67,7 @@ PYTHON=/opt/homebrew/bin/python3 \
 ```sh
 python3 ~/.claude/terminal-handoff/terminal-handoff.py status
 python3 ~/.claude/terminal-handoff/terminal-handoff.py coverage
+python3 ~/.claude/terminal-handoff/terminal-handoff.py notifications test --channel local
 ```
 
 `coverage` lists every Claude settings file on the machine and whether Terminal
@@ -74,6 +76,10 @@ project defining its own `statusLine`; see below.
 
 Then start a new Claude Code session. The status line should end with a badge
 such as `TH 12%`.
+
+The notification test should also create one local macOS alert. Signed webhook,
+presence-aware routing and Messages/SMS relay remain disabled until you opt in;
+configure them with [NOTIFICATIONS.md](NOTIFICATIONS.md).
 
 ## Projects with their own status line
 

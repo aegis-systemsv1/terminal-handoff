@@ -29,6 +29,8 @@ validated before it is written.
 - handoff manifests (`handoffs/`)
 - logs (`logs/`)
 - configuration backups (`backups/`)
+- notification configuration and presence (`notifications.json`, `notifications/`)
+- notification delivery history (`outbox/`)
 
 These are retained deliberately: they are the record of what happened and what
 your configuration looked like beforehand. Remove them yourself when you are

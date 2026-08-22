@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,6 +30,7 @@ from _harness import (  # noqa: E402
     json_file,
     process_alive,
     run_th,
+    wait_for,
     wait_for_exit,
 )
 
@@ -228,9 +230,15 @@ class TestTransferStateMachine(THTestCase):
     def setUp(self):
         super(TestTransferStateMachine, self).setUp()
         os.environ["CLAUDE_TERMINAL_HANDOFF_HOME"] = self.home
+        self._old_test_mode = os.environ.get("CLAUDE_TERMINAL_HANDOFF_TEST_MODE")
+        os.environ["CLAUDE_TERMINAL_HANDOFF_TEST_MODE"] = "1"
 
     def tearDown(self):
         os.environ.pop("CLAUDE_TERMINAL_HANDOFF_HOME", None)
+        if self._old_test_mode is None:
+            os.environ.pop("CLAUDE_TERMINAL_HANDOFF_TEST_MODE", None)
+        else:
+            os.environ["CLAUDE_TERMINAL_HANDOFF_TEST_MODE"] = self._old_test_mode
         super(TestTransferStateMachine, self).tearDown()
 
     def test_the_legal_transitions_are_the_documented_ones(self):
@@ -246,7 +254,7 @@ class TestTransferStateMachine(THTestCase):
         )
         self.assertEqual(CORE.TRANSFER_OWNER["LAUNCHING"], "parent")
         self.assertEqual(CORE.TRANSFER_OWNER["SUCCESSOR_VERIFIED"], "parent")
-        self.assertEqual(CORE.TRANSFER_OWNER["PARENT_STOP_REQUESTED"], "successor")
+        self.assertEqual(CORE.TRANSFER_OWNER["PARENT_STOP_REQUESTED"], "none")
         self.assertEqual(CORE.TRANSFER_OWNER["TRANSFER_COMPLETE"], "successor")
         self.assertEqual(CORE.TRANSFER_OWNER["TRANSFER_FAILED"], "parent")
 
@@ -280,20 +288,133 @@ class TestTransferStateMachine(THTestCase):
         self.assertTrue(first)
         self.assertFalse(second)
 
-    def test_recovery_from_each_state_is_deterministic(self):
-        """Re-running the supervisor from any state does the same thing twice."""
-        proc = self.standin_claude()
-        binding = self.binding_for(proc.pid, session_id="rec")
-        outcomes = {}
-        for state in ("PARENT_STOP_REQUESTED", "TRANSFER_COMPLETE", "TRANSFER_FAILED"):
-            path = self.write_transfer("rec-%s" % state, binding, state=state)
+    def test_recovery_from_terminal_states_is_deterministic(self):
+        """Re-running from a terminal state is always a signal-free no-op."""
+        for state in ("TRANSFER_COMPLETE", "TRANSFER_FAILED"):
+            path = self.write_transfer("rec-%s" % state, None, state=state)
             first = CORE.supervise_transfer(path)
             after_first = json_file(path)["state"]
             second = CORE.supervise_transfer(path)
-            outcomes[state] = (first, second, after_first, json_file(path)["state"])
             self.assertEqual(after_first, state, "state changed on resume from %s" % state)
             self.assertEqual(first, second)
-            self.assertTrue(process_alive(proc.pid), "resume from %s signalled the parent" % state)
+
+    def test_recovery_completes_an_interrupted_stop_when_parent_is_gone(self):
+        binding = {"pid": 424242, "session_id": "recovered-gone"}
+        path = self.write_transfer(
+            "recovered-gone",
+            binding,
+            state="PARENT_STOP_REQUESTED",
+            parent_process_bound=True,
+            stop_requested_epoch=time.time() - 60,
+        )
+        with mock.patch.object(CORE, "bound_parent_process_state", return_value="gone"):
+            code = CORE.supervise_transfer(path, wait=False)
+        record = json_file(path)
+        self.assertEqual(code, 0)
+        self.assertEqual(record["state"], "TRANSFER_COMPLETE")
+        self.assertEqual(record["owner"], "successor")
+        self.assertTrue(record["supervisor_recovered"])
+
+    def test_recovery_never_resignals_a_live_parent(self):
+        binding = {"pid": 424243, "session_id": "recovered-live"}
+        path = self.write_transfer(
+            "recovered-live",
+            binding,
+            state="PARENT_STOP_REQUESTED",
+            parent_process_bound=True,
+            stop_requested_epoch=time.time() - 60,
+        )
+        with mock.patch.object(
+            CORE, "bound_parent_process_state", return_value="present"
+        ), mock.patch.object(
+            CORE, "verify_parent_binding", return_value=(True, None)
+        ), mock.patch.object(CORE.os, "kill", side_effect=AssertionError("must not signal")):
+            code = CORE.supervise_transfer(path, wait=False)
+        record = json_file(path)
+        self.assertEqual(code, 5)
+        self.assertEqual(record["state"], "TRANSFER_FAILED")
+        self.assertEqual(record["owner"], "parent")
+        self.assertIn("no second signal", record["history"][-1]["reason"])
+
+    def test_recovery_fails_closed_when_process_liveness_is_unknown(self):
+        path = self.write_transfer(
+            "recovered-unknown",
+            {"pid": 424245, "session_id": "recovered-unknown"},
+            state="PARENT_STOP_REQUESTED",
+            parent_process_bound=True,
+        )
+        with mock.patch.object(CORE, "bound_parent_process_state", return_value="unknown"):
+            code = CORE.supervise_transfer(path, wait=False)
+        record = json_file(path)
+        self.assertEqual(code, 5)
+        self.assertEqual(record["state"], "TRANSFER_FAILED")
+        self.assertEqual(record["owner"], "parent")
+        self.assertIn("could not prove", record["history"][-1]["reason"])
+
+    def test_a_zombie_is_proven_gone_but_a_parse_failure_is_unknown(self):
+        binding = {"pid": 424246, "start": "recorded"}
+        with mock.patch.object(CORE, "process_identity", return_value=None), mock.patch.object(
+            CORE, "_ps_field", return_value="Z"
+        ):
+            self.assertEqual(CORE.bound_parent_process_state(binding), "gone")
+        with mock.patch.object(CORE, "process_identity", return_value=None), mock.patch.object(
+            CORE, "_ps_field", return_value="S"
+        ), mock.patch.object(CORE, "process_exists", return_value=False):
+            self.assertEqual(CORE.bound_parent_process_state(binding), "unknown")
+
+    def test_status_refresh_can_restart_an_interrupted_stop_request(self):
+        path = self.write_transfer(
+            "recover-stop-refresh",
+            {"pid": 424244, "session_id": "recover-stop-refresh"},
+            state="PARENT_STOP_REQUESTED",
+            parent_process_bound=True,
+        )
+        with mock.patch.dict(
+            os.environ, {"CLAUDE_TERMINAL_HANDOFF_TEST_MODE": ""}
+        ), mock.patch.object(CORE, "spawn_supervisor", return_value=True) as spawn:
+            self.assertTrue(CORE.ensure_supervisor_running(path))
+            spawn.assert_called_once_with(path)
+
+    def test_a_crashed_supervisor_releases_its_lease_for_recovery(self):
+        """The kernel, not a permanent marker, owns the supervisor lease."""
+        path = self.write_transfer("crash-recovery", None, state="SUCCESSOR_VERIFIED")
+        ready = os.path.join(self.tmp, "lease-ready")
+        code = "\n".join(
+            [
+                "import importlib.util, os, time",
+                "spec = importlib.util.spec_from_file_location('th_child', %r)" % TH_SCRIPT,
+                "module = importlib.util.module_from_spec(spec)",
+                "spec.loader.exec_module(module)",
+                "os.environ['CLAUDE_TERMINAL_HANDOFF_HOME'] = %r" % self.home,
+                "lease = module.acquire_supervisor_lease('crash-recovery')",
+                "open(%r, 'w').write('ready')" % ready,
+                "time.sleep(120)",
+            ]
+        )
+        holder = subprocess.Popen([PYTHON, "-c", code])
+        self._standins.append(holder)
+        self.assertTrue(wait_for(ready), "lease holder did not start")
+
+        with mock.patch.dict(
+            os.environ, {"CLAUDE_TERMINAL_HANDOFF_TEST_MODE": ""}
+        ), mock.patch.object(CORE, "spawn_supervisor", return_value=True) as spawn:
+            self.assertTrue(CORE.ensure_supervisor_running(path))
+            spawn.assert_not_called()
+
+        first = CORE.supervise_transfer(path, wait=False)
+        self.assertEqual(first, 0)
+        self.assertEqual(json_file(path)["state"], "SUCCESSOR_VERIFIED")
+
+        holder.kill()
+        holder.wait(timeout=10)
+        with mock.patch.dict(
+            os.environ, {"CLAUDE_TERMINAL_HANDOFF_TEST_MODE": ""}
+        ), mock.patch.object(CORE, "spawn_supervisor", return_value=True) as spawn:
+            self.assertTrue(CORE.ensure_supervisor_running(path))
+            spawn.assert_called_once_with(path)
+        second = CORE.supervise_transfer(path, wait=False)
+        self.assertEqual(second, 3)
+        self.assertEqual(json_file(path)["state"], "TRANSFER_FAILED")
 
 
 class TestParentShutdown(THTestCase):

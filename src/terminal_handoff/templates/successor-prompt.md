@@ -28,9 +28,11 @@ of the following are true:
 
          cat {{TRANSFER_PATH}}
 
-     `"state": "PARENT_STOP_REQUESTED"` or `"TRANSFER_COMPLETE"` means you own
-     continuation. `"LAUNCHING"` or `"SUCCESSOR_VERIFIED"` means the parent
-     still does: read, verify and report, but change nothing yet.
+     Only `"state": "TRANSFER_COMPLETE"` means you own continuation.
+     `"LAUNCHING"` or `"SUCCESSOR_VERIFIED"` means the parent still owns the
+     work. `"PARENT_STOP_REQUESTED"` is a quiescent transition in which neither
+     session may mutate. In all three states, read, verify and report, but
+     change nothing yet.
      `"TRANSFER_FAILED"` means the parent is still running and still owns the
      work: report that plainly and do not begin mutating work.
 
@@ -123,6 +125,11 @@ Before modifying anything:
    - active revert state
    - recent commits
    - relevant tests where safe
+
+   If you performed this verification before `TRANSFER_COMPLETE`, repeat pwd,
+   branch, HEAD, git status and active Git-operation checks immediately after
+   ownership transfers and before your first mutation. The parent may have
+   changed state while it still owned the work.
 
 9. Treat the live filesystem and Git state as authoritative if they conflict
    with the old transcript.

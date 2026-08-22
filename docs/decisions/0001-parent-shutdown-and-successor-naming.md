@@ -5,6 +5,11 @@
 - **Release:** 1.1.0
 - **Supersedes:** the 1.0.x statement "The original Terminal is never closed"
 
+> Ownership timing and supervisor recovery are amended by
+> [decision 2](0002-exclusive-ownership-and-notification-outbox.md):
+> `PARENT_STOP_REQUESTED` is now ownerless, and only confirmed
+> `TRANSFER_COMPLETE` gives ownership to the successor.
+
 ## Context
 
 Two defects were reported from live use of 1.0.1.
