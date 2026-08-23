@@ -219,7 +219,7 @@ The chain carries a **base display name** and a **chain ID**, and they are diffe
 - The base display name is human-facing: `Ranger`. It is captured once, from `.session_name`, when the chain is created, written to `chains/<chain-id>.json`, and never rewritten. Generation *n* is displayed as `<base> <n>`; generation 1 keeps the base name unchanged.
 - The chain ID is machine-safe hex used to key state. It never appears as a session name.
 
-The generation number is read from trusted chain state — `chains/<chain-id>.json` records which session ID occupies which generation — and only falls back to the launcher's exported `CLAUDE_TERMINAL_HANDOFF_GENERATION` when chain state does not yet know the session. It is never derived by parsing digits off a visible name, so `Project 42` hands off to `Project 42 2`.
+The generation number is read from trusted chain state — `chains/<chain-id>.json` records which session ID occupies which generation. When a Claude Code tool subprocess does not retain the launcher's custom environment, Terminal Handoff searches its private chain records for that exact session ID and restores the chain and generation only when there is exactly one match. It falls back to the launcher's exported `CLAUDE_TERMINAL_HANDOFF_GENERATION` when chain state does not yet know the session. It is never derived by parsing digits off a visible name, so `Project 42` hands off to `Project 42 2`.
 
 If no session name is available, the documented fallback is `Terminal Handoff <chain-id[:8]>`. No repository, directory or project name is ever substituted.
 

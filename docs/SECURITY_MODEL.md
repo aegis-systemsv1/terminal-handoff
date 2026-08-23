@@ -37,6 +37,12 @@ retrying a terminally failed transfer, it archives the prior authoritative
 records and atomically replaces the trigger claim under the same lock used by
 the automatic status-line path.
 
+Chain continuity does not depend solely on inherited tool environment. If those
+variables are absent, the runtime looks up the exact Claude session ID in its
+private `0600` chain records. Recovery is accepted only for one well-formed
+match. Visible session-name digits are never promoted into trusted generation
+authority.
+
 ## The transcript
 
 The transcript is the most sensitive object Terminal Handoff touches. It is

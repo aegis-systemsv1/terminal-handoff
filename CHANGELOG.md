@@ -5,6 +5,26 @@ All notable changes to Terminal Handoff are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-08-23
+
+### Fixed
+
+- Manual `/handoff` now recovers an existing successor's chain and generation
+  from private verified chain state when the Claude Code tool subprocess does
+  not retain Terminal Handoff's custom environment variables. A manual rescue
+  of `DJI Drone 3` therefore launches and titles `DJI Drone 4`, rather than
+  starting a new naming sequence.
+- Recovered chain state remains authoritative when it disagrees with an
+  inherited chain environment value. The mismatch is recorded without exposing
+  an internal chain identifier as a human-facing name.
+
+### Tests
+
+- Added a regression test that removes every handoff environment variable,
+  invokes `/handoff` from a verified generation-3 session, and checks the
+  manifest, Claude `--name` argument, Terminal title and result all say
+  `DJI Drone 4`.
+
 ## [1.2.1] - 2026-08-22
 
 ### Added

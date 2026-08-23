@@ -219,6 +219,11 @@ automatic launcher is still starting; after that it is archived as orphaned and
 can be recovered. Do not replace it with a hand-written `claude` or `osascript`
 command.
 
+If a manual successor repeats or restarts the visible numbering, upgrade to
+1.2.2 or later. Manual recovery now looks up the exact Claude session ID in
+private verified chain state, so naming remains sequential even when a Claude
+Code tool subprocess does not inherit Terminal Handoff's chain environment.
+
 ## The successor started with the wrong model or effort
 
 Check what it observed:

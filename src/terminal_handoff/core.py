@@ -21,6 +21,7 @@ from __future__ import print_function
 
 import errno
 import fcntl
+import glob
 import hashlib
 import hmac
 import json
@@ -37,7 +38,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.2.1"
+TERMINAL_HANDOFF_VERSION = "1.2.2"
 MANIFEST_SCHEMA_VERSION = 2
 NOTIFICATION_SCHEMA_VERSION = 1
 
@@ -1434,9 +1435,27 @@ def chain_identity(session_id=None, session_name=None):
     state, which is authoritative when it knows this session. It is never
     inferred by parsing trailing digits off a visible session name.
     """
+    recovered = trusted_chain_identity_for_session(session_id)
+    if recovered is False:
+        recovered = None
     chain = os.environ.get("CLAUDE_TERMINAL_HANDOFF_CHAIN_ID", "").strip()
     if not CHAIN_ID_RE.match(chain or ""):
         chain = None
+    if recovered is not None:
+        recovered_chain, recovered_generation, recovered_manifest, recovered_parent = recovered
+        if chain and chain != recovered_chain:
+            log_event(
+                "chain_environment_disagrees_with_state",
+                session_id=session_id,
+                environment_chain_id=chain,
+                recovered_chain_id=recovered_chain,
+            )
+        return (
+            recovered_chain,
+            recovered_generation,
+            recovered_manifest,
+            recovered_parent,
+        )
     generation = env_int("CLAUDE_TERMINAL_HANDOFF_GENERATION", 0)
     parent_manifest = os.environ.get("CLAUDE_TERMINAL_HANDOFF_MANIFEST", "").strip() or None
     parent_session = os.environ.get("CLAUDE_TERMINAL_HANDOFF_PARENT_SESSION", "").strip() or None
@@ -1448,6 +1467,66 @@ def chain_identity(session_id=None, session_name=None):
     if generation < 1:
         generation = 1
     return chain, generation, parent_manifest, parent_session
+
+
+def trusted_chain_identity_for_session(session_id):
+    """Recover one session's chain from private chain state without env vars.
+
+    Claude Code tool subprocesses are not guaranteed to retain every custom
+    environment variable. The session ID from Claude Code is stable, and a
+    verified successor heartbeat records that ID under exactly one private
+    chain generation. That record is authoritative for continuity and naming.
+    Malformed state is ignored. Ambiguous state returns ``False`` so the
+    side-effecting manual path can refuse rather than guess.
+    """
+    if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
+        return None
+    matches = []
+    for path in sorted(glob.glob(th_path("chains", "*.json"))):
+        state = read_json(path)
+        if not isinstance(state, dict):
+            continue
+        chain_id = state.get("chain_id")
+        if not isinstance(chain_id, str) or not CHAIN_ID_RE.match(chain_id):
+            continue
+        generations = state.get("generations")
+        if not isinstance(generations, dict):
+            continue
+        for key, entry in generations.items():
+            if not isinstance(entry, dict) or entry.get("session_id") != session_id:
+                continue
+            try:
+                generation = int(entry.get("generation", key))
+            except (TypeError, ValueError):
+                continue
+            if generation < 1:
+                continue
+            parent_session = None
+            parent_manifest = None
+            if generation > 1:
+                parent_entry = generations.get(str(generation - 1))
+                if isinstance(parent_entry, dict):
+                    candidate = parent_entry.get("session_id")
+                    if isinstance(candidate, str) and SESSION_ID_RE.match(candidate):
+                        parent_session = candidate
+                        candidate_manifest = manifest_path(candidate)
+                        if os.path.isfile(candidate_manifest):
+                            parent_manifest = candidate_manifest
+            matches.append((chain_id, generation, parent_manifest, parent_session))
+    unique = []
+    for match in matches:
+        if match not in unique:
+            unique.append(match)
+    if len(unique) == 1:
+        return unique[0]
+    if len(unique) > 1:
+        log_event(
+            "chain_state_ambiguous",
+            session_id=session_id,
+            matches=len(unique),
+        )
+        return False
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -3442,7 +3521,19 @@ def run_manual_handoff(session_id):
             ),
         }
 
-    launch_identity = chain_identity(facts.session_id, facts.session_name)
+    recovered_identity = trusted_chain_identity_for_session(facts.session_id)
+    if recovered_identity is False:
+        return {
+            "ok": False,
+            "state": "refused",
+            "reason": (
+                "the session ID appears in more than one private chain record; "
+                "manual handoff will not guess which chain owns it"
+            ),
+        }
+    launch_identity = recovered_identity or chain_identity(
+        facts.session_id, facts.session_name
+    )
     chain_id, generation, _, _ = launch_identity
     ceiling = max_generations()
     if ceiling is not None and generation >= ceiling:
