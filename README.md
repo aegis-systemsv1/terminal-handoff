@@ -240,8 +240,8 @@ The original generation-one session keeps its name exactly as it is; no `1` is e
 
 Three rules make this dependable:
 
-1. **The base name is captured once**, from `.session_name` in the official status-line JSON, when the chain is created. It is then stored as explicit chain metadata under `~/.claude/terminal-handoff/chains/` and reused for every later generation. Renaming a successor mid-chain does not rewrite the chain's base name.
-2. **The generation number comes from trusted chain state**, not from the visible name. Terminal Handoff never parses trailing digits off a session name, so a session legitimately named `Project 42` hands off to `Project 42 2` rather than `Project 43`.
+1. **The base name is captured once**, from `.session_name` in the official status-line JSON, when the chain is created. It is then stored as explicit chain metadata under `~/.claude/terminal-handoff/chains/` and reused for every later generation. Renaming a normally named successor mid-chain does not rewrite the chain's base name.
+2. **The generation number comes from trusted chain state**, not from the visible name. Terminal Handoff does not generally parse trailing digits, so a session legitimately named `Project 42` hands off to `Project 42 2` rather than `Project 43`. There is one narrow repair for old broken chains: if the stored base is Terminal Handoff's exact internal fallback and a verified generation 4 session is named `DJI Drone 4`, the fallback is replaced with `DJI Drone` and the successor becomes `DJI Drone 5`. The visible suffix must exactly match the trusted generation.
 3. **The internal chain identifier is never shown.** `chain_id` remains a machine-safe hex string used for state keying; it never appears as a session name. Names such as `terminal-handoff-7a282bd6-g2` are gone.
 
 A session name is untrusted text. It is stripped of control characters, collapsed to single spaces, prevented from beginning with `-`, and bounded to 64 characters — then passed as a single argv element and escaped for AppleScript. Unicode is preserved. Shell metacharacters cannot become commands.

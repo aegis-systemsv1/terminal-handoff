@@ -38,7 +38,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.3.0"
+TERMINAL_HANDOFF_VERSION = "1.3.1"
 MANIFEST_SCHEMA_VERSION = 2
 NOTIFICATION_SCHEMA_VERSION = 1
 
@@ -1916,13 +1916,71 @@ def chain_generation_for_session(chain_id, session_id):
     return None
 
 
+def base_name_from_exact_generation_name(session_name, generation):
+    """Recover a base only when the visible suffix exactly matches generation.
+
+    This is deliberately narrower than general trailing-number parsing.  It is
+    used only to repair a chain whose stored base is Terminal Handoff's own
+    fallback.  A trusted generation 4 session named ``DJI Drone 4`` can recover
+    ``DJI Drone``; ``Project 42`` at generation 4 cannot be guessed.
+    """
+    current = sanitize_display_name(session_name)
+    try:
+        generation = int(generation)
+    except (TypeError, ValueError):
+        return None
+    if current is None or generation <= 1:
+        return None
+    suffix = " %d" % generation
+    if not current.endswith(suffix):
+        return None
+    candidate = sanitize_display_name(current[:-len(suffix)])
+    if candidate is None or generation_display_name(candidate, generation) != current:
+        return None
+    return candidate
+
+
+def repair_fallback_chain_base_name(chain_id, generation, session_name):
+    """Replace only this chain's exact internal fallback with a proved live base."""
+    if not chain_id or not CHAIN_ID_RE.match(str(chain_id)):
+        return None
+    candidate = base_name_from_exact_generation_name(session_name, generation)
+    fallback = fallback_base_name(chain_id)
+    if candidate is None or candidate == fallback:
+        return None
+    repaired = {"value": None}
+
+    def mutate(data):
+        stored = sanitize_display_name(data.get("base_display_name"))
+        if stored != fallback:
+            return
+        data["prior_base_display_name"] = stored
+        data["base_display_name"] = candidate
+        data["base_name_source"] = "verified_live_name_recovery"
+        data["base_name_recovered_generation"] = int(generation)
+        data["base_name_recovered_utc"] = utc_stamp()
+        data["naming_convention"] = DISPLAY_NAME_CONVENTION
+        repaired["value"] = candidate
+
+    update_json_locked(chain_state_path(chain_id), mutate, {"chain_id": chain_id})
+    if repaired["value"]:
+        log_event(
+            "fallback_chain_name_recovered",
+            chain_id=chain_id,
+            generation=int(generation),
+            prior_base_display_name=fallback,
+            recovered_base_display_name=candidate,
+        )
+    return repaired["value"]
+
+
 def resolve_base_display_name(chain_id, generation, session_name):
     """Return (base_name, source) for a chain.
 
     Generation 1 captures the live Claude session name from the official
-    status-line JSON. Every later generation takes the base name from trusted
-    Terminal Handoff chain state - never by parsing trailing digits off a
-    visible session name.
+    status-line JSON. Every later generation normally takes the base name from
+    trusted Terminal Handoff chain state. The only recovery exception is an
+    exact generation suffix replacing Terminal Handoff's own fallback.
     """
     try:
         generation = int(generation)
@@ -1932,6 +1990,14 @@ def resolve_base_display_name(chain_id, generation, session_name):
         state = read_chain_state(chain_id) or {}
         stored = sanitize_display_name(state.get("base_display_name"))
         if stored:
+            if stored == fallback_base_name(chain_id):
+                repaired = repair_fallback_chain_base_name(
+                    chain_id, generation, session_name
+                )
+                if repaired:
+                    return repaired, "verified_live_name_recovery"
+            if state.get("base_name_source") == "verified_live_name_recovery":
+                return stored, "verified_live_name_recovery"
             return stored, "chain_state"
         from_env = sanitize_display_name(os.environ.get("CLAUDE_TERMINAL_HANDOFF_BASE_NAME"))
         if from_env:
