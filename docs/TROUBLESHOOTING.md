@@ -1,5 +1,28 @@
 # Troubleshooting
 
+## The status line shows `peers N`
+
+Another fresh Claude session is running in the same workspace or a nested
+directory. This is a warning about possible shared-file interference, not an
+error. Sessions running in sibling Git worktrees are intentionally independent.
+
+Inspect the local registry:
+
+```sh
+python3 ~/.claude/terminal-handoff/terminal-handoff.py coordination status
+```
+
+Claude Code 2.1.224 or later should use `ListAgents` and `SendMessage` to
+exchange task, file and Git-operation intent automatically. If the sessions
+cannot establish one owner for an overlapping file set or Git operation, stop
+that operation and decide which session owns it. Never solve the warning by
+killing, resetting or deleting another session's work.
+
+If a closed session remains listed, wait 20 seconds. A stale record expires
+without deleting its historical status snapshot. Override the window only for
+diagnosis with `CLAUDE_TERMINAL_HANDOFF_COORDINATION_MAX_AGE` between 5 and 300
+seconds.
+
 Start here:
 
 ```sh

@@ -15,6 +15,8 @@ When your session fills up, Terminal Handoff opens a new Terminal window running
 - continues authorised work
 - sends a durable local alert, with optional signed-webhook and Messages/SMS routing
 - provides a global **`/handoff` manual fail-safe** when an automatic transfer fails
+- detects other fresh Claude sessions in the same workspace and coordinates
+  conflicting work through Claude Code's native session messaging
 - can later hand off to another generation, indefinitely
 
 Once the successor has proved it started correctly, the parent Claude session is asked to exit gracefully, so exactly one session continues the work. Its Terminal window stays open at a shell prompt, and if the successor cannot be verified the parent keeps running. Unrelated Claude sessions and Terminal windows are never touched.
@@ -195,6 +197,7 @@ unlimited generations; local macOS alerts are enabled by default.
 | `CLAUDE_TERMINAL_HANDOFF_STOP_GRACE` | Seconds to wait for the parent to exit after each `SIGTERM` | `20` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_ATTEMPTS` | `SIGTERM` requests before giving up (never escalates) | `2` |
 | `CLAUDE_TERMINAL_HANDOFF_LIVE_SESSION_MAX_AGE` | Maximum snapshot age accepted by `/handoff`, seconds | `30` |
+| `CLAUDE_TERMINAL_HANDOFF_COORDINATION_MAX_AGE` | Maximum age for a session to count as a live coordination peer, seconds | `20` |
 | `CLAUDE_TERMINAL_HANDOFF_ORPHAN_CLAIM_SECONDS` | Age before `/handoff` may replace a claim with no transfer record; minimum 60 seconds | `90` |
 | `CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN=1` | Run the whole shutdown path but send no signal | unset |
 | `CLAUDE_TERMINAL_HANDOFF_DISABLE_NOTIFICATIONS=1` | Leave events queued but do not spawn the delivery worker | unset |
@@ -357,6 +360,32 @@ If a status line already exists, Terminal Handoff runs it through `/bin/sh -c` â
 
 See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for the full threat model.
 
+## Multiple sessions coordinate instead of colliding
+
+Terminal Handoff 1.3.0 keeps a private, short-lived presence view from the same
+minimal status snapshots already used by `/handoff`. When another fresh Claude
+session shares the exact workspace or a nested directory, the status line adds
+`peers N`. Sibling worktrees remain independent, and a session disappears from
+the peer view when its heartbeat is older than 20 seconds.
+
+Claude Code 2.1.224 or later provides native `ListAgents` and `SendMessage`
+tools. Terminal Handoff's managed instructions require sessions to use those
+tools proactively before overlapping edits or branch-changing Git operations.
+They exchange only concise task, file, branch and operation intent. One session
+owns each overlapping file set or Git operation; the other moves to independent
+work, a separate worktree, review, research, or pauses the conflicting action.
+
+This is coordination, not delegated authority. A peer message never counts as
+your approval, and no session may kill, reset, commandeer or silently overwrite
+another. Unresolved conflict stops only the conflicting operation and comes
+back to you.
+
+Inspect the local view at any time:
+
+```sh
+python3 ~/.claude/terminal-handoff/terminal-handoff.py coordination status
+```
+
 ## Wrapping an existing status line
 
 If you already have a status line, Terminal Handoff **wraps** it rather than replacing it: it runs your command with the identical stdin bytes and preserves its stdout byte-for-byte, appending only a short badge.
@@ -375,6 +404,7 @@ If you already have a status line, Terminal Handoff **wraps** it rather than rep
 | `TH blocked` | Validation failed; no launch will occur |
 | `TH circuit open` | Storm breaker tripped |
 | `TH disabled` | Kill switch set |
+| `peers 2` | Two fresh Claude sessions share or overlap this workspace |
 
 Project-level settings override user-level settings, so any repository defining its own `statusLine` must be integrated explicitly. `coverage` reports exactly which configurations are covered:
 

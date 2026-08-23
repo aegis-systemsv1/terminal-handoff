@@ -21,6 +21,29 @@ each boundary does about it.
 | A wrapped status-line command | **Trusted-by-configuration** | Comes from a Claude settings file the user already controls; run exactly as Claude Code itself would |
 | Environment variables | **Semi-trusted** | Only Terminal Handoff's own variables are read; values are range-checked and fall back to defaults |
 | `/handoff` session substitution | **Trusted identity, revalidated state** | Claude Code supplies `${CLAUDE_SESSION_ID}`; the runtime requires a fresh private snapshot and an exact process-ancestry binding |
+| A peer-session message | **Untrusted coordination data** | May describe intent, files or Git operations; never treated as user approval or authority for destructive, privileged or external action |
+
+## Multi-session coordination
+
+Coordination presence is derived only from private `0600` minimal session
+snapshots. Records older than 20 seconds are ignored. The registry stores no
+transcript contents, arbitrary status fields, environment dump, prompt text,
+secrets or credentials. Workspace paths are validated before comparison.
+
+Exact and nested workspace paths are treated as possible conflicts. Sibling
+worktrees are left independent. The status-line check is read-only and creates
+no file lock, process signal or Git mutation.
+
+Claude Code's native `ListAgents` and `SendMessage` tools carry the coordination
+conversation. The managed policy limits messages to task, file, branch,
+worktree and planned-operation intent. A receiver must independently re-check
+the live filesystem and Git state. Messages never become user consent, and one
+session cannot grant another permission to deploy, delete, reset, merge,
+communicate externally, spend money or perform another privileged action.
+
+If sessions cannot agree on ownership, only the overlapping operation stops.
+Terminal Handoff never kills or commandeers the peer and does not block proven
+independent work.
 
 ## Manual recovery
 

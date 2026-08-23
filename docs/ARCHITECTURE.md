@@ -3,7 +3,8 @@
 > Behavioural decisions with a rationale worth keeping are recorded in
 > [decision 1](decisions/0001-parent-shutdown-and-successor-naming.md) and
 > [decision 2](decisions/0002-exclusive-ownership-and-notification-outbox.md), and
-> [decision 3](decisions/0003-manual-handoff-recovery.md).
+> [decision 3](decisions/0003-manual-handoff-recovery.md), and
+> [decision 4](decisions/0004-native-multi-session-coordination.md).
 
 Terminal Handoff has one job: notice that a Claude Code session is nearly full, and hand its work to a fresh session that can verify what it inherits.
 
@@ -122,6 +123,25 @@ A trigger claim with no transfer or launch record can be a launcher crash. It
 is not replaced inside the normal launcher race window. After 90 seconds, with
 no completed launch record, `/handoff` treats it as an orphan, archives it and
 claims one recovery attempt. The lower bound is always 60 seconds.
+
+## 3b. Multi-session coordination
+
+Every valid status refresh already writes a private minimal record under
+`sessions/`. Coordination reads only those records and keeps entries whose
+`observed_epoch` is no more than 20 seconds old. Exact and nested workspace
+paths are peers because either session can alter files visible to the other.
+Sibling worktrees are not peers because their working trees are isolated.
+
+The status line reports the count as `peers N`, and `coordination status`
+provides the read-only local view. Terminal Handoff does not create a second
+message transport. Claude Code 2.1.224 or later already exposes `ListAgents`
+and `SendMessage`, so the managed `CLAUDE.md` policy tells sessions to inspect
+their peers, exchange concise intent and establish one owner for overlapping
+files or Git operations.
+
+No runtime lock silently transfers authority. Independent work continues.
+Unresolved overlapping work fails closed and returns to the user, while a peer
+message remains advisory and cannot authorise destructive or external action.
 
 ## 4. Manifest creation
 
