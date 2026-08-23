@@ -145,6 +145,68 @@ class TestManualHandoff(THTestCase):
         self.assertEqual(launch["argv"][launch["argv"].index("--name") + 1], "DJI Drone 4")
         self.assertEqual(launch["title"], "DJI Drone 4")
 
+    def test_manual_handoff_repairs_a_verified_v121_split_chain(self):
+        _, session_id, binding = self.prepare(session_name="DJI Drone 3 2")
+        parent_session = self.payload(session_name="DJI Drone 3")["_session_id"]
+        original_chain = "a1a2a3a4a5a6"
+        split_chain = "b1b2b3b4b5b6"
+        CORE.record_chain_generation(
+            original_chain,
+            3,
+            session_id=parent_session,
+            display_name="DJI Drone 3",
+            base_name="DJI Drone",
+            source="session_name",
+        )
+        CORE.record_chain_generation(
+            split_chain,
+            1,
+            session_id=parent_session,
+            display_name="DJI Drone 3",
+            base_name="DJI Drone 3",
+            source="session_name",
+        )
+        CORE.record_chain_generation(
+            split_chain,
+            2,
+            session_id=session_id,
+            display_name="DJI Drone 3 2",
+        )
+        CORE.write_json_private(
+            CORE.th_path("completed", "%s.launch.json" % parent_session),
+            {
+                "launch_mode": "manual",
+                "chain_id": split_chain,
+                "generation": 1,
+                "successor_generation": 2,
+            },
+        )
+        CORE.write_json_private(
+            CORE.th_path("transfers", "%s.json" % parent_session),
+            {
+                "state": "TRANSFER_COMPLETE",
+                "chain_id": split_chain,
+                "parent_generation": 1,
+                "successor_generation": 2,
+                "parent_session_id": parent_session,
+                "successor": {"session_id": session_id},
+            },
+        )
+        os.environ["CLAUDE_TERMINAL_HANDOFF_CHAIN_ID"] = split_chain
+        os.environ["CLAUDE_TERMINAL_HANDOFF_GENERATION"] = "2"
+        os.environ["CLAUDE_TERMINAL_HANDOFF_BASE_NAME"] = "DJI Drone 3"
+
+        result = self.run_manual(session_id, binding)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["chain_id"], original_chain)
+        self.assertEqual(result["generation"], 4)
+        self.assertEqual(result["successor_generation"], 5)
+        self.assertEqual(result["successor_display_name"], "DJI Drone 5")
+
+        manifest = json_file(CORE.manifest_path(session_id))
+        self.assertEqual(manifest["display"]["outgoing_display_name"], "DJI Drone 4")
+        self.assertEqual(manifest["display"]["successor_display_name"], "DJI Drone 5")
+
     def test_ambiguous_private_chain_state_is_refused(self):
         _, session_id, binding = self.prepare(session_name="DJI Drone 3")
         for chain_id in ("aaaaaaaaaaaa", "bbbbbbbbbbbb"):

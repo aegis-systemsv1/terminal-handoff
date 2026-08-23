@@ -43,6 +43,13 @@ private `0600` chain records. Recovery is accepted only for one well-formed
 match. Visible session-name digits are never promoted into trusted generation
 authority.
 
+The v1.2.1 split-chain repair is narrower still. It requires a completed manual
+transfer record whose chain, parent generation, successor generation, parent
+session ID and verified successor session ID all match the private chain
+records. The parent must appear in exactly one other trusted chain, and that
+chain's computed parent display name must equal the split chain's captured base
+name. If any proof is absent or conflicting, no repair occurs.
+
 ## The transcript
 
 The transcript is the most sensitive object Terminal Handoff touches. It is

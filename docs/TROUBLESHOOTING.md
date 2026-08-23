@@ -220,9 +220,13 @@ can be recovered. Do not replace it with a hand-written `claude` or `osascript`
 command.
 
 If a manual successor repeats or restarts the visible numbering, upgrade to
-1.2.2 or later. Manual recovery now looks up the exact Claude session ID in
+1.2.3 or later. Manual recovery now looks up the exact Claude session ID in
 private verified chain state, so naming remains sequential even when a Claude
 Code tool subprocess does not inherit Terminal Handoff's chain environment.
+Version 1.2.3 also reconnects an already-open successor created by the v1.2.1
+split-chain bug when the completed transfer records prove the relationship.
+Rename that existing Claude session once with `/rename Correct Name 4`; later
+automatic and manual handoffs continue with `Correct Name 5`.
 
 ## The successor started with the wrong model or effort
 
