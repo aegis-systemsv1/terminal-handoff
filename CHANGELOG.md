@@ -5,6 +5,38 @@ All notable changes to Terminal Handoff are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-08-23
+
+### Added
+
+- Private multi-session presence detection from the existing minimal status
+  snapshots. Fresh sessions in the same or a nested workspace are reported as
+  peers; stale sessions and sibling worktrees are excluded.
+- A `coordination status` command for inspecting active sessions and conflicting
+  workspaces without reading transcripts, arbitrary status fields or
+  environment data.
+- A `peers N` status-line indicator when another fresh Claude session can
+  conflict with the current workspace.
+- A managed multi-session policy that instructs Claude Code 2.1.224 or later to
+  coordinate proactively through its native `ListAgents` and `SendMessage`
+  tools, establish one owner per overlapping file set or Git operation, and
+  continue independent work without unnecessary blocking.
+
+### Safety
+
+- Peer messages are coordination data only and never count as user consent.
+  Unresolved overlap fails closed on the conflicting action. Sessions may not
+  kill, reset, commandeer or silently overwrite one another.
+- Existing managed `~/.claude/CLAUDE.md` blocks are upgraded in place while all
+  user-owned content outside the markers is preserved. Malformed managed blocks
+  are refused rather than guessed at.
+
+### Tests
+
+- Added coverage for same-workspace and nested-workspace peers, sibling
+  worktree isolation, stale-session expiry, CLI output, status-line peer counts,
+  consent boundaries and safe managed-instruction upgrades.
+
 ## [1.2.3] - 2026-08-23
 
 ### Fixed

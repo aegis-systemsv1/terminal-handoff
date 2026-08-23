@@ -145,6 +145,49 @@ class TestInstallUninstall(THTestCase):
         self.assertNotIn("TERMINAL HANDOFF", after)
         self.assertIn("Existing user content that must survive.", after)
 
+    def test_install_upgrades_only_the_managed_claude_md_block(self):
+        env = self.env()
+        env["HOME"] = self.tmp
+        directory = os.path.join(self.tmp, ".claude")
+        os.makedirs(directory, exist_ok=True)
+        target = os.path.join(directory, "CLAUDE.md")
+        original = (
+            "# User instructions\n\nKeep this exactly.\n\n"
+            "<!-- BEGIN TERMINAL HANDOFF -->\n"
+            "# Terminal Handoff\n\nOld managed instructions.\n"
+            "<!-- END TERMINAL HANDOFF -->\n"
+        )
+        with open(target, "w") as handle:
+            handle.write(original)
+        settings = self.write_settings("coordination-upgrade.json", {})
+
+        code, output, error = run_th(["install", "--settings", settings], "", env)
+        self.assertEqual(code, 0, error)
+        result = json.loads(output)
+        self.assertTrue(result["claude_md"]["updated"])
+        content = text_file(target)
+        self.assertIn("Keep this exactly.", content)
+        self.assertNotIn("Old managed instructions.", content)
+        self.assertIn("ListAgents", content)
+        self.assertIn("SendMessage", content)
+        self.assertIn("never user consent", content.lower())
+
+    def test_install_refuses_a_malformed_managed_claude_md_block(self):
+        env = self.env()
+        env["HOME"] = self.tmp
+        directory = os.path.join(self.tmp, ".claude")
+        os.makedirs(directory, exist_ok=True)
+        target = os.path.join(directory, "CLAUDE.md")
+        original = "# User content\n\n<!-- BEGIN TERMINAL HANDOFF -->\nbroken\n"
+        with open(target, "w") as handle:
+            handle.write(original)
+        settings = self.write_settings("malformed-coordination-block.json", {})
+
+        code, output, _ = run_th(["install", "--settings", settings], "", env)
+        self.assertNotEqual(code, 0)
+        self.assertIn("malformed", output)
+        self.assertEqual(text_file(target), original)
+
 
 # ---------------------------------------------------------------------------
 # 11. Coverage reporting
