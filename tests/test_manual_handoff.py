@@ -145,6 +145,28 @@ class TestManualHandoff(THTestCase):
         self.assertEqual(launch["argv"][launch["argv"].index("--name") + 1], "DJI Drone 4")
         self.assertEqual(launch["title"], "DJI Drone 4")
 
+    def test_manual_handoff_repairs_a_fallback_chain_after_user_rename(self):
+        _, session_id, binding = self.prepare(session_name="DJI Drone 4")
+        chain_id = "26f50621abcd"
+        fallback = CORE.fallback_base_name(chain_id)
+        CORE.record_chain_generation(
+            chain_id,
+            4,
+            session_id=session_id,
+            display_name="DJI Drone 4",
+            base_name=fallback,
+            source="fallback",
+        )
+
+        result = self.run_manual(session_id, binding)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["generation"], 4)
+        self.assertEqual(result["successor_display_name"], "DJI Drone 5")
+        launch = json_file(CORE.th_path("completed", "%s.launch.json" % session_id))
+        self.assertEqual(launch["title"], "DJI Drone 5")
+        self.assertEqual(launch["argv"][launch["argv"].index("--name") + 1], "DJI Drone 5")
+
     def test_manual_handoff_repairs_a_verified_v121_split_chain(self):
         _, session_id, binding = self.prepare(session_name="DJI Drone 3 2")
         parent_session = self.payload(session_name="DJI Drone 3")["_session_id"]

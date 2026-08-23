@@ -5,6 +5,24 @@ All notable changes to Terminal Handoff are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-08-23
+
+### Fixed
+
+- A verified later-generation session renamed from an old internal fallback now
+  repairs that fallback before launching its successor. For example, generation
+  4 named `DJI Drone 4` now launches both the Claude session and Terminal window
+  as `DJI Drone 5`, instead of `Terminal Handoff <chain> 5`.
+- The repair is deliberately narrow. It runs only when trusted chain state still
+  contains Terminal Handoff's exact fallback and the live name's final number
+  exactly matches the trusted generation. Mismatched or ambiguous names do not
+  rewrite chain identity.
+
+### Tests
+
+- Added automatic and manual handoff regressions for the observed fallback-chain
+  failure, plus a negative test proving a mismatched visible number is refused.
+
 ## [1.3.0] - 2026-08-23
 
 ### Added

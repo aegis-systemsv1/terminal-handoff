@@ -67,9 +67,11 @@ To stop trying entirely, `export CLAUDE_TERMINAL_HANDOFF_STOP_PARENT=0`.
 ## The successor is named `Terminal Handoff <hex> 2`
 
 That is the documented fallback used when the status-line JSON carried no
-`.session_name`. Name the session (`/rename`) before it hands off and the chain
-will use that name instead. Terminal Handoff will not substitute a repository or
-directory name.
+`.session_name`. Name the session (`/rename`) before it hands off. From 1.3.1,
+a later-generation fallback chain also repairs itself when the live name exactly
+matches its trusted generation, for example `DJI Drone 4` at generation 4 becomes
+`DJI Drone 5`. A mismatched suffix is refused rather than guessed. Terminal
+Handoff will not substitute a repository or directory name.
 
 ## No status line appears at all
 

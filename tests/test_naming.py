@@ -175,6 +175,43 @@ class TestChainNamingAcrossGenerations(THTestCase):
         gen2 = self._handoff(renamed, self._successor_env(chain, 2, first["_session_id"], "Ranger"))
         self.assertEqual(gen2["argv"][gen2["argv"].index("--name") + 1], "Ranger 3")
 
+    def test_verified_live_name_repairs_an_old_fallback_chain(self):
+        """Regression: DJI Drone 4 must not become Terminal Handoff <id> 5."""
+        chain = "26f50621abcd"
+        payload = self.payload(percent=90.0, session_name="DJI Drone 4")
+        fallback = CORE.fallback_base_name(chain)
+        os.environ["CLAUDE_TERMINAL_HANDOFF_HOME"] = self.home
+        CORE.record_chain_generation(
+            chain,
+            4,
+            session_id=payload["_session_id"],
+            display_name="DJI Drone 4",
+            base_name=fallback,
+            source="fallback",
+        )
+
+        record = self._handoff(payload)
+
+        self.assertEqual(record["generation"], 4)
+        self.assertEqual(record["base_display_name"], "DJI Drone")
+        self.assertEqual(record["base_name_source"], "verified_live_name_recovery")
+        self.assertEqual(record["argv"][record["argv"].index("--name") + 1], "DJI Drone 5")
+        self.assertEqual(record["title"], "DJI Drone 5")
+        state = json_file(CORE.chain_state_path(chain))
+        self.assertEqual(state["base_display_name"], "DJI Drone")
+        self.assertEqual(state["prior_base_display_name"], fallback)
+
+    def test_fallback_repair_refuses_a_mismatched_visible_number(self):
+        chain = "26f50621abcd"
+        fallback = CORE.fallback_base_name(chain)
+        os.environ["CLAUDE_TERMINAL_HANDOFF_HOME"] = self.home
+        CORE.record_chain_generation(
+            chain, 4, base_name=fallback, source="fallback"
+        )
+        base, source = CORE.resolve_base_display_name(chain, 4, "DJI Drone 9")
+        self.assertEqual(base, fallback)
+        self.assertEqual(source, "chain_state")
+
     def test_generation_derives_from_trusted_chain_metadata(self):
         """Chain state wins over the environment's generation number."""
         first = self.payload(percent=90.0, session_name="Ranger")
