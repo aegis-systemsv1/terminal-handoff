@@ -110,6 +110,58 @@ class TestManualHandoff(THTestCase):
         claim = json_file(CORE.th_path("triggered", session_id))
         self.assertEqual(claim["mode"], "manual")
 
+    def test_manual_handoff_recovers_chain_name_when_tool_env_is_missing(self):
+        _, session_id, binding = self.prepare(session_name="DJI Drone 3")
+        chain_id = "d1d2d3d4d5d6"
+        CORE.record_chain_generation(
+            chain_id,
+            3,
+            session_id=session_id,
+            display_name="DJI Drone 3",
+            base_name="DJI Drone",
+            source="session_name",
+        )
+
+        for name in (
+            "CLAUDE_TERMINAL_HANDOFF_CHAIN_ID",
+            "CLAUDE_TERMINAL_HANDOFF_GENERATION",
+            "CLAUDE_TERMINAL_HANDOFF_MANIFEST",
+            "CLAUDE_TERMINAL_HANDOFF_PARENT_SESSION",
+            "CLAUDE_TERMINAL_HANDOFF_BASE_NAME",
+        ):
+            os.environ.pop(name, None)
+
+        result = self.run_manual(session_id, binding)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["chain_id"], chain_id)
+        self.assertEqual(result["generation"], 3)
+        self.assertEqual(result["successor_generation"], 4)
+        self.assertEqual(result["successor_display_name"], "DJI Drone 4")
+
+        manifest = json_file(CORE.manifest_path(session_id))
+        self.assertEqual(manifest["display"]["outgoing_display_name"], "DJI Drone 3")
+        self.assertEqual(manifest["display"]["successor_display_name"], "DJI Drone 4")
+        launch = json_file(CORE.th_path("completed", "%s.launch.json" % session_id))
+        self.assertEqual(launch["argv"][launch["argv"].index("--name") + 1], "DJI Drone 4")
+        self.assertEqual(launch["title"], "DJI Drone 4")
+
+    def test_ambiguous_private_chain_state_is_refused(self):
+        _, session_id, binding = self.prepare(session_name="DJI Drone 3")
+        for chain_id in ("aaaaaaaaaaaa", "bbbbbbbbbbbb"):
+            CORE.record_chain_generation(
+                chain_id,
+                3,
+                session_id=session_id,
+                display_name="DJI Drone 3",
+                base_name="DJI Drone",
+                source="session_name",
+            )
+        result = self.run_manual(session_id, binding)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], "refused")
+        self.assertIn("more than one private chain record", result["reason"])
+        self.assertFalse(os.path.exists(CORE.th_path("triggered", session_id)))
+
     def test_a_live_transfer_blocks_a_duplicate_manual_successor(self):
         _, session_id, binding = self.prepare()
         first = self.run_manual(session_id, binding)
