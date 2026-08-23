@@ -38,7 +38,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.2.2"
+TERMINAL_HANDOFF_VERSION = "1.2.3"
 MANIFEST_SCHEMA_VERSION = 2
 NOTIFICATION_SCHEMA_VERSION = 1
 
@@ -1469,18 +1469,10 @@ def chain_identity(session_id=None, session_name=None):
     return chain, generation, parent_manifest, parent_session
 
 
-def trusted_chain_identity_for_session(session_id):
-    """Recover one session's chain from private chain state without env vars.
-
-    Claude Code tool subprocesses are not guaranteed to retain every custom
-    environment variable. The session ID from Claude Code is stable, and a
-    verified successor heartbeat records that ID under exactly one private
-    chain generation. That record is authoritative for continuity and naming.
-    Malformed state is ignored. Ambiguous state returns ``False`` so the
-    side-effecting manual path can refuse rather than guess.
-    """
+def _trusted_chain_matches_for_session(session_id):
+    """Return valid private chain records that claim one exact session ID."""
     if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
-        return None
+        return []
     matches = []
     for path in sorted(glob.glob(th_path("chains", "*.json"))):
         state = read_json(path)
@@ -1517,8 +1509,112 @@ def trusted_chain_identity_for_session(session_id):
     for match in matches:
         if match not in unique:
             unique.append(match)
+    return unique
+
+
+def _legacy_manual_bridge_identity(session_id, match):
+    """Map a verified v1.2.1 split chain back to its original chain.
+
+    v1.2.1 could start a fresh generation-1 chain when ``/handoff`` ran in a
+    Claude tool subprocess that had lost the launcher's custom environment.
+    Repair is intentionally narrow: only the directly verified generation-2
+    successor of a completed manual transfer is eligible, and the same parent
+    session must occur in exactly one other trusted chain. No visible suffix is
+    parsed or trusted.
+    """
+    chain_id, generation, _, _ = match
+    if generation != 2:
+        return None
+    state = read_chain_state(chain_id) or {}
+    generations = state.get("generations") or {}
+    first = generations.get("1")
+    second = generations.get("2")
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return None
+    parent_session = first.get("session_id")
+    if (
+        not isinstance(parent_session, str)
+        or not SESSION_ID_RE.match(parent_session)
+        or second.get("session_id") != session_id
+    ):
+        return None
+
+    launch = read_json(th_path("completed", "%s.launch.json" % parent_session), {}) or {}
+    transfer = read_json(th_path("transfers", "%s.json" % parent_session), {}) or {}
+    if not isinstance(launch, dict) or not isinstance(transfer, dict):
+        return None
+    verified_successor = transfer.get("successor") or {}
+    if not isinstance(verified_successor, dict):
+        return None
+    try:
+        launch_generation = int(launch.get("generation") or 0)
+        launch_successor_generation = int(launch.get("successor_generation") or 0)
+        transfer_parent_generation = int(transfer.get("parent_generation") or 0)
+        transfer_successor_generation = int(transfer.get("successor_generation") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (
+        launch.get("launch_mode") == "manual"
+        and launch.get("chain_id") == chain_id
+        and launch_generation == 1
+        and launch_successor_generation == 2
+        and transfer.get("state") == "TRANSFER_COMPLETE"
+        and transfer.get("chain_id") == chain_id
+        and transfer_parent_generation == 1
+        and transfer_successor_generation == 2
+        and transfer.get("parent_session_id") == parent_session
+        and verified_successor.get("session_id") == session_id
+    ):
+        return None
+
+    prior = [
+        candidate
+        for candidate in _trusted_chain_matches_for_session(parent_session)
+        if candidate[0] != chain_id
+    ]
+    if len(prior) != 1:
+        return None
+    prior_chain, prior_generation, _, _ = prior[0]
+    prior_state = read_chain_state(prior_chain) or {}
+    prior_base = sanitize_display_name(prior_state.get("base_display_name"))
+    bridge_base = sanitize_display_name(state.get("base_display_name"))
+    expected_parent = generation_display_name(prior_base, prior_generation)
+    if not prior_base or bridge_base != expected_parent:
+        return None
+
+    mapped_generation = prior_generation + 1
+    mapped_entry = (prior_state.get("generations") or {}).get(str(mapped_generation))
+    if isinstance(mapped_entry, dict):
+        existing_session = mapped_entry.get("session_id")
+        if existing_session and existing_session != session_id:
+            return None
+    parent_manifest = manifest_path(parent_session)
+    if not os.path.isfile(parent_manifest):
+        parent_manifest = None
+    log_event(
+        "legacy_manual_chain_recovered",
+        session_id=session_id,
+        split_chain_id=chain_id,
+        recovered_chain_id=prior_chain,
+        recovered_generation=mapped_generation,
+    )
+    return prior_chain, mapped_generation, parent_manifest, parent_session
+
+
+def trusted_chain_identity_for_session(session_id):
+    """Recover one session's chain from private chain state without env vars.
+
+    Claude Code tool subprocesses are not guaranteed to retain every custom
+    environment variable. The session ID from Claude Code is stable, and a
+    verified successor heartbeat records that ID under exactly one private
+    chain generation. That record is authoritative for continuity and naming.
+    Malformed state is ignored. Ambiguous state returns ``False`` so the
+    side-effecting manual path can refuse rather than guess.
+    """
+    unique = _trusted_chain_matches_for_session(session_id)
     if len(unique) == 1:
-        return unique[0]
+        repaired = _legacy_manual_bridge_identity(session_id, unique[0])
+        return repaired or unique[0]
     if len(unique) > 1:
         log_event(
             "chain_state_ambiguous",

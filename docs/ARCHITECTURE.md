@@ -221,6 +221,13 @@ The chain carries a **base display name** and a **chain ID**, and they are diffe
 
 The generation number is read from trusted chain state — `chains/<chain-id>.json` records which session ID occupies which generation. When a Claude Code tool subprocess does not retain the launcher's custom environment, Terminal Handoff searches its private chain records for that exact session ID and restores the chain and generation only when there is exactly one match. It falls back to the launcher's exported `CLAUDE_TERMINAL_HANDOFF_GENERATION` when chain state does not yet know the session. It is never derived by parsing digits off a visible name, so `Project 42` hands off to `Project 42 2`.
 
+Version 1.2.3 also recognises the exact split-chain shape produced by the
+v1.2.1 manual bug. A generation-2 session is mapped back only when a completed
+manual transfer proves its parent and verified successor IDs, the parent occurs
+in exactly one other trusted chain, and the stored display names agree. The
+mapping restores the original chain and increments its generation; it never
+parses the visible suffix.
+
 If no session name is available, the documented fallback is `Terminal Handoff <chain-id[:8]>`. No repository, directory or project name is ever substituted.
 
 ## 9b. Transfer of ownership and parent shutdown

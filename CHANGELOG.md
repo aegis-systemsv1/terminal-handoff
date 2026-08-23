@@ -5,6 +5,22 @@ All notable changes to Terminal Handoff are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - 2026-08-23
+
+### Fixed
+
+- A successor already created by the v1.2.1 manual naming bug now reconnects
+  to its original verified chain. The repair requires a completed manual
+  transfer, the exact verified successor session ID, and exactly one prior
+  chain containing the parent session. No visible number is parsed or trusted.
+- After the user renames the already-open successor from `DJI Drone 3 2` to
+  `DJI Drone 4`, the next automatic or manual successor is `DJI Drone 5`.
+
+### Tests
+
+- Added a regression that recreates the v1.2.1 split-chain records and proves
+  the current successor maps back to generation 4 and launches generation 5.
+
 ## [1.2.2] - 2026-08-23
 
 ### Fixed
