@@ -5,6 +5,28 @@ All notable changes to Terminal Handoff are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A successor launched after a launch-time parent-bind failure (an unbindable
+  or wrong-cwd parent process) is now told, on its own status line, that it
+  was never granted ownership. Previously `_supervise_transfer_claimed` sent
+  the transfer straight to `TRANSFER_FAILED` before the successor's first
+  heartbeat, but nothing distinguished that terminal rejection from the
+  ordinary retryable `successor_mismatch` state, and nothing surfaced it
+  outside the manifest. A real, running successor session could sit
+  indefinitely alongside its still-live parent with no visible signal that it
+  was never the owner. `successor_heartbeat` now records a distinct
+  `rejected_transfer_failed` launch state, and the status-line badge shows
+  `TH rejected (not owner)` on every render while that holds.
+
+### Tests
+
+- Added `TestRejectedSuccessorAfterUnboundParent` covering the terminal
+  rejection, its status-line visibility, and that the pre-existing retryable
+  `successor_mismatch` path is unchanged.
+
 ## [1.3.1] - 2026-08-23
 
 ### Fixed

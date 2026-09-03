@@ -260,6 +260,73 @@ class TestFailedHeartbeatsNeverStopTheParent(TransferTestCase):
         self.assertTrue(process_alive(unrelated.pid), "an unrelated session was stopped")
 
 
+class TestRejectedSuccessorAfterUnboundParent(TransferTestCase):
+    """A successor launched after a launch-time parent-bind failure.
+
+    _supervise_transfer_claimed sends the transfer straight to TRANSFER_FAILED
+    the moment the supervisor sees `parent_process_bound: false` - before the
+    successor it just spawned has heartbeated even once. That successor is a
+    real, running Claude Code session that was never granted ownership. It
+    must be told so plainly and mechanically (via its own status-line badge),
+    not left to infer it from the manifest alone.
+    """
+
+    def fail_transfer_as_unbound(self, parent):
+        path = self.transfer(parent["_session_id"])
+        record = json_file(path)
+        record["state"] = "TRANSFER_FAILED"
+        record["parent_process_bound"] = False
+        record["parent_stopped"] = False
+        record.setdefault("history", []).append(
+            {
+                "from": "LAUNCHING",
+                "state": "TRANSFER_FAILED",
+                "reason": (
+                    "the parent Claude process was not bound at trigger time; "
+                    "the parent is left fully operational"
+                ),
+            }
+        )
+        with open(path, "w") as handle:
+            json.dump(record, handle, indent=2, sort_keys=True)
+        return path
+
+    def test_the_manifest_records_a_terminal_rejection_not_a_retryable_mismatch(self):
+        parent = self.handoff()
+        self.fail_transfer_as_unbound(parent)
+        successor = self.payload(percent=4.0, session_name="Ranger 2", include_context=False)
+        code, out, err = self.statusline(successor, self.successor_env(parent))
+        self.assertEqual(code, 0, err)
+
+        manifest = json_file(self.manifest(parent["_session_id"]))
+        self.assertEqual(manifest["successor"]["launch_state"], "rejected_transfer_failed")
+        self.assertIsNone(manifest["successor"]["confirmed_utc"])
+
+        transfer = json_file(self.transfer(parent["_session_id"]))
+        self.assertEqual(transfer["state"], "TRANSFER_FAILED", "a terminal failure was reopened")
+        self.assertTrue(transfer["successor_rejected"]["transfer_already_failed"])
+
+    def test_the_rejected_successors_own_status_line_says_it_is_not_the_owner(self):
+        parent = self.handoff()
+        self.fail_transfer_as_unbound(parent)
+        successor = self.payload(percent=4.0, session_name="Ranger 2", include_context=False)
+        code, out, err = self.statusline(successor, self.successor_env(parent))
+        self.assertEqual(code, 0, err)
+        self.assertIn("TH rejected", out)
+
+    def test_a_still_retryable_mismatch_is_unaffected(self):
+        """The pre-existing successor_mismatch path (transfer still LAUNCHING,
+        e.g. a wrong model) must keep behaving exactly as before this change."""
+        parent = self.handoff()
+        wrong_model = self.payload(percent=4.0, session_name="Ranger 2", model_id="claude-haiku-4-5")
+        code, out, err = self.statusline(wrong_model, self.successor_env(parent))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("TH rejected", out)
+        manifest = json_file(self.manifest(parent["_session_id"]))
+        self.assertEqual(manifest["successor"]["launch_state"], "successor_mismatch")
+        self.assertEqual(json_file(self.transfer(parent["_session_id"]))["state"], "LAUNCHING")
+
+
 class TestSuccessorPromptOwnership(THTestCase):
     def test_fallback_prompt_has_the_same_exclusive_boundary(self):
         fallback = CORE.FALLBACK_PROMPT_TEMPLATE

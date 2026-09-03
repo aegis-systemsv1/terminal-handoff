@@ -4057,7 +4057,20 @@ def successor_heartbeat(facts):
     checks = evaluate_successor_checks(data, facts, env_chain, env_generation, parent_session)
     failed = sorted(name for name in SUCCESSOR_CHECK_NAMES if not checks.get(name))
 
-    if failed:
+    # A launch-time parent-bind failure (unbindable or wrong-cwd parent) sends
+    # the transfer straight to TRANSFER_FAILED before this successor ever gets
+    # a chance to heartbeat - see _supervise_transfer_claimed's unbound-parent
+    # check. No number of further heartbeats can move a terminal TRANSFER_FAILED
+    # transfer forward, so a successor born into that state is told plainly
+    # rather than being left to run on indefinitely as an unacknowledged
+    # duplicate of its own parent.
+    transfer_file = resolve_transfer_file(env_transfer, parent_session)
+    transfer_record = read_transfer(transfer_file) if transfer_file else None
+    transfer_already_failed = bool(transfer_record) and transfer_record.get("state") == TRANSFER_FAILED
+
+    if failed and transfer_already_failed:
+        state = "rejected_transfer_failed"
+    elif failed:
         state = "successor_mismatch"
     elif beats >= HEARTBEATS_REQUIRED:
         state = "completed"
@@ -4100,7 +4113,6 @@ def successor_heartbeat(facts):
         },
     )
 
-    transfer_file = resolve_transfer_file(env_transfer, parent_session)
     if state == "completed":
         record_chain_generation(
             data.get("chain_id"),
@@ -4137,6 +4149,7 @@ def successor_heartbeat(facts):
                 "session_id": facts.session_id,
                 "failed_checks": failed,
                 "checks": checks,
+                "transfer_already_failed": transfer_already_failed,
                 "observed_utc": utc_stamp(),
             },
         )
@@ -4856,6 +4869,7 @@ def cmd_statusline(args):
 
     decision = {"state": "invalid", "percent": None}
     facts = None
+    successor_state = None
     try:
         ensure_dirs()
         if not env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE"):
@@ -4873,7 +4887,7 @@ def cmd_statusline(args):
                         error=str(exc)[:300],
                     )
             try:
-                successor_heartbeat(facts)
+                successor_state = successor_heartbeat(facts)
             except Exception as exc:
                 log_event(
                     "successor_heartbeat_error",
@@ -4958,6 +4972,14 @@ def cmd_statusline(args):
             )
         if peer_count:
             badge += " · peers %d" % peer_count
+    if successor_state == "rejected_transfer_failed":
+        # This session was launched as a Terminal Handoff successor, but its
+        # transfer already hit a terminal TRANSFER_FAILED before it could
+        # heartbeat (typically an unbindable parent process at trigger time).
+        # It was never granted ownership and the outgoing session is still
+        # running - surface that on every status-line render rather than
+        # leaving an unacknowledged duplicate session with no signal at all.
+        badge += " · TH rejected (not owner)"
     if payload is not None and not args.wrap:
         line = render_default_statusline(payload, decision) + " · " + badge
         sys.stdout.write(line)
