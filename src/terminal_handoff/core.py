@@ -109,6 +109,8 @@ STATE_DIRS = (
     "notifications",
     "sessions",
     "recoveries",
+    "logical",
+    "remote",
 )
 
 TRUTHY = ("1", "true", "yes", "on")
@@ -2355,6 +2357,11 @@ CONTINUATION_BRIEF_FIELDS = (
 )
 
 
+def logical_id_from_env():
+    value = os.environ.get("CLAUDE_TERMINAL_HANDOFF_LOGICAL_SESSION", "").strip()
+    return value if logical_session_valid(value) else None
+
+
 def build_manifest(facts, decision, now=None):
     now = now if now is not None else time.time()
     chain_id = decision.get("chain_id") or uuid.uuid4().hex[:12]
@@ -2435,6 +2442,7 @@ def build_manifest(facts, decision, now=None):
             "expected_chain_id": chain_id,
             "generation": generation + 1,
         },
+        "logical_session_id": logical_id_from_env(),
         "continuation": {
             "policy": "automatic_after_ownership",
             "remote_control_requested": remote_control_enabled(),
@@ -2710,6 +2718,7 @@ PER_HANDOFF_ENV = (
     "CLAUDE_TERMINAL_HANDOFF_BASE_NAME",
     "CLAUDE_TERMINAL_HANDOFF_DISPLAY_NAME",
     "CLAUDE_TERMINAL_HANDOFF_TRANSFER",
+    "CLAUDE_TERMINAL_HANDOFF_LOGICAL_SESSION",
 )
 
 
@@ -2759,6 +2768,11 @@ def build_launch_script(manifest, argv, workdir, manifest_file, transfer_file=No
     ]
     if transfer_file:
         lines.append("export CLAUDE_TERMINAL_HANDOFF_TRANSFER=%s" % shlex.quote(transfer_file))
+    if logical_session_valid(manifest.get("logical_session_id")):
+        lines.append(
+            "export CLAUDE_TERMINAL_HANDOFF_LOGICAL_SESSION=%s"
+            % shlex.quote(manifest["logical_session_id"])
+        )
     lines += [
         "echo 'Terminal Handoff: generation %d of chain %s'"
         % (generation + 1, manifest.get("chain_id")),
@@ -3155,6 +3169,7 @@ def build_transfer_record(manifest, binding, now=None):
         "state": TRANSFER_LAUNCHING,
         "owner": TRANSFER_OWNER[TRANSFER_LAUNCHING],
         "chain_id": manifest.get("chain_id"),
+        "logical_session_id": manifest.get("logical_session_id"),
         "attempt_id": (manifest.get("trigger") or {}).get("attempt_id"),
         "parent_generation": manifest.get("generation"),
         "successor_generation": successor.get("generation"),
@@ -4481,6 +4496,14 @@ def recover_parent_stop_requested(path, record):
     return False, "parent still running after recovered stop request"
 
 
+def send_graceful_stop(pid):
+    """The single signalling call in Terminal Handoff. Never SIGKILL.
+
+    Callers must have re-proved the process identity immediately beforehand.
+    """
+    os.kill(pid, PARENT_STOP_SIGNAL)
+
+
 def request_parent_stop(path, record):
     """Send one graceful stop request to the exact bound parent process.
 
@@ -4577,7 +4600,7 @@ def request_parent_stop(path, record):
             return False, reason
         attempts += 1
         try:
-            os.kill(pid, PARENT_STOP_SIGNAL)
+            send_graceful_stop(pid)
         except OSError as exc:
             if exc.errno == errno.ESRCH:
                 transfer_transition(
@@ -5945,6 +5968,643 @@ def transfer_summary():
 
 
 # ---------------------------------------------------------------------------
+# Logical sessions: the durable control object above disposable Claude sessions
+# ---------------------------------------------------------------------------
+#
+# A logical session outlives every Claude process beneath it. Remote clients
+# address `logical_session_id` only, never a PID or a Claude session ID. The
+# registry record carries the STOP flag, the durable instruction inbox, the
+# owner fencing epoch and the remote-control state, so all of them survive
+# A -> B -> C handoffs and a Terminal Handoff process restart.
+
+LOGICAL_ID_RE = re.compile(r"^ls_[a-f0-9]{24}$")
+LOGICAL_SCHEMA_VERSION = 1
+
+LS_CREATING = "CREATING"
+LS_RUNNING = "RUNNING"
+LS_WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
+LS_PAUSED = "PAUSED"
+LS_STOPPED = "STOPPED"
+LS_COMPLETED = "COMPLETED"
+LS_FAILED = "FAILED"
+LS_ORPHANED = "ORPHANED"
+LS_RECOVERING = "RECOVERING"
+LS_STATES = (
+    LS_CREATING,
+    LS_RUNNING,
+    LS_WAITING_FOR_HUMAN,
+    LS_PAUSED,
+    LS_STOPPED,
+    LS_COMPLETED,
+    LS_FAILED,
+    LS_ORPHANED,
+    LS_RECOVERING,
+)
+LS_TERMINAL = (LS_COMPLETED, LS_FAILED)
+
+MAX_INSTRUCTION_CHARS = 8000
+MAX_IDEMPOTENCY_KEY = 80
+MAX_INBOX_KEPT = 300
+MAX_OUTPUT_LINES = 200
+MAX_OUTPUT_LINE_CHARS = 600
+
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bthd_[A-Za-z0-9._-]{8,}"),
+    re.compile(r"(?i)\b(password|passwd|token|secret|api[_-]?key|authorization|cookie)\b(\s*[=:]\s*)\S+"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+)
+
+
+def redact_secrets(text):
+    """Best-effort removal of credential-looking text before storage or display."""
+    text = str(text)
+    text = _SECRET_PATTERNS[0].sub(r"\1[redacted]", text)
+    text = _SECRET_PATTERNS[1].sub("[redacted]", text)
+    text = _SECRET_PATTERNS[2].sub("[redacted]", text)
+    text = _SECRET_PATTERNS[3].sub(lambda m: "%s%s[redacted]" % (m.group(1), m.group(2)), text)
+    text = _SECRET_PATTERNS[4].sub("[redacted private key]", text)
+    return text
+
+
+def clean_untrusted_text(value, limit):
+    """Normalise untrusted remote text: str only, no NULs or control chars."""
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(ch for ch in value if ch in "\n\t" or (ord(ch) >= 32 and ord(ch) != 127))
+    cleaned = cleaned.strip()
+    if not cleaned or len(cleaned) > limit:
+        return None
+    return cleaned
+
+
+class LogicalRefusal(Exception):
+    """A logical-session operation refused before changing anything."""
+
+
+def logical_session_valid(lsid):
+    return isinstance(lsid, str) and bool(LOGICAL_ID_RE.match(lsid))
+
+
+def logical_path(lsid):
+    if not logical_session_valid(lsid):
+        raise ValueError("malformed logical session id")
+    return th_path("logical", "%s.json" % lsid)
+
+
+def logical_read(lsid):
+    if not logical_session_valid(lsid):
+        return None
+    data = read_json(logical_path(lsid))
+    return data if isinstance(data, dict) else None
+
+
+def logical_list():
+    directory = th_path("logical")
+    rows = []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return rows
+    for name in names:
+        if name.endswith(".json") and logical_session_valid(name[:-5]):
+            record = read_json(os.path.join(directory, name))
+            if isinstance(record, dict):
+                rows.append(record)
+    rows.sort(key=lambda r: r.get("created_epoch") or 0, reverse=True)
+    return rows
+
+
+def logical_find_by_agent_session(agent_session_id):
+    if not agent_session_id:
+        return None
+    for record in logical_list():
+        if (record.get("owner") or {}).get("agent_session_id") == agent_session_id:
+            return record
+    return None
+
+
+def logical_history(record, event, **fields):
+    entry = {"event": event, "ts": utc_stamp()}
+    entry.update(fields)
+    history = record.setdefault("history", [])
+    history.append(entry)
+    del history[:-100]
+
+
+def logical_create(
+    project=None,
+    repository=None,
+    branch=None,
+    created_by="local",
+    state=LS_CREATING,
+    launch_token_sha256=None,
+    launch_expires_epoch=None,
+    permissions_snapshot=None,
+    title=None,
+):
+    ensure_dirs()
+    lsid = "ls_" + uuid.uuid4().hex[:24]
+    now = time.time()
+    record = {
+        "schema_version": LOGICAL_SCHEMA_VERSION,
+        "logical_session_id": lsid,
+        "project": project,
+        "repository": repository,
+        "branch": branch,
+        "title": clean_untrusted_text(title, 200) if title else None,
+        "state": state,
+        "created_by": created_by,
+        "created_utc": utc_stamp(),
+        "created_epoch": now,
+        "owner": None,
+        "owner_epoch": 0,
+        "stop": {"active": False},
+        "paused": False,
+        "inbox": {"next_seq": 1, "messages": []},
+        "approvals": [],
+        "remote_control": {"state": REMOTE_UNKNOWN},
+        "permissions": permissions_snapshot,
+        "output": [],
+        "launch": {"token_sha256": launch_token_sha256, "expires_epoch": launch_expires_epoch},
+        "history": [],
+    }
+    logical_history(record, "created", by=created_by, project=project)
+    write_json_private(logical_path(lsid), record)
+    log_event("logical_session_created", logical_session_id=lsid, project=project, by=created_by)
+    return record
+
+
+def logical_mutate(lsid, mutator):
+    """Apply `mutator(record)` under the record lock.
+
+    Returns `(ok, reason, result, record)`. A mutator raises LogicalRefusal
+    before touching the record to refuse; nothing changes in that case.
+    """
+    if not logical_session_valid(lsid):
+        return False, "malformed logical session id", None, None
+    path = logical_path(lsid)
+    if not os.path.isfile(path):
+        return False, "unknown logical session", None, None
+    out = {"ok": False, "reason": None, "result": None}
+
+    def mutate(data):
+        try:
+            out["result"] = mutator(data)
+            out["ok"] = True
+            data["updated_utc"] = utc_stamp()
+        except LogicalRefusal as exc:
+            out["reason"] = str(exc)
+
+    record = update_json_locked(path, mutate)
+    return out["ok"], out["reason"], out["result"], record
+
+
+def _is_owner(record, agent_session_id):
+    owner = record.get("owner") or {}
+    return bool(agent_session_id) and owner.get("agent_session_id") == agent_session_id
+
+
+def _effective_active_state(record):
+    """The state a running session returns to after a pause or gate."""
+    if record.get("stop", {}).get("active"):
+        return LS_STOPPED
+    if record.get("paused"):
+        return LS_PAUSED
+    if any(a.get("status") == "pending" for a in record.get("approvals") or []):
+        return LS_WAITING_FOR_HUMAN
+    return LS_RUNNING
+
+
+def logical_register_owner(lsid, agent_session_id, generation=1, chain_id=None, binding=None,
+                           launch_token=None, transfer_file=None):
+    """Register the first owner of a logical session (remote-created sessions).
+
+    Fails unless the session is CREATING with no owner and the one-time launch
+    token is presented; the token is stored only as a hash.
+    """
+    token_hash = hashlib.sha256((launch_token or "").encode("utf-8")).hexdigest()
+
+    def mutate(record):
+        if record.get("state") != LS_CREATING or record.get("owner"):
+            raise LogicalRefusal("session is not awaiting its first owner")
+        launch = record.get("launch") or {}
+        if not launch.get("token_sha256"):
+            raise LogicalRefusal("no launch token was issued")
+        if launch.get("expires_epoch") and time.time() > float(launch["expires_epoch"]):
+            raise LogicalRefusal("launch token expired")
+        if not hmac.compare_digest(str(launch["token_sha256"]), token_hash):
+            raise LogicalRefusal("launch token mismatch")
+        record["owner_epoch"] = int(record.get("owner_epoch") or 0) + 1
+        record["owner"] = {
+            "agent_session_id": agent_session_id,
+            "generation": int(generation or 1),
+            "chain_id": chain_id,
+            "epoch": record["owner_epoch"],
+            "process": binding,
+            "transfer_file": transfer_file,
+            "since_utc": utc_stamp(),
+        }
+        record["launch"]["token_sha256"] = None  # single use
+        record["state"] = _effective_active_state(record)
+        logical_history(record, "owner_registered", generation=int(generation or 1), epoch=record["owner_epoch"])
+
+    ok, reason, _, record = logical_mutate(lsid, mutate)
+    if ok:
+        log_event("logical_owner_registered", logical_session_id=lsid, generation=generation)
+    return ok, reason, record
+
+
+def logical_adopt_successor(lsid, transfer_record, binding=None):
+    """Move logical ownership to the verified successor of a COMPLETE transfer.
+
+    The transfer's parent must be the registered owner. That is what stops a
+    forged or replayed link from moving ownership, and what makes A -> B -> C
+    a chain of single, fenced owners.
+    """
+    successor = (transfer_record.get("successor") or {})
+    successor_id = successor.get("session_id")
+
+    def mutate(record):
+        if transfer_record.get("state") != TRANSFER_COMPLETE or not successor_id:
+            raise LogicalRefusal("transfer is not complete")
+        owner = record.get("owner") or {}
+        if owner.get("agent_session_id") == successor_id:
+            return "already_owner"
+        if owner.get("agent_session_id") != transfer_record.get("parent_session_id"):
+            raise LogicalRefusal("the transfer's parent is not the registered owner")
+        if record.get("state") in LS_TERMINAL:
+            raise LogicalRefusal("logical session has ended")
+        record["owner_epoch"] = int(record.get("owner_epoch") or 0) + 1
+        record["owner"] = {
+            "agent_session_id": successor_id,
+            "generation": transfer_record.get("successor_generation"),
+            "chain_id": transfer_record.get("chain_id"),
+            "epoch": record["owner_epoch"],
+            "process": binding,
+            "transfer_file": None,
+            "previous_owner": owner.get("agent_session_id"),
+            "since_utc": utc_stamp(),
+        }
+        record["owner"]["transfer_file"] = transfer_path(transfer_record.get("parent_session_id"))
+        # Unacknowledged deliveries return to the queue for the new owner.
+        for message in record["inbox"]["messages"]:
+            if message.get("status") == "delivered":
+                message["status"] = "pending"
+                message["redelivered"] = int(message.get("redelivered") or 0) + 1
+                message["delivered_epoch"] = None
+        # A pending approval survives, re-bound to the new epoch (Stage 6).
+        for approval in record.get("approvals") or []:
+            if approval.get("status") in ("pending", "approved"):
+                approval["rebound_from_epoch"] = approval.get("bound_epoch")
+                approval["bound_epoch"] = record["owner_epoch"]
+        record["remote_control"] = {"state": REMOTE_UNKNOWN}  # re-verified for the new owner
+        # STOP, pause and the inbox are deliberately untouched.
+        logical_history(
+            record,
+            "ownership_changed",
+            epoch=record["owner_epoch"],
+            generation=transfer_record.get("successor_generation"),
+        )
+        return "adopted"
+
+    ok, reason, result, record = logical_mutate(lsid, mutate)
+    if ok and result == "adopted":
+        log_event(
+            "logical_ownership_changed",
+            logical_session_id=lsid,
+            chain_id=transfer_record.get("chain_id"),
+            generation=transfer_record.get("successor_generation"),
+        )
+    elif not ok:
+        log_event("logical_adoption_refused", logical_session_id=lsid, reason=reason)
+    return ok, reason, record
+
+
+# -- STOP / pause ----------------------------------------------------------
+
+
+def logical_stop(lsid, by="local", reason=None, hard=False):
+    """Set the logical STOP. Owned by the logical session, never by a PID."""
+    clean_reason = clean_untrusted_text(reason, 240) if reason else None
+
+    def mutate(record):
+        if record.get("state") in LS_TERMINAL:
+            raise LogicalRefusal("logical session has ended")
+        record["stop"] = {
+            "active": True,
+            "by": by,
+            "reason": clean_reason,
+            "since_utc": utc_stamp(),
+            "epoch_at_stop": record.get("owner_epoch"),
+        }
+        record["state"] = LS_STOPPED
+        logical_history(record, "stop", by=by)
+
+    ok, why, _, record = logical_mutate(lsid, mutate)
+    if ok:
+        log_event("logical_stop", logical_session_id=lsid, by=by)
+        if hard:
+            logical_hard_stop(lsid)
+            record = logical_read(lsid)
+    return ok, why, record
+
+
+def logical_hard_stop(lsid):
+    """Backstop: one graceful SIGTERM to the re-proved owner process.
+
+    Never a PID supplied by a caller. Never SIGKILL. Cooperative STOP already
+    holds regardless of the outcome here.
+    """
+    record = logical_read(lsid)
+    owner = (record or {}).get("owner") or {}
+    binding = owner.get("process")
+    result = {"attempted_utc": utc_stamp(), "outcome": None}
+    ok, reason = verify_parent_binding(
+        binding,
+        chain_id=owner.get("chain_id"),
+        generation=owner.get("generation"),
+        session_id=owner.get("agent_session_id"),
+    )
+    if not ok:
+        result["outcome"] = "not_signalled"
+        result["reason"] = reason
+    elif env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE") or env_flag("CLAUDE_TERMINAL_HANDOFF_STOP_DRY_RUN"):
+        result["outcome"] = "simulated"
+    else:
+        try:
+            send_graceful_stop(int(binding["pid"]))
+            result["outcome"] = "signalled"
+        except OSError as exc:
+            result["outcome"] = "not_signalled"
+            result["reason"] = str(exc)[:200]
+
+    def mutate(rec):
+        rec["hard_stop"] = result
+        logical_history(rec, "hard_stop", outcome=result["outcome"])
+
+    logical_mutate(lsid, mutate)
+    log_event("logical_hard_stop", logical_session_id=lsid, outcome=result["outcome"])
+    return result
+
+
+def logical_pause(lsid, by="local"):
+    def mutate(record):
+        if record.get("state") in LS_TERMINAL:
+            raise LogicalRefusal("logical session has ended")
+        if record.get("stop", {}).get("active"):
+            raise LogicalRefusal("session is stopped; clear STOP first")
+        record["paused"] = True
+        record["state"] = LS_PAUSED
+        logical_history(record, "pause", by=by)
+
+    ok, why, _, record = logical_mutate(lsid, mutate)
+    if ok:
+        log_event("logical_pause", logical_session_id=lsid, by=by)
+    return ok, why, record
+
+
+def logical_resume(lsid, by="local", clear_stop=False, reason=None):
+    """Resume from pause. Clearing STOP is a separate, explicit act."""
+    clean_reason = clean_untrusted_text(reason, 240) if reason else None
+
+    def mutate(record):
+        stopped = record.get("stop", {}).get("active")
+        if stopped and not clear_stop:
+            raise LogicalRefusal("session is STOPPED; resume requires explicit STOP clearance")
+        if stopped:
+            if not clean_reason:
+                raise LogicalRefusal("clearing STOP requires a reason")
+            record.setdefault("stop_history", []).append(
+                dict(record["stop"], cleared_utc=utc_stamp(), cleared_by=by, clear_reason=clean_reason)
+            )
+            record["stop"] = {"active": False}
+            logical_history(record, "stop_cleared", by=by)
+        elif not record.get("paused"):
+            raise LogicalRefusal("session is not paused or stopped")
+        record["paused"] = False
+        record["state"] = _effective_active_state(record)
+        logical_history(record, "resume", by=by)
+
+    ok, why, _, record = logical_mutate(lsid, mutate)
+    if ok:
+        log_event("logical_resume", logical_session_id=lsid, by=by, cleared_stop=bool(clear_stop))
+    return ok, why, record
+
+
+def logical_halt_reason(record):
+    """`stop`, `pause` or None: whether autonomous mutation must not proceed."""
+    if not record:
+        return None
+    if record.get("stop", {}).get("active"):
+        return "stop"
+    if record.get("paused"):
+        return "pause"
+    return None
+
+
+# -- Durable instruction inbox ----------------------------------------------
+
+
+def inbox_post(lsid, text, idempotency_key=None, source="local"):
+    """Queue one instruction. Durable, ordered, deduplicated by key."""
+    body = clean_untrusted_text(text, MAX_INSTRUCTION_CHARS)
+    if body is None:
+        return False, "instruction must be non-empty text of at most %d characters" % MAX_INSTRUCTION_CHARS, None
+    key = None
+    if idempotency_key is not None:
+        if not isinstance(idempotency_key, str) or not re.match(r"^[A-Za-z0-9._:-]{8,%d}$" % MAX_IDEMPOTENCY_KEY, idempotency_key):
+            return False, "malformed idempotency key", None
+        key = idempotency_key
+
+    def mutate(record):
+        if record.get("state") in LS_TERMINAL:
+            raise LogicalRefusal("logical session has ended")
+        inbox = record["inbox"]
+        if key:
+            for existing in inbox["messages"]:
+                if existing.get("idempotency_key") == key:
+                    return dict(existing, duplicate=True)
+        message = {
+            "id": "im_" + uuid.uuid4().hex[:16],
+            "seq": inbox["next_seq"],
+            "text": body,
+            "source": source,
+            "idempotency_key": key,
+            "created_utc": utc_stamp(),
+            "status": "pending",
+            "redelivered": 0,
+        }
+        inbox["next_seq"] += 1
+        inbox["messages"].append(message)
+        acked = [m for m in inbox["messages"] if m["status"] == "acked"]
+        while len(inbox["messages"]) > MAX_INBOX_KEPT and acked:
+            inbox["messages"].remove(acked.pop(0))
+        logical_history(record, "instruction_received", seq=message["seq"], source=source)
+        return dict(message, duplicate=False)
+
+    ok, why, message, _ = logical_mutate(lsid, mutate)
+    if ok and not message.get("duplicate"):
+        log_event("logical_instruction_received", logical_session_id=lsid, message_id=message["id"], seq=message["seq"])
+    return ok, why, message
+
+
+def inbox_claim(lsid, agent_session_id, limit=20):
+    """Deliver pending instructions, in order, to the current owner only."""
+
+    def mutate(record):
+        if not _is_owner(record, agent_session_id):
+            raise LogicalRefusal("not the current owner of this logical session")
+        if logical_halt_reason(record):
+            raise LogicalRefusal("halted:%s" % logical_halt_reason(record))
+        epoch = record.get("owner_epoch")
+        claimed = []
+        for message in record["inbox"]["messages"]:
+            if message["status"] == "pending" and len(claimed) < limit:
+                message["status"] = "delivered"
+                message["delivered_epoch"] = epoch
+                message["delivered_utc"] = utc_stamp()
+                claimed.append(dict(message))
+        if claimed:
+            logical_history(record, "instructions_delivered", count=len(claimed), epoch=epoch)
+        return claimed
+
+    return logical_mutate(lsid, mutate)[:3]
+
+
+def inbox_ack(lsid, agent_session_id, message_id):
+    def mutate(record):
+        if not _is_owner(record, agent_session_id):
+            raise LogicalRefusal("not the current owner of this logical session")
+        for message in record["inbox"]["messages"]:
+            if message["id"] == message_id:
+                if message["status"] == "acked":
+                    return "already_acked"
+                if message["status"] != "delivered" or message.get("delivered_epoch") != record.get("owner_epoch"):
+                    raise LogicalRefusal("message was not delivered to the current owner")
+                message["status"] = "acked"
+                message["acked_utc"] = utc_stamp()
+                logical_history(record, "instruction_acked", seq=message["seq"])
+                return "acked"
+        raise LogicalRefusal("unknown message")
+
+    ok, why, result, _ = logical_mutate(lsid, mutate)
+    if ok and result == "acked":
+        log_event("logical_instruction_acked", logical_session_id=lsid, message_id=message_id)
+    return ok, why, result
+
+
+def logical_append_output(lsid, agent_session_id, text):
+    line = clean_untrusted_text(str(text)[:MAX_OUTPUT_LINE_CHARS * 2], MAX_OUTPUT_LINE_CHARS * 2)
+    if line is None:
+        return False, "empty output", None
+    line = redact_secrets(line)[:MAX_OUTPUT_LINE_CHARS]
+
+    def mutate(record):
+        if not _is_owner(record, agent_session_id):
+            raise LogicalRefusal("not the current owner of this logical session")
+        record["output"].append({"ts": utc_stamp(), "text": line})
+        del record["output"][:-MAX_OUTPUT_LINES]
+
+    ok, why, _, _ = logical_mutate(lsid, mutate)
+    return ok, why, None
+
+
+def logical_public_view(record):
+    """What a remote client may see. No PIDs, bindings, hashes or paths."""
+    owner = record.get("owner") or {}
+    inbox = (record.get("inbox") or {}).get("messages") or []
+    return {
+        "logical_session_id": record.get("logical_session_id"),
+        "project": record.get("project"),
+        "branch": record.get("branch"),
+        "title": record.get("title"),
+        "state": record.get("state"),
+        "created_utc": record.get("created_utc"),
+        "updated_utc": record.get("updated_utc"),
+        "owner": {
+            "generation": owner.get("generation"),
+            "epoch": owner.get("epoch"),
+            "since_utc": owner.get("since_utc"),
+        }
+        if owner
+        else None,
+        "stop": {k: v for k, v in (record.get("stop") or {}).items() if k in ("active", "reason", "since_utc", "by")},
+        "paused": bool(record.get("paused")),
+        "remote_control": {k: v for k, v in (record.get("remote_control") or {}).items() if k in ("state", "detail", "checked_utc")},
+        "inbox": {
+            "pending": sum(1 for m in inbox if m["status"] == "pending"),
+            "delivered": sum(1 for m in inbox if m["status"] == "delivered"),
+            "acked": sum(1 for m in inbox if m["status"] == "acked"),
+        },
+        "recent_output": list(record.get("output") or [])[-20:],
+    }
+
+
+def logical_link_for_agent(lsid_hint, agent_session_id):
+    """Resolve the logical session an agent acts for, or None."""
+    if lsid_hint and logical_session_valid(lsid_hint):
+        return lsid_hint
+    found = logical_find_by_agent_session(agent_session_id)
+    return found.get("logical_session_id") if found else None
+
+
+def cmd_session(args):
+    action = args.action
+    agent = getattr(args, "session_id", None) or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    lsid = args.logical_session or os.environ.get("CLAUDE_TERMINAL_HANDOFF_LOGICAL_SESSION", "").strip() or None
+    if action == "list":
+        print(json.dumps([logical_public_view(r) for r in logical_list()], indent=2, sort_keys=True))
+        return 0
+    if action in ("inbox", "ack", "note", "check"):
+        lsid = logical_link_for_agent(lsid, agent)
+    if not lsid:
+        print(json.dumps({"error": "no logical session"}))
+        return 2
+    record = logical_read(lsid)
+    if record is None:
+        print(json.dumps({"error": "unknown logical session"}))
+        return 2
+    out = {"logical_session_id": lsid}
+    ok, why = True, None
+    if action == "show":
+        out = logical_public_view(record)
+    elif action == "stop":
+        ok, why, _ = logical_stop(lsid, by="local", reason=args.reason, hard=args.hard)
+    elif action == "pause":
+        ok, why, _ = logical_pause(lsid, by="local")
+    elif action == "resume":
+        ok, why, _ = logical_resume(lsid, by="local", clear_stop=args.clear_stop, reason=args.reason)
+    elif action == "post":
+        ok, why, message = inbox_post(lsid, args.text, args.key, source="local")
+        out["message"] = message
+    elif action == "inbox":
+        ok, why, claimed = inbox_claim(lsid, agent)
+        out["messages"] = claimed or []
+        if not ok and str(why).startswith("halted:"):
+            out["directive"] = "HALT"
+            out["halt"] = why.split(":", 1)[1]
+    elif action == "ack":
+        ok, why, result = inbox_ack(lsid, agent, args.message_id)
+        out["result"] = result
+    elif action == "note":
+        ok, why, _ = logical_append_output(lsid, agent, args.text or "")
+    elif action == "check":
+        halt = logical_halt_reason(record)
+        out["directive"] = "HALT" if halt else "CONTINUE"
+        out["halt"] = halt
+        out["is_owner"] = _is_owner(record, agent)
+        out["pending_instructions"] = logical_public_view(record)["inbox"]["pending"]
+    if not ok:
+        out["error"] = why
+    if action != "show" or True:
+        out.setdefault("state", (logical_read(lsid) or {}).get("state"))
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0 if ok else 3
+
+
+# ---------------------------------------------------------------------------
 # Automatic continuation and remote-control readiness
 # ---------------------------------------------------------------------------
 #
@@ -5986,6 +6646,7 @@ DIRECTIVE_WAIT = "WAIT"
 DIRECTIVE_CONTINUE = "CONTINUE"
 DIRECTIVE_HOLD = "HOLD_FOR_HUMAN"
 DIRECTIVE_STOP = "STOP"
+DIRECTIVE_HALT = "HALT"
 
 # Notification kinds that need a human. They follow the routing of `failed`.
 ATTENTION_KINDS = ("human_gate", "remote_degraded")
@@ -6169,7 +6830,30 @@ def _remote_summary(cont):
 
 
 def continuation_report(record, session_id):
-    """The machine-readable answer a successor acts on."""
+    """The machine-readable answer a successor acts on, with STOP/pause applied."""
+    report = _continuation_report_base(record, session_id)
+    lsid = (record or {}).get("logical_session_id")
+    lrec = logical_read(lsid) if lsid else None
+    if lrec:
+        report["logical_session_id"] = lsid
+        report["logical_state"] = lrec.get("state")
+        adoption = ((record.get("continuation") or {}).get("logical_adoption")) or {}
+        if adoption.get("ok") is False and report["directive"] != DIRECTIVE_STOP:
+            report["directive"] = DIRECTIVE_STOP
+            report["reason"] = "logical ownership was refused: %s. Do not mutate." % adoption.get("reason")
+        halt = logical_halt_reason(lrec)
+        if halt and report["directive"] != DIRECTIVE_STOP:
+            report["directive"] = DIRECTIVE_HALT
+            report["halt"] = halt
+            report["reason"] = (
+                "the logical session is %s; perform no further autonomous mutation until it is "
+                "deliberately resumed" % ("STOPPED" if halt == "stop" else "PAUSED")
+            )
+    return report
+
+
+def _continuation_report_base(record, session_id):
+    """The base directive from the transfer state alone."""
     state = (record or {}).get("state")
     phase = continuation_phase(record)
     report = {
@@ -6211,6 +6895,24 @@ def continuation_report(record, session_id):
     return report
 
 
+def _adopt_logical_ownership(path, session_id, record):
+    """After TRANSFER_COMPLETE, fence the logical session over to this successor."""
+    lsid = record.get("logical_session_id")
+    if not lsid or not logical_session_valid(lsid):
+        return record
+    lrec = logical_read(lsid)
+    if lrec is None or (lrec.get("owner") or {}).get("agent_session_id") == session_id:
+        return record
+    binding, _ = bind_parent_claude_process(session_id, (lrec or {}).get("repository"))
+    ok, reason, _ = logical_adopt_successor(lsid, record, binding)
+
+    def note(cont, data):
+        cont["logical_adoption"] = {"ok": bool(ok), "reason": reason, "ts": utc_stamp()}
+
+    _, _, updated = continuation_mutate(path, session_id, note)
+    return updated or record
+
+
 def continuation_advance(path, session_id):
     """Verify Remote Control once ownership is the successor's, then run.
 
@@ -6221,6 +6923,7 @@ def continuation_advance(path, session_id):
     record = read_transfer(path) if path else None
     if not _continuation_authorised(record or {}, session_id):
         return record
+    record = _adopt_logical_ownership(path, session_id, record) or record
     phase = continuation_phase(record)
     if phase not in CONT_PRE_VERIFY_PHASES:
         return record
@@ -6398,7 +7101,7 @@ def cmd_continuation(args):
     else:  # status
         report = continuation_report(read_transfer(path), session_id)
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report["directive"] in (DIRECTIVE_CONTINUE, DIRECTIVE_WAIT, DIRECTIVE_HOLD) else 3
+    return 0 if report["directive"] in (DIRECTIVE_CONTINUE, DIRECTIVE_WAIT, DIRECTIVE_HOLD, DIRECTIVE_HALT) else 3
 
 
 def cmd_supervise(args):
@@ -6700,6 +7403,24 @@ def main(argv=None):
     p.add_argument("--reason", default=None)
     p.add_argument("--requested-action", default=None)
     p.set_defaults(func=cmd_continuation)
+
+    p = sub.add_parser(
+        "session",
+        help="Logical sessions: list, show, stop, pause, resume, post an instruction, agent inbox",
+    )
+    p.add_argument(
+        "action",
+        choices=("list", "show", "stop", "pause", "resume", "post", "inbox", "ack", "note", "check"),
+    )
+    p.add_argument("--logical-session", default=None)
+    p.add_argument("--session-id", default=None)
+    p.add_argument("--reason", default=None)
+    p.add_argument("--hard", action="store_true", help="also gracefully stop the verified owner process")
+    p.add_argument("--clear-stop", action="store_true")
+    p.add_argument("--text", default=None)
+    p.add_argument("--key", default=None)
+    p.add_argument("--message-id", default=None)
+    p.set_defaults(func=cmd_session)
 
     p = sub.add_parser("build-command", help="Print the successor launch argv for a manifest")
     p.add_argument("--manifest", required=True)

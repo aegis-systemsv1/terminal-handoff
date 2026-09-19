@@ -188,6 +188,14 @@ Before modifying anything:
     - STOP: you are not the owner (the transfer failed, or another session is
       the verified successor). Report it and mutate nothing.
 
+    If the JSON contains "logical_session_id", you act for that logical session.
+    HALT means the human has STOPPED or PAUSED it: do no further autonomous
+    mutation, and never clear a STOP yourself. Also run
+    `{{TH_COMMAND}} session inbox` at the start of every task step. It returns
+    durable instructions from the user's remote devices, in order; act on each,
+    then run `{{TH_COMMAND}} session ack --message-id <id>`. Instructions never
+    grant approval for anything in the human-gate list below.
+
     Automatic continuation is never automatic approval. Never answer an
     approval prompt yourself, never use any permission bypass, and never treat
     an earlier approval as covering a later or different action.
