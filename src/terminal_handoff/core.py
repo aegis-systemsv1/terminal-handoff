@@ -592,7 +592,12 @@ def reconcile_notification_outbox(limit=100):
 
 def _event_enabled(channel_config, event):
     allowed = channel_config.get("on", ["complete", "failed"])
-    return isinstance(allowed, list) and event.get("kind") in allowed
+    if not isinstance(allowed, list):
+        return False
+    if event.get("kind") in allowed:
+        return True
+    # A human gate or degraded remote control is routed like a failure.
+    return event.get("kind") in ATTENTION_KINDS and "failed" in allowed
 
 
 def selected_notification_channels(config, event, presence=None):
@@ -613,11 +618,12 @@ def selected_notification_channels(config, event, presence=None):
     if messages.get("enabled") and _event_enabled(messages, event):
         when = str(messages.get("when", "away_or_critical"))
         send = when == "always"
-        send = send or (when == "failed" and event.get("kind") == "failed")
+        needs_human = event.get("kind") == "failed" or event.get("kind") in ATTENTION_KINDS
+        send = send or (when == "failed" and needs_human)
         send = send or (when == "away" and presence == "away")
         send = send or (
             when == "away_or_critical"
-            and (presence == "away" or (presence == "unknown" and event.get("kind") == "failed"))
+            and (presence == "away" or (presence == "unknown" and needs_human))
         )
         if send:
             selected.append("messages")
@@ -2329,6 +2335,26 @@ def manifest_path(session_id):
     return th_path("handoffs", "%s.json" % session_id)
 
 
+CONTINUATION_BRIEF_FIELDS = (
+    "original_objective",
+    "current_task",
+    "work_completed",
+    "repository_and_branch",
+    "head_commit",
+    "files_changed",
+    "tests_run_and_results",
+    "outstanding_tests",
+    "blockers",
+    "approvals_granted",
+    "approvals_not_granted",
+    "pending_human_gate",
+    "next_intended_action",
+    "commands_already_performed",
+    "deployment_state",
+    "warnings_and_safety_constraints",
+)
+
+
 def build_manifest(facts, decision, now=None):
     now = now if now is not None else time.time()
     chain_id = decision.get("chain_id") or uuid.uuid4().hex[:12]
@@ -2409,6 +2435,27 @@ def build_manifest(facts, decision, now=None):
             "expected_chain_id": chain_id,
             "generation": generation + 1,
         },
+        "continuation": {
+            "policy": "automatic_after_ownership",
+            "remote_control_requested": remote_control_enabled(),
+            "ownership": {
+                "chain_id": chain_id,
+                "parent_generation": generation,
+                "successor_generation": generation + 1,
+                "parent_session_id": facts.session_id,
+                "transfer_path": transfer_path(facts.session_id),
+            },
+            "pending_human_gate": None,
+            "authority": {
+                "approvals_granted": [],
+                "approvals_not_granted": "everything not explicitly recorded in the brief",
+                "rule": (
+                    "An approval covers only the exact action it named. It is never "
+                    "blanket approval for a later or different action."
+                ),
+            },
+            "required_brief_fields": list(CONTINUATION_BRIEF_FIELDS),
+        },
         "validation_warnings": list(facts.warnings) + list(decision.get("warnings") or []),
         "security": {
             "stores_secrets": False,
@@ -2484,7 +2531,13 @@ def build_launch_argv(manifest, claude_bin, prompt_text):
     if not isinstance(model_id, str) or not MODEL_ID_RE.match(model_id):
         raise ValueError("refusing to launch: model id is missing or unsafe")
 
-    argv = [claude_bin, "--model", model_id]
+    argv = [claude_bin]
+    if remote_control_enabled():
+        # Remote Control is requested at launch so the successor is reachable
+        # from claude.ai/code or the mobile app. Its health is verified after
+        # ownership transfers; it grants no permission and bypasses no prompt.
+        argv.append("--remote-control")
+    argv += ["--model", model_id]
 
     if effort_available:
         if effort not in ALLOWED_EFFORT_LEVELS:
@@ -2581,6 +2634,8 @@ def render_successor_prompt(manifest, template_path=None):
         "{{WORKING_DIRECTORY}}": str((manifest.get("outgoing") or {}).get("current_dir")),
         "{{THRESHOLD}}": str(manifest.get("trigger", {}).get("configured_threshold")),
         "{{TH_VERSION}}": TERMINAL_HANDOFF_VERSION,
+        "{{TH_COMMAND}}": "%s %s"
+        % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__))),
     }
     rendered = template
     for key, value in values.items():
@@ -2606,7 +2661,12 @@ always allowed.
 
 Read the manifest, delegate parent-transcript analysis to a context-isolated
 subagent, verify repository state independently, then produce a TERMINAL HANDOFF
-CONTINUATION REPORT before continuing any work.
+CONTINUATION REPORT, then run:
+    {{TH_COMMAND}} continuation wait --timeout 30
+repeatedly until the directive is not WAIT. CONTINUE means resume the unfinished
+authorised work at once; HOLD_FOR_HUMAN and STOP mean do not mutate. Continuation
+is never approval: never answer approval prompts or bypass permissions. At a real
+human gate run `{{TH_COMMAND}} continuation gate --reason ... --requested-action ...`.
 """
 
 
@@ -3173,6 +3233,20 @@ def transfer_transition(path, target, reason=None, **fields):
             chain_id=(outcome["record"] or {}).get("chain_id"),
             parent_session_id=(outcome["record"] or {}).get("parent_session_id"),
         )
+        audit_event = {
+            TRANSFER_SUCCESSOR_VERIFIED: "successor_ready",
+            TRANSFER_PARENT_STOP_REQUESTED: "ownership_transfer_started",
+            TRANSFER_COMPLETE: "parent_ownership_released",
+            TRANSFER_FAILED: "recovery_path_entered",
+        }.get(target)
+        if audit_event:
+            log_event(
+                audit_event,
+                chain_id=(outcome["record"] or {}).get("chain_id"),
+                parent_session_id=(outcome["record"] or {}).get("parent_session_id"),
+                successor_session_id=((outcome["record"] or {}).get("successor") or {}).get("session_id"),
+                generation=(outcome["record"] or {}).get("successor_generation"),
+            )
         if target in (TRANSFER_COMPLETE, TRANSFER_FAILED):
             try:
                 enqueue_notification(
@@ -3647,6 +3721,13 @@ def perform_launch(payload_file, launch_mode="automatic", launch_identity=None):
 
     transfer_file = transfer_path(session_id)
     write_json_private(transfer_file, build_transfer_record(manifest, binding))
+    log_event(
+        "handoff_requested",
+        session_id=session_id,
+        chain_id=chain_id,
+        generation=generation,
+        launch_mode=launch_mode,
+    )
 
     script_file = th_path("launching", "%s.launch.sh" % session_id)
     write_private(
@@ -3671,6 +3752,8 @@ def perform_launch(payload_file, launch_mode="automatic", launch_identity=None):
     )
     record_launch(session_id, chain_id, generation)
     result = launch_terminal(manifest, script_file, title, test_mode)
+    if result.get("launched") or result.get("simulated") or test_mode:
+        log_event("successor_spawned", session_id=session_id, chain_id=chain_id, generation=generation + 1)
 
     launch_record = {
         "session_id": session_id,
@@ -5851,9 +5934,471 @@ def transfer_summary():
                 "owner": TRANSFER_OWNER.get(state, record.get("owner")),
                 "successor_display_name": record.get("successor_display_name"),
                 "parent_stopped": record.get("parent_stopped"),
+                "phase": continuation_phase(record),
+                "remote_control": ((record.get("continuation") or {}).get("remote_control") or {}).get("state"),
+                "waiting_for_human": bool(
+                    ((record.get("continuation") or {}).get("human_gate") or {}).get("waiting_for_human")
+                ),
             }
         )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Automatic continuation and remote-control readiness
+# ---------------------------------------------------------------------------
+#
+# Ownership is still decided only by the transfer state machine above. This
+# section adds what happens AFTER TRANSFER_COMPLETE: the successor verifies
+# that Remote Control is really registered, then continues the unfinished,
+# already-authorised work. It records a machine-readable human gate when a real
+# authority boundary is reached. Nothing here can create, move or widen
+# ownership, and nothing here answers an approval prompt.
+
+CONT_PREPARING_SUCCESSOR = "PREPARING_SUCCESSOR"
+CONT_SUCCESSOR_READY = "SUCCESSOR_READY"
+CONT_OWNERSHIP_TRANSFERRING = "OWNERSHIP_TRANSFERRING"
+CONT_SUCCESSOR_OWNER = "SUCCESSOR_OWNER"
+CONT_REMOTE_VERIFYING = "REMOTE_CONTROL_VERIFYING"
+CONT_RUNNING = "RUNNING"
+CONT_WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
+CONT_DEGRADED_REMOTE = "DEGRADED_REMOTE"
+CONT_FAILED = "FAILED"
+
+# Phases in which the successor is the sole owner and may act.
+CONT_ACTIVE_PHASES = (CONT_RUNNING, CONT_DEGRADED_REMOTE)
+CONT_PRE_VERIFY_PHASES = (CONT_SUCCESSOR_OWNER, CONT_REMOTE_VERIFYING)
+
+CONT_PRE_OWNERSHIP_PHASE = {
+    TRANSFER_LAUNCHING: CONT_PREPARING_SUCCESSOR,
+    TRANSFER_SUCCESSOR_VERIFIED: CONT_SUCCESSOR_READY,
+    TRANSFER_PARENT_STOP_REQUESTED: CONT_OWNERSHIP_TRANSFERRING,
+    TRANSFER_FAILED: CONT_FAILED,
+}
+
+REMOTE_UNKNOWN = "unknown"
+REMOTE_VERIFYING = "verifying"
+REMOTE_HEALTHY = "healthy"
+REMOTE_DEGRADED = "degraded"
+REMOTE_DISABLED = "disabled"
+
+DIRECTIVE_WAIT = "WAIT"
+DIRECTIVE_CONTINUE = "CONTINUE"
+DIRECTIVE_HOLD = "HOLD_FOR_HUMAN"
+DIRECTIVE_STOP = "STOP"
+
+# Notification kinds that need a human. They follow the routing of `failed`.
+ATTENTION_KINDS = ("human_gate", "remote_degraded")
+
+DEFAULT_REMOTE_VERIFY_SECONDS = 20.0
+
+
+def remote_control_enabled():
+    """Remote Control is on by default; `...REMOTE_CONTROL=0` turns it off."""
+    raw = os.environ.get("CLAUDE_TERMINAL_HANDOFF_REMOTE_CONTROL")
+    if raw is None or raw.strip() == "":
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def remote_verify_seconds():
+    value = env_float("CLAUDE_TERMINAL_HANDOFF_REMOTE_VERIFY_SECONDS", DEFAULT_REMOTE_VERIFY_SECONDS)
+    return value if value >= 0 else DEFAULT_REMOTE_VERIFY_SECONDS
+
+
+def claude_sessions_dir():
+    explicit = os.environ.get("CLAUDE_TERMINAL_HANDOFF_CLAUDE_SESSIONS_DIR", "").strip()
+    if explicit:
+        return explicit
+    config = os.environ.get("CLAUDE_CONFIG_DIR", "").strip() or os.path.join(
+        os.path.expanduser("~"), ".claude"
+    )
+    return os.path.join(config, "sessions")
+
+
+def _pid_alive(pid):
+    """Liveness by process-group lookup; never a signalling call."""
+    try:
+        os.getpgid(int(pid))
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError, TypeError, OverflowError):
+        return isinstance(pid, int) and pid > 0
+    return True
+
+
+def probe_remote_control(session_id, sessions_dir=None):
+    """Return `(healthy, detail)` from Claude Code's own live session record.
+
+    Remote Control is healthy only when a live process owns a session record
+    for exactly this session ID and that record carries a registered bridge
+    session. The bridge identifier itself is never returned, stored or logged.
+    """
+    if not session_id:
+        return False, "no session id to verify"
+    directory = sessions_dir or claude_sessions_dir()
+    try:
+        names = sorted(name for name in os.listdir(directory) if name.endswith(".json"))
+    except OSError:
+        return False, "Claude session records are unreadable"
+    for name in names:
+        record = read_json(os.path.join(directory, name))
+        if not isinstance(record, dict) or record.get("sessionId") != session_id:
+            continue
+        if not _pid_alive(record.get("pid")):
+            return False, "the session's Claude process is not alive"
+        bridge = record.get("bridgeSessionId")
+        if isinstance(bridge, str) and bridge:
+            return True, "Remote Control bridge is registered for this session"
+        return False, "the live session has no Remote Control bridge registered"
+    return False, "no live Claude session record matches this session"
+
+
+def verify_remote_control(session_id, budget=None, sleep=time.sleep):
+    """Poll the real registration until it appears or the budget is spent."""
+    budget = remote_verify_seconds() if budget is None else budget
+    deadline = time.time() + budget
+    attempts = 0
+    while True:
+        attempts += 1
+        healthy, detail = probe_remote_control(session_id)
+        if healthy or time.time() >= deadline:
+            return {"healthy": healthy, "detail": detail, "attempts": attempts}
+        sleep(1.0)
+
+
+def continuation_phase(record):
+    """The single lifecycle phase for a transfer record."""
+    state = (record or {}).get("state")
+    if state == TRANSFER_COMPLETE:
+        return ((record.get("continuation") or {}).get("phase")) or CONT_SUCCESSOR_OWNER
+    return CONT_PRE_OWNERSHIP_PHASE.get(state, CONT_PREPARING_SUCCESSOR)
+
+
+def _continuation_authorised(record, session_id):
+    """Only the verified successor of a COMPLETE transfer may continue."""
+    return (
+        bool(session_id)
+        and (record or {}).get("state") == TRANSFER_COMPLETE
+        and ((record.get("successor") or {}).get("session_id")) == session_id
+    )
+
+
+def _continuation_defaults():
+    return {
+        "phase": CONT_SUCCESSOR_OWNER,
+        "remote_control": {"state": REMOTE_UNKNOWN, "attempts": 0},
+        "human_gate": {"waiting_for_human": False, "resume_capable": True},
+        "gates_history": [],
+        "history": [],
+    }
+
+
+def continuation_mutate(path, session_id, mutator):
+    """Apply `mutator(continuation, record)` only for the authorised successor.
+
+    Returns `(ok, reason, record)`. Refusal leaves the record untouched, which
+    is what keeps a stray, duplicate or second successor from continuing.
+    """
+    outcome = {"ok": False, "reason": None, "record": None}
+
+    def mutate(data):
+        if not _continuation_authorised(data, session_id):
+            outcome["reason"] = "not the verified successor of a completed transfer"
+            outcome["record"] = dict(data)
+            return
+        cont = data.get("continuation")
+        if not isinstance(cont, dict):
+            cont = _continuation_defaults()
+            data["continuation"] = cont
+        before = cont.get("phase")
+        mutator(cont, data)
+        cont["updated_utc"] = utc_stamp()
+        if cont.get("phase") != before:
+            history = cont.setdefault("history", [])
+            history.append({"phase": cont.get("phase"), "from": before, "ts": utc_stamp()})
+            del history[:-40]
+        outcome["ok"] = True
+        outcome["record"] = dict(data)
+
+    if not path or not os.path.isfile(path):
+        return False, "transfer record not found", None
+    update_json_locked(path, mutate)
+    return outcome["ok"], outcome["reason"], outcome["record"]
+
+
+def attention_notification_event(record, kind, headline, detail, key):
+    successor = _safe_notification_text(record.get("successor_display_name") or "Session B", 120)
+    message = "%s: %s. %s" % (successor, _safe_notification_text(headline, 200), _safe_notification_text(detail, 240))
+    return {
+        "schema_version": NOTIFICATION_SCHEMA_VERSION,
+        "event_id": _notification_event_id(
+            kind, record.get("parent_session_id"), record.get("attempt_id"), key
+        ),
+        "event_type": "terminal_handoff.%s" % kind,
+        "kind": kind,
+        "title": "Terminal Handoff %s" % ("needs you" if kind == "human_gate" else "remote control degraded"),
+        "message": _safe_notification_text(message),
+        "urgency": "critical",
+        "chain_id": _safe_notification_text(record.get("chain_id"), 32),
+        "parent_generation": record.get("parent_generation"),
+        "successor_generation": record.get("successor_generation"),
+        "parent_display_name": _safe_notification_text(record.get("parent_display_name") or "Session A", 120),
+        "successor_display_name": successor,
+        "owner": record.get("owner"),
+        "suggested_channels": ["local", "push", "sms"],
+        "routing_hint": "sms_when_away_or_unknown",
+        "created_utc": utc_stamp(),
+        "created_epoch": time.time(),
+    }
+
+
+def _notify_attention(record, kind, headline, detail, key):
+    """Queue one deduplicated attention event. A failure never blocks work."""
+    try:
+        enqueue_notification(attention_notification_event(record, kind, headline, detail, key))
+        return True
+    except Exception as exc:
+        log_event("notification_enqueue_failed", kind=kind, error=str(exc)[:300])
+        return False
+
+
+def _remote_summary(cont):
+    remote = cont.get("remote_control") or {}
+    return {"state": remote.get("state"), "detail": remote.get("detail"), "attempts": remote.get("attempts")}
+
+
+def continuation_report(record, session_id):
+    """The machine-readable answer a successor acts on."""
+    state = (record or {}).get("state")
+    phase = continuation_phase(record)
+    report = {
+        "directive": DIRECTIVE_WAIT,
+        "phase": phase,
+        "transfer_state": state,
+        "owner": (record or {}).get("owner"),
+        "chain_id": (record or {}).get("chain_id"),
+        "presence": notification_presence(),
+        "session_id": session_id,
+    }
+    if state == TRANSFER_FAILED:
+        report["directive"] = DIRECTIVE_STOP
+        report["reason"] = "transfer failed; the parent still owns the work. Do not mutate."
+        return report
+    recorded = ((record or {}).get("successor") or {}).get("session_id")
+    if recorded and session_id and recorded != session_id:
+        report["directive"] = DIRECTIVE_STOP
+        report["reason"] = "another session is the verified successor. Do not mutate."
+        return report
+    if state != TRANSFER_COMPLETE:
+        report["reason"] = "the parent still owns the work; read-only preparation only"
+        return report
+    cont = record.get("continuation") or {}
+    report["remote_control"] = _remote_summary(cont)
+    gate = cont.get("human_gate") or {}
+    if phase == CONT_WAITING_FOR_HUMAN:
+        report["directive"] = DIRECTIVE_HOLD
+        report["human_gate"] = {
+            key: gate.get(key)
+            for key in ("waiting_for_human", "reason", "requested_action", "resume_capable", "gate_id", "raised_utc")
+        }
+        report["reason"] = "waiting for a human decision; do not perform the gated action"
+    elif phase in CONT_ACTIVE_PHASES:
+        report["directive"] = DIRECTIVE_CONTINUE
+        report["reason"] = "you own the session; resume the unfinished authorised work now"
+    else:
+        report["reason"] = "ownership acquired; verifying remote control"
+    return report
+
+
+def continuation_advance(path, session_id):
+    """Verify Remote Control once ownership is the successor's, then run.
+
+    Idempotent, and it only ever moves forward from SUCCESSOR_OWNER. A remote
+    control failure records DEGRADED_REMOTE and continues: the healthy
+    successor is never killed for a channel fault.
+    """
+    record = read_transfer(path) if path else None
+    if not _continuation_authorised(record or {}, session_id):
+        return record
+    phase = continuation_phase(record)
+    if phase not in CONT_PRE_VERIFY_PHASES:
+        return record
+
+    def begin(cont, data):
+        if cont.get("phase") == CONT_SUCCESSOR_OWNER:
+            cont["phase"] = CONT_REMOTE_VERIFYING
+            cont["owner_since_utc"] = cont.get("owner_since_utc") or utc_stamp()
+            cont["presence"] = notification_presence()
+            cont["remote_control"] = {"state": REMOTE_VERIFYING, "attempts": 0}
+
+    _, _, record = continuation_mutate(path, session_id, begin)
+    log_event(
+        "successor_ownership_acquired",
+        session_id=session_id,
+        chain_id=(record or {}).get("chain_id"),
+        generation=(record or {}).get("successor_generation"),
+    )
+
+    if not remote_control_enabled():
+        result = {"healthy": False, "detail": "remote control disabled by configuration", "attempts": 0, "disabled": True}
+    else:
+        log_event("remote_control_activation_attempted", session_id=session_id)
+        result = verify_remote_control(session_id)
+
+    def commit(cont, data):
+        if cont.get("phase") not in CONT_PRE_VERIFY_PHASES:
+            return
+        healthy = bool(result["healthy"])
+        disabled = bool(result.get("disabled"))
+        cont["remote_control"] = {
+            "state": REMOTE_HEALTHY if healthy else (REMOTE_DISABLED if disabled else REMOTE_DEGRADED),
+            "detail": result["detail"],
+            "attempts": result["attempts"],
+            "checked_utc": utc_stamp(),
+        }
+        cont["phase"] = CONT_RUNNING if (healthy or disabled) else CONT_DEGRADED_REMOTE
+        cont["automatic_continuation_started_utc"] = utc_stamp()
+
+    _, _, record = continuation_mutate(path, session_id, commit)
+    remote = ((record or {}).get("continuation") or {}).get("remote_control") or {}
+    if remote.get("state") == REMOTE_HEALTHY:
+        log_event("remote_control_verified", session_id=session_id, chain_id=(record or {}).get("chain_id"))
+    elif remote.get("state") == REMOTE_DEGRADED:
+        log_event(
+            "remote_control_degraded",
+            session_id=session_id,
+            chain_id=(record or {}).get("chain_id"),
+            detail=remote.get("detail"),
+        )
+        _notify_attention(
+            record,
+            "remote_degraded",
+            "remote control could not be verified",
+            "The session is healthy and continuing. Detail: %s" % remote.get("detail"),
+            "remote_degraded",
+        )
+    log_event(
+        "automatic_continuation_started",
+        session_id=session_id,
+        chain_id=(record or {}).get("chain_id"),
+        phase=continuation_phase(record),
+    )
+    return record
+
+
+def continuation_raise_gate(path, session_id, reason, requested_action):
+    """Record a real human-authority boundary and notify once."""
+    reason = _safe_notification_text(reason, 240)
+    requested = _safe_notification_text(requested_action, 240)
+    if not reason or not requested:
+        return False, "a gate needs both a reason and a requested action", None
+    gate_id = _notification_event_id("gate", session_id, reason, requested)
+    state = {"first": False}
+
+    def raise_it(cont, data):
+        gate = cont.get("human_gate") or {}
+        if gate.get("waiting_for_human") and gate.get("gate_id") == gate_id:
+            return  # the same unresolved gate: no new state, no new alert
+        state["first"] = True
+        cont["human_gate"] = {
+            "waiting_for_human": True,
+            "reason": reason,
+            "requested_action": requested,
+            "resume_capable": True,
+            "gate_id": gate_id,
+            "raised_utc": utc_stamp(),
+        }
+        cont["phase"] = CONT_WAITING_FOR_HUMAN
+
+    ok, why, record = continuation_mutate(path, session_id, raise_it)
+    if ok and state["first"]:
+        log_event("human_gate_reached", session_id=session_id, chain_id=record.get("chain_id"), gate_id=gate_id)
+        remote = ((record.get("continuation") or {}).get("remote_control") or {}).get("state")
+        tail = (
+            "Reply from Remote Control to continue."
+            if remote == REMOTE_HEALTHY
+            else "Remote control is %s; return to the terminal." % (remote or REMOTE_UNKNOWN)
+        )
+        _notify_attention(record, "human_gate", "approval needed: %s" % requested, "%s %s" % (reason, tail), gate_id)
+    return ok, why, record
+
+
+def continuation_resume(path, session_id):
+    """Clear the gate after the human has actually supplied the decision."""
+
+    def resume(cont, data):
+        gate = cont.get("human_gate") or {}
+        if gate.get("waiting_for_human"):
+            cont.setdefault("gates_history", []).append(dict(gate, resolved_utc=utc_stamp()))
+            del cont["gates_history"][:-20]
+        cont["human_gate"] = {"waiting_for_human": False, "resume_capable": True}
+        remote = (cont.get("remote_control") or {}).get("state")
+        cont["phase"] = CONT_DEGRADED_REMOTE if remote == REMOTE_DEGRADED else CONT_RUNNING
+
+    ok, why, record = continuation_mutate(path, session_id, resume)
+    if ok:
+        log_event("human_gate_resolved", session_id=session_id, chain_id=record.get("chain_id"))
+    return ok, why, record
+
+
+def continuation_transfer_file(args):
+    explicit = getattr(args, "transfer", None)
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    env_transfer = os.environ.get("CLAUDE_TERMINAL_HANDOFF_TRANSFER", "").strip() or None
+    parent = os.environ.get("CLAUDE_TERMINAL_HANDOFF_PARENT_SESSION", "").strip() or None
+    return resolve_transfer_file(env_transfer, parent)
+
+
+def cmd_continuation(args):
+    session_id = getattr(args, "session_id", None) or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    path = continuation_transfer_file(args)
+    if not path:
+        print(json.dumps({"directive": DIRECTIVE_STOP, "reason": "no transfer record for this session"}))
+        return 2
+    action = args.action
+    if action == "wait":
+        deadline = time.time() + max(0.0, args.timeout)
+        while True:
+            record = read_transfer(path)
+            if record and _continuation_authorised(record, session_id):
+                record = continuation_advance(path, session_id) or record
+            report = continuation_report(record, session_id)
+            if report["directive"] != DIRECTIVE_WAIT or time.time() >= deadline:
+                break
+            time.sleep(min(transfer_poll_seconds(), max(0.0, deadline - time.time())))
+    elif action == "gate":
+        ok, why, record = continuation_raise_gate(path, session_id, args.reason, args.requested_action)
+        report = continuation_report(record or read_transfer(path), session_id)
+        if not ok:
+            report["error"] = why
+    elif action == "resume":
+        ok, why, record = continuation_resume(path, session_id)
+        report = continuation_report(record or read_transfer(path), session_id)
+        if not ok:
+            report["error"] = why
+    elif action == "remote-check":
+        record = read_transfer(path)
+        if record and _continuation_authorised(record, session_id):
+            result = verify_remote_control(session_id, budget=0.0)
+
+            def recheck(cont, data):
+                cont["remote_control"] = {
+                    "state": REMOTE_HEALTHY if result["healthy"] else REMOTE_DEGRADED,
+                    "detail": result["detail"],
+                    "attempts": (cont.get("remote_control") or {}).get("attempts", 0) + 1,
+                    "checked_utc": utc_stamp(),
+                }
+                if cont.get("phase") in CONT_ACTIVE_PHASES:
+                    cont["phase"] = CONT_RUNNING if result["healthy"] else CONT_DEGRADED_REMOTE
+
+            _, _, record = continuation_mutate(path, session_id, recheck)
+        report = continuation_report(record, session_id)
+    else:  # status
+        report = continuation_report(read_transfer(path), session_id)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["directive"] in (DIRECTIVE_CONTINUE, DIRECTIVE_WAIT, DIRECTIVE_HOLD) else 3
 
 
 def cmd_supervise(args):
@@ -6140,6 +6685,21 @@ def main(argv=None):
     )
     p.add_argument("--transfer", required=True)
     p.set_defaults(func=cmd_supervise)
+
+    p = sub.add_parser(
+        "continuation",
+        help=(
+            "Successor continuation: wait for ownership, verify Remote Control, "
+            "record or clear a human gate"
+        ),
+    )
+    p.add_argument("action", choices=("wait", "status", "gate", "resume", "remote-check"))
+    p.add_argument("--session-id", default=None)
+    p.add_argument("--transfer", default=None)
+    p.add_argument("--timeout", type=float, default=30.0)
+    p.add_argument("--reason", default=None)
+    p.add_argument("--requested-action", default=None)
+    p.set_defaults(func=cmd_continuation)
 
     p = sub.add_parser("build-command", help="Print the successor launch argv for a manifest")
     p.add_argument("--manifest", required=True)
