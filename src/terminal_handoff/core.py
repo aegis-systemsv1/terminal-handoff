@@ -19,18 +19,22 @@ Target: Python 3.9+ (macOS system python3). No third-party dependencies.
 
 from __future__ import print_function
 
+import base64
 import errno
 import fcntl
 import glob
 import hashlib
 import hmac
+import http.server
 import json
 import os
 import re
 import shlex
 import signal
+import socketserver
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -6605,6 +6609,937 @@ def cmd_session(args):
 
 
 # ---------------------------------------------------------------------------
+# Remote control plane: project registry, permission profiles, devices, API
+# ---------------------------------------------------------------------------
+#
+# The remote API controls registered agent sessions. It is not a shell: no
+# endpoint accepts a command, a path or a PID. Projects are named entries in a
+# local trusted registry; the phone only ever sends a project name.
+
+
+PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+TOOL_RULE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\([^()\n,]{1,200}\))?$")
+DEVICE_ID_RE = re.compile(r"^d_[a-f0-9]{16}$")
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,80}$")
+
+# Gates every profile must carry. A profile cannot drop them.
+MANDATORY_HUMAN_GATES = (
+    "production deployment",
+    "production restart",
+    "rollback",
+    "destructive filesystem operation",
+    "credential changes",
+    "security configuration changes",
+    "irreversible external action",
+)
+PERMISSION_PROFILE_KEYS = ("profile", "description", "allow", "deny", "human_gate")
+READ_ONLY_TOOLS = ("Read", "Grep", "Glob", "LS")
+# Command families that may never be pre-approved: they are gates or native prompts.
+UNALLOWABLE_COMMANDS = re.compile(
+    r"^(sudo|su|rm|rmdir|chmod|chown|dd|mkfs|kill|killall|pkill|launchctl|shutdown|reboot|"
+    r"curl|wget|ssh|scp|rsync|nc|ncat|osascript|open|"
+    r"git\s+push|git\s+reset|git\s+clean|git\s+checkout\s+--|npm\s+publish|npm\s+deploy|"
+    r"terraform|kubectl|helm|docker|vercel|fly|flyctl|gcloud|aws|az|heroku|netlify|firebase|supabase)\b"
+)
+BROAD_SPECIFIERS = ("*", ":*", "**", "*:*")
+
+
+def starter_permission_profile():
+    """A starting point shown to the user. It is never applied automatically."""
+    return {
+        "profile": "development",
+        "description": "Edit this. Nothing here is applied until you save and validate it.",
+        "allow": [
+            "Read",
+            "Grep",
+            "Glob",
+            "Bash(git status:*)",
+            "Bash(git diff:*)",
+            "Bash(git log:*)",
+        ],
+        "deny": [],
+        "human_gate": list(MANDATORY_HUMAN_GATES),
+    }
+
+
+def validate_permission_profile(profile):
+    """Return a list of problems. An empty list means the profile is valid."""
+    problems = []
+    if not isinstance(profile, dict):
+        return ["profile must be a JSON object"]
+    for key in profile:
+        if key not in PERMISSION_PROFILE_KEYS:
+            problems.append("unknown key %r (permission modes and bypasses cannot be set here)" % key)
+    name = profile.get("profile")
+    if not isinstance(name, str) or not PROFILE_NAME_RE.match(name):
+        problems.append("profile name is missing or malformed")
+    allow = profile.get("allow")
+    if not isinstance(allow, list) or not allow:
+        problems.append("allow must be a non-empty list")
+        allow = []
+    if len(allow) > 100:
+        problems.append("allow has too many entries")
+    for entry in allow:
+        problems.extend(_validate_tool_rule(entry, allowing=True))
+    deny = profile.get("deny", [])
+    if not isinstance(deny, list):
+        problems.append("deny must be a list")
+        deny = []
+    for entry in deny:
+        problems.extend(_validate_tool_rule(entry, allowing=False))
+    gates = profile.get("human_gate")
+    if not isinstance(gates, list) or not all(isinstance(g, str) and 0 < len(g) <= 120 for g in gates):
+        problems.append("human_gate must be a list of short strings")
+        gates = []
+    for required in MANDATORY_HUMAN_GATES:
+        if required not in gates:
+            problems.append("human_gate must include %r" % required)
+    return problems
+
+
+def _validate_tool_rule(entry, allowing):
+    if not isinstance(entry, str) or not TOOL_RULE_RE.match(entry):
+        return ["malformed tool rule %r" % (entry if isinstance(entry, str) else type(entry).__name__)]
+    tool, _, spec = entry.partition("(")
+    spec = spec[:-1] if spec else None
+    if not allowing:
+        return []
+    if tool.lower() in ("bypasspermissions", "dangerously") or "dangerous" in entry.lower():
+        return ["rule %r is a permission bypass" % entry]
+    if spec is None:
+        if tool in READ_ONLY_TOOLS:
+            return []
+        return ["rule %r is unrestricted: give %s a specific pattern" % (entry, tool)]
+    if spec.strip() in BROAD_SPECIFIERS and tool not in READ_ONLY_TOOLS:
+        return ["rule %r is unrestricted" % entry]
+    if tool == "Bash" and UNALLOWABLE_COMMANDS.match(spec.strip()):
+        return ["rule %r pre-approves a command that must stay behind a human gate" % entry]
+    return []
+
+
+def permission_profile_hash(profile):
+    canonical = json.dumps(profile, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# -- Project registry --------------------------------------------------------
+
+
+def projects_path():
+    return th_path("remote", "projects.json")
+
+
+def projects_load():
+    data = read_json(projects_path(), {}) or {}
+    projects = data.get("projects")
+    return projects if isinstance(projects, dict) else {}
+
+
+def projects_update(mutator):
+    def mutate(data):
+        data.setdefault("projects", {})
+        mutator(data["projects"])
+
+    return update_json_locked(projects_path(), mutate)
+
+
+def project_add(name, path):
+    """Register a project. The path is resolved once and pinned by realpath."""
+    if not isinstance(name, str) or not PROJECT_NAME_RE.match(name):
+        return False, "project name must match %s" % PROJECT_NAME_RE.pattern
+    if not isinstance(path, str) or "\x00" in path or not os.path.isabs(path):
+        return False, "path must be absolute"
+    real = os.path.realpath(path)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not os.path.isdir(real):
+        return False, "path is not a directory"
+    if real in ("/", home) or real.startswith(os.path.realpath(th_home())):
+        return False, "refusing to register %s as a project" % real
+    outcome = {}
+
+    def mutate(projects):
+        if name in projects:
+            outcome["error"] = "project already exists"
+            return
+        projects[name] = {
+            "path": path,  # as supplied: a swapped symlink here is detected at resolve time
+            "realpath": real,
+            "enabled": True,
+            "remote_launch": False,
+            "created_utc": utc_stamp(),
+            "permissions": None,
+        }
+
+    projects_update(mutate)
+    if outcome.get("error"):
+        return False, outcome["error"]
+    log_event("project_registered", project=name)
+    return True, None
+
+
+def project_resolve(name):
+    """Return `(realpath, project, None)` or `(None, None, reason)`.
+
+    Only a registered, enabled name resolves. The pinned realpath must still be
+    what the path resolves to, so a swapped symlink is refused.
+    """
+    if not isinstance(name, str) or not PROJECT_NAME_RE.match(name):
+        return None, None, "unknown project"
+    project = projects_load().get(name)
+    if not isinstance(project, dict) or not project.get("enabled"):
+        return None, None, "unknown project"
+    pinned = project.get("realpath")
+    try:
+        current = os.path.realpath(project.get("path") or "")
+    except (OSError, ValueError):
+        return None, None, "project path is unavailable"
+    if not pinned or current != pinned or not os.path.isdir(current):
+        return None, None, "project path changed or is unavailable"
+    return current, project, None
+
+
+def project_permissions_ok(project):
+    """`(profile, None)` when the stored profile validates and is unchanged."""
+    permissions = (project or {}).get("permissions")
+    if not isinstance(permissions, dict) or not isinstance(permissions.get("profile"), dict):
+        return None, "no remote permission profile is configured"
+    profile = permissions["profile"]
+    problems = validate_permission_profile(profile)
+    if problems:
+        return None, "permission profile is invalid: %s" % problems[0]
+    if permissions.get("validated_sha256") != permission_profile_hash(profile):
+        return None, "permission profile changed since it was validated"
+    return profile, None
+
+
+def project_set_permissions(name, profile):
+    problems = validate_permission_profile(profile)
+    if problems:
+        return False, problems
+    outcome = {}
+
+    def mutate(projects):
+        if name not in projects:
+            outcome["error"] = ["unknown project"]
+            return
+        projects[name]["permissions"] = {
+            "profile": profile,
+            "validated_sha256": permission_profile_hash(profile),
+            "validated_utc": utc_stamp(),
+        }
+        projects[name]["remote_launch"] = False  # a changed profile must be re-enabled deliberately
+
+    projects_update(mutate)
+    if outcome.get("error"):
+        return False, outcome["error"]
+    log_event("project_permissions_saved", project=name)
+    return True, []
+
+
+def project_set_remote_launch(name, enabled):
+    outcome = {}
+
+    def mutate(projects):
+        project = projects.get(name)
+        if not project:
+            outcome["error"] = "unknown project"
+            return
+        if enabled:
+            _, why = project_permissions_ok(project)
+            if why:
+                outcome["error"] = why
+                return
+        project["remote_launch"] = bool(enabled)
+
+    projects_update(mutate)
+    if outcome.get("error"):
+        return False, outcome["error"]
+    log_event("project_remote_launch", project=name, enabled=bool(enabled))
+    return True, None
+
+
+def cmd_project(args):
+    rest = list(args.rest or [])
+    action = args.action
+    if action == "list":
+        rows = []
+        for name, project in sorted(projects_load().items()):
+            _, why = project_permissions_ok(project)
+            rows.append(
+                {
+                    "name": name,
+                    "path": project.get("path"),
+                    "enabled": project.get("enabled"),
+                    "remote_launch": project.get("remote_launch"),
+                    "permissions": "valid" if not why else why,
+                }
+            )
+        print(json.dumps(rows, indent=2))
+        return 0
+    if action == "add":
+        if len(rest) != 2:
+            print("usage: project add NAME ABSOLUTE_PATH")
+            return 2
+        ok, why = project_add(rest[0], rest[1])
+        print("ok" if ok else "refused: %s" % why)
+        return 0 if ok else 3
+    if action in ("remove", "enable-remote", "disable-remote"):
+        if len(rest) != 1:
+            print("usage: project %s NAME" % action)
+            return 2
+        name = rest[0]
+        if action == "remove":
+            projects_update(lambda projects: projects.pop(name, None))
+            log_event("project_removed", project=name)
+            print("ok")
+            return 0
+        ok, why = project_set_remote_launch(name, action == "enable-remote")
+        print("ok" if ok else "refused: %s" % why)
+        return 0 if ok else 3
+    if action == "permissions":
+        if len(rest) != 2 or rest[0] not in ("show", "edit", "validate", "template"):
+            print("usage: project permissions show|edit|validate|template NAME")
+            return 2
+        sub, name = rest
+        project = projects_load().get(name)
+        if sub == "template":
+            print(json.dumps(starter_permission_profile(), indent=2))
+            return 0
+        if project is None:
+            print("unknown project")
+            return 3
+        stored = (project.get("permissions") or {}).get("profile")
+        if sub == "show":
+            print(json.dumps(stored or {"note": "no profile configured; run `project permissions edit %s`" % name}, indent=2))
+            return 0
+        if sub == "validate":
+            profile, why = project_permissions_ok(project)
+            if why and isinstance(stored, dict):
+                problems = validate_permission_profile(stored)
+                if not problems:
+                    ok, _ = project_set_permissions(name, stored)  # unchanged and valid: record it
+                    print("valid" if ok else "invalid")
+                    return 0 if ok else 3
+                print("invalid:\n  " + "\n  ".join(problems))
+                return 3
+            print("valid" if not why else "invalid: %s" % why)
+            return 0 if not why else 3
+        # edit
+        source = getattr(args, "from_file", None)
+        if source:
+            try:
+                new_profile = json.load(open(source))
+            except (OSError, ValueError) as exc:
+                print("could not read profile: %s" % exc)
+                return 3
+        else:
+            editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+            if not editor:
+                print("set $EDITOR or pass --from-file")
+                return 2
+            import tempfile
+
+            fd, tmp = tempfile.mkstemp(prefix="th-permissions-", suffix=".json")
+            with os.fdopen(fd, "w") as handle:
+                json.dump(stored or starter_permission_profile(), handle, indent=2)
+            try:
+                subprocess.call(shlex.split(editor) + [tmp])
+                new_profile = json.load(open(tmp))
+            except (OSError, ValueError) as exc:
+                print("could not read edited profile: %s" % exc)
+                return 3
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        ok, problems = project_set_permissions(name, new_profile)
+        if ok:
+            print("saved and validated. Remote launch remains disabled until: project enable-remote %s" % name)
+            return 0
+        print("not saved:\n  " + "\n  ".join(problems))
+        return 3
+    return 2
+
+
+# -- Remote configuration and devices ---------------------------------------
+
+
+DEFAULT_DEVICE_TTL_DAYS = 14
+MAX_DEVICE_TTL_DAYS = 90
+ENROLLMENT_TTL_SECONDS = 600
+
+
+def remote_config_path():
+    return th_path("remote", "config.json")
+
+
+def remote_config():
+    data = read_json(remote_config_path(), {}) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def remote_config_problems(config):
+    """Fail-closed startup conditions. Empty means the gateway may start."""
+    problems = []
+    host = config.get("allowed_host")
+    if not isinstance(host, str) or not re.match(r"^[a-z0-9.-]+\.ts\.net$", host):
+        problems.append("allowed_host must be this Mac's Tailscale name (*.ts.net)")
+    users = config.get("tailscale_users")
+    if not isinstance(users, list) or not users or not all(isinstance(u, str) and "@" in u for u in users):
+        problems.append("tailscale_users must list at least one Tailscale login")
+    port = config.get("port")
+    if not isinstance(port, int) or not (1024 <= port <= 65535):
+        problems.append("port must be an integer between 1024 and 65535")
+    return problems
+
+
+def devices_path():
+    return th_path("remote", "devices.json")
+
+
+def _sha256(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def device_enroll_begin(name, ttl_days=DEFAULT_DEVICE_TTL_DAYS):
+    name = clean_untrusted_text(name, 60)
+    if name is None:
+        return None, "device name is required"
+    ttl_days = max(1, min(int(ttl_days), MAX_DEVICE_TTL_DAYS))
+    code = "thc_" + base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
+
+    def mutate(data):
+        enrollments = data.setdefault("enrollments", {})
+        now = time.time()
+        for key in [k for k, v in enrollments.items() if v.get("expires_epoch", 0) < now]:
+            del enrollments[key]
+        enrollments[_sha256(code)] = {
+            "name": name,
+            "ttl_days": ttl_days,
+            "expires_epoch": now + ENROLLMENT_TTL_SECONDS,
+        }
+
+    update_json_locked(devices_path(), mutate)
+    log_event("remote_enrollment_started", device_name=name, ttl_days=ttl_days)
+    return code, None
+
+
+def device_enroll_complete(code):
+    """Exchange a one-time enrollment code for a device token, exactly once."""
+    if not isinstance(code, str) or not code.startswith("thc_") or len(code) > 100:
+        return None, None
+    out = {}
+
+    def mutate(data):
+        enrollment = (data.get("enrollments") or {}).pop(_sha256(code), None)
+        if not enrollment or enrollment.get("expires_epoch", 0) < time.time():
+            return
+        device_id = "d_" + uuid.uuid4().hex[:16]
+        secret = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+        now = time.time()
+        data.setdefault("devices", {})[device_id] = {
+            "name": enrollment["name"],
+            "secret_sha256": _sha256(secret),
+            "created_epoch": now,
+            "created_utc": utc_stamp(),
+            "expires_epoch": now + enrollment["ttl_days"] * 86400,
+            "revoked_epoch": None,
+            "last_seen_epoch": None,
+        }
+        out["device_id"] = device_id
+        out["token"] = "thd_%s.%s" % (device_id, secret)
+        out["name"] = enrollment["name"]
+
+    update_json_locked(devices_path(), mutate)
+    if out:
+        log_event("remote_device_enrolled", device_id=out["device_id"], device_name=out["name"])
+        return out["device_id"], out["token"]
+    log_event("remote_enrollment_rejected")
+    return None, None
+
+
+def device_authenticate(token, now=None):
+    """Return `(device_id, device)` for a valid token, else `(None, reason)`."""
+    now = now if now is not None else time.time()
+    if not isinstance(token, str) or not token.startswith("thd_") or len(token) > 120 or "." not in token:
+        return None, "malformed"
+    device_id, _, secret = token[4:].partition(".")
+    if not DEVICE_ID_RE.match(device_id) or not secret:
+        return None, "malformed"
+    device = ((read_json(devices_path(), {}) or {}).get("devices") or {}).get(device_id)
+    if not isinstance(device, dict):
+        return None, "unknown"
+    if not hmac.compare_digest(str(device.get("secret_sha256")), _sha256(secret)):
+        return None, "bad_secret"
+    if device.get("revoked_epoch"):
+        return None, "revoked"
+    if float(device.get("expires_epoch") or 0) < now:
+        return None, "expired"
+    return device_id, device
+
+
+def device_touch(device_id):
+    def mutate(data):
+        device = (data.get("devices") or {}).get(device_id)
+        if device and (time.time() - float(device.get("last_seen_epoch") or 0)) > 60:
+            device["last_seen_epoch"] = time.time()
+
+    update_json_locked(devices_path(), mutate)
+
+
+def device_revoke(device_id):
+    out = {}
+
+    def mutate(data):
+        device = (data.get("devices") or {}).get(device_id)
+        if device and not device.get("revoked_epoch"):
+            device["revoked_epoch"] = time.time()
+            out["ok"] = True
+
+    if not DEVICE_ID_RE.match(str(device_id)):
+        return False
+    update_json_locked(devices_path(), mutate)
+    if out.get("ok"):
+        log_event("remote_device_revoked", device_id=device_id)
+    return bool(out.get("ok"))
+
+
+def device_list():
+    rows = []
+    for device_id, device in sorted(((read_json(devices_path(), {}) or {}).get("devices") or {}).items()):
+        rows.append(
+            {
+                "device_id": device_id,
+                "name": device.get("name"),
+                "created_utc": device.get("created_utc"),
+                "expires_utc": utc_stamp(datetime.fromtimestamp(device.get("expires_epoch", 0), timezone.utc)),
+                "revoked": bool(device.get("revoked_epoch")),
+                "last_seen": device.get("last_seen_epoch"),
+            }
+        )
+    return rows
+
+
+def server_key():
+    path = th_path("remote", "server.key")
+    if not os.path.isfile(path):
+        _mkdir_private(os.path.dirname(path))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(os.urandom(32))
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def csrf_token_for(device_id, device):
+    message = ("%s:%s" % (device_id, device.get("secret_sha256"))).encode("utf-8")
+    return hmac.new(server_key(), message, hashlib.sha256).hexdigest()
+
+
+def check_tailscale(allowed_host, run=subprocess.run):
+    """Fail closed unless Tailscale is running and this Mac is `allowed_host`."""
+    binary = None
+    for candidate in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            binary = candidate
+            break
+    if binary is None:
+        return False, "the tailscale CLI was not found"
+    try:
+        proc = run([binary, "status", "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        status = json.loads(proc.stdout.decode("utf-8", "replace"))
+    except Exception as exc:
+        return False, "tailscale status failed: %s" % str(exc)[:100]
+    return tailscale_status_ok(status, allowed_host)
+
+
+def tailscale_status_ok(status, allowed_host):
+    if not isinstance(status, dict) or status.get("BackendState") != "Running":
+        return False, "Tailscale is not running"
+    dns = str(((status.get("Self") or {}).get("DNSName")) or "").rstrip(".").lower()
+    if dns != str(allowed_host).lower():
+        return False, "this Mac's Tailscale name does not match allowed_host"
+    return True, None
+
+
+class RateLimiter(object):
+    """Small in-memory sliding-window limiter with a failure lockout."""
+
+    def __init__(self, clock=time.time):
+        self.clock = clock
+        self.hits = {}
+        self.lock = threading.Lock()
+
+    def allow(self, key, limit, window):
+        now = self.clock()
+        with self.lock:
+            hits = [t for t in self.hits.get(key, ()) if now - t < window]
+            if len(hits) >= limit:
+                self.hits[key] = hits
+                return False
+            hits.append(now)
+            self.hits[key] = hits
+            return True
+
+    def blocked(self, key, limit, window):
+        now = self.clock()
+        with self.lock:
+            return len([t for t in self.hits.get(key, ()) if now - t < window]) >= limit
+
+
+# -- The HTTP API ---------------------------------------------------------------
+
+MAX_BODY_BYTES = 32768
+SESSION_PATH_RE = re.compile(r"^/api/v1/sessions/(ls_[a-f0-9]{24})(?:/([a-z]+))?$")
+ALLOWED_BODY_KEYS = {
+    "instructions": {"text", "request_id"},
+    "pause": {"request_id"},
+    "resume": {"request_id", "reason", "clear_stop"},
+    "stop": {"request_id", "reason", "hard"},
+    "create": {"project", "task", "request_id"},
+    "enroll": {"code"},
+}
+AUTH_FAIL_LIMIT = 8
+AUTH_FAIL_WINDOW = 300
+
+
+class RemoteGateway(object):
+    """Holds the gateway's policy so the handler stays a thin adapter."""
+
+    def __init__(self, config, launcher=None, clock=time.time):
+        self.config = config
+        self.clock = clock
+        self.limiter = RateLimiter(clock)
+        self.replay = {}
+        self.replay_lock = threading.Lock()
+        self.launcher = launcher
+
+    # Origin and Host are derived from configuration, never from the request.
+    @property
+    def host(self):
+        return self.config["allowed_host"].lower()
+
+    @property
+    def origin(self):
+        return "https://%s" % self.host
+
+    def tailscale_user(self, headers):
+        login = (headers.get("Tailscale-User-Login") or "").strip().lower()
+        return login if login in [u.lower() for u in self.config.get("tailscale_users", [])] else None
+
+    def remember(self, device_id, request_id, response):
+        now = self.clock()
+        with self.replay_lock:
+            for key in [k for k, v in self.replay.items() if now - v[0] > 600]:
+                del self.replay[key]
+            self.replay[(device_id, request_id)] = (now, response)
+
+    def replayed(self, device_id, request_id):
+        with self.replay_lock:
+            hit = self.replay.get((device_id, request_id))
+        return hit[1] if hit and self.clock() - hit[0] <= 600 else None
+
+
+def _json_body(handler):
+    length = handler.headers.get("Content-Length")
+    if not length or not length.isdigit() or int(length) > MAX_BODY_BYTES:
+        return None, "invalid or oversized body"
+    if (handler.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
+        return None, "content type must be application/json"
+    try:
+        body = json.loads(handler.rfile.read(int(length)).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, "malformed json"
+    return (body, None) if isinstance(body, dict) else (None, "body must be an object")
+
+
+def make_remote_handler(gateway):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "TerminalHandoff"
+        sys_version = ""
+        timeout = 10
+
+        def log_message(self, fmt, *args):  # never write request lines (they can carry secrets)
+            return
+
+        # ---- responses
+        def _send(self, status, payload, cookie=None):
+            data = json.dumps(payload, sort_keys=True).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Frame-Options", "DENY")
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _deny(self, status, code, why=None):
+            log_event("remote_request_refused", status=status, code=code, why=why, path=self.path.split("?")[0][:80])
+            self._send(status, {"error": code})
+
+        # ---- gate: every request passes here first
+        def _gate(self, mutating, need_device=True):
+            host = (self.headers.get("Host") or "").split(":")[0].lower()
+            if host != gateway.host:
+                self._deny(403, "forbidden", "bad host")
+                return None
+            login = gateway.tailscale_user(self.headers)
+            if login is None:
+                self._deny(403, "forbidden", "not a permitted tailnet identity")
+                return None
+            peer = "%s|%s" % (login, self.client_address[0])
+            if gateway.limiter.blocked(("authfail", peer), AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW):
+                self._deny(429, "rate_limited", "auth lockout")
+                return None
+            if not gateway.limiter.allow(("req", peer), 240, 60):
+                self._deny(429, "rate_limited", "request rate")
+                return None
+            if not need_device:
+                if mutating and not self._origin_ok():
+                    return None
+                return {"login": login, "peer": peer}
+            token, via_cookie = self._token()
+            device_id, device = device_authenticate(token, gateway.clock())
+            if device_id is None:
+                gateway.limiter.allow(("authfail", peer), 10 ** 6, AUTH_FAIL_WINDOW)
+                log_event("remote_auth_failed", reason=device, peer_login=login)
+                self._send(401, {"error": "unauthorized"})
+                return None
+            if mutating:
+                if not self._origin_ok():
+                    return None
+                if via_cookie:
+                    presented = self.headers.get("X-CSRF-Token") or ""
+                    if not hmac.compare_digest(presented, csrf_token_for(device_id, device)):
+                        self._deny(403, "forbidden", "csrf")
+                        return None
+                if not gateway.limiter.allow(("mut", device_id), 60, 60):
+                    self._deny(429, "rate_limited", "mutation rate")
+                    return None
+            device_touch(device_id)
+            return {"device_id": device_id, "device": device, "login": login, "peer": peer}
+
+        def _origin_ok(self):
+            origin = self.headers.get("Origin")
+            if origin is None or origin != gateway.origin:
+                self._deny(403, "forbidden", "origin")
+                return False
+            return True
+
+        def _token(self):
+            auth = self.headers.get("Authorization") or ""
+            if auth.startswith("Bearer "):
+                return auth[7:].strip(), False
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                name, _, value = part.strip().partition("=")
+                if name == "__Host-thd":
+                    return value, True
+            return None, False
+
+        # ---- verbs
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path == "/healthz":
+                ctx = self._gate(False, need_device=False)
+                if ctx:
+                    self._send(200, {"status": "ok"})
+                return
+            ctx = self._gate(False)
+            if not ctx:
+                return
+            if path == "/api/v1/me":
+                self._send(200, {"device": ctx["device"]["name"], "csrf": csrf_token_for(ctx["device_id"], ctx["device"])})
+            elif path == "/api/v1/projects":
+                names = [n for n, p in sorted(projects_load().items()) if p.get("enabled") and p.get("remote_launch")]
+                self._send(200, {"projects": names})
+            elif path == "/api/v1/sessions":
+                self._send(200, {"sessions": [logical_public_view(r) for r in logical_list()]})
+            else:
+                match = SESSION_PATH_RE.match(path)
+                record = logical_read(match.group(1)) if match and match.group(2) in (None, "output") else None
+                if record is None:
+                    self._deny(404, "not_found")
+                elif match.group(2) == "output":
+                    self._send(200, {"output": list(record.get("output") or [])[-100:]})
+                else:
+                    self._send(200, logical_public_view(record))
+
+        def do_POST(self):
+            path = self.path.split("?")[0]
+            if path == "/api/v1/enroll":
+                return self._enroll()
+            ctx = self._gate(True)
+            if not ctx:
+                return
+            body, why = _json_body(self)
+            if body is None:
+                return self._deny(400, "bad_request", why)
+            if path == "/api/v1/sessions":
+                action, lsid = "create", None
+            else:
+                match = SESSION_PATH_RE.match(path)
+                if not match or match.group(2) not in ("instructions", "pause", "resume", "stop"):
+                    return self._deny(404, "not_found")
+                lsid, action = match.group(1), match.group(2)
+            unknown = set(body) - ALLOWED_BODY_KEYS[action]
+            if unknown:
+                return self._deny(400, "bad_request", "unexpected fields")
+            request_id = body.get("request_id")
+            if not isinstance(request_id, str) or not REQUEST_ID_RE.match(request_id):
+                return self._deny(400, "bad_request", "request_id required")
+            cached = gateway.replayed(ctx["device_id"], request_id)
+            if cached is not None:
+                return self._send(cached[0], dict(cached[1], replayed=True))
+            status, payload = self._dispatch(action, lsid, body, ctx, request_id)
+            gateway.remember(ctx["device_id"], request_id, (status, payload))
+            self._send(status, payload)
+
+        def do_PUT(self):
+            self._deny(405, "method_not_allowed")
+
+        do_DELETE = do_PATCH = do_PUT
+
+        def _enroll(self):
+            ctx = self._gate(True, need_device=False)
+            if not ctx:
+                return
+            if not gateway.limiter.allow(("enroll", ctx["peer"]), 5, 600):
+                return self._deny(429, "rate_limited", "enrollment rate")
+            body, why = _json_body(self)
+            if body is None or set(body) - ALLOWED_BODY_KEYS["enroll"]:
+                return self._deny(400, "bad_request", why or "unexpected fields")
+            device_id, token = device_enroll_complete(body.get("code"))
+            if device_id is None:
+                gateway.limiter.allow(("authfail", ctx["peer"]), 10 ** 6, AUTH_FAIL_WINDOW)
+                return self._send(401, {"error": "unauthorized"})
+            device = ((read_json(devices_path(), {}) or {}).get("devices") or {}).get(device_id)
+            cookie = "__Host-thd=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=%d" % (
+                token,
+                int(device["expires_epoch"] - time.time()),
+            )
+            self._send(200, {"device_id": device_id, "csrf": csrf_token_for(device_id, device)}, cookie=cookie)
+
+        def _dispatch(self, action, lsid, body, ctx, request_id):
+            by = "device:%s" % ctx["device_id"]
+            if action == "create":
+                if gateway.launcher is None:
+                    return 501, {"error": "remote session creation is not enabled"}
+                return gateway.launcher(body, ctx)
+            record = logical_read(lsid)
+            if record is None:
+                return 404, {"error": "not_found"}
+            if action == "instructions":
+                ok, why, message = inbox_post(lsid, body.get("text"), idempotency_key=request_id, source=by)
+                if not ok:
+                    return 400, {"error": "refused", "reason": why}
+                return 202, {"message_id": message["id"], "seq": message["seq"], "duplicate": message["duplicate"]}
+            if action == "pause":
+                ok, why, _ = logical_pause(lsid, by=by)
+            elif action == "stop":
+                ok, why, _ = logical_stop(lsid, by=by, reason=body.get("reason"), hard=bool(body.get("hard")))
+            else:
+                clear = bool(body.get("clear_stop"))
+                ok, why, _ = logical_resume(lsid, by=by, clear_stop=clear, reason=body.get("reason"))
+            log_event("remote_control_action", logical_session_id=lsid, action=action, device_id=ctx["device_id"], ok=ok)
+            if not ok:
+                return 409, {"error": "refused", "reason": why}
+            return 200, logical_public_view(logical_read(lsid))
+
+    return Handler
+
+
+class _LoopbackServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def make_remote_server(config, port=None, launcher=None, tailscale_checker=None):
+    """Build the gateway server. Fails closed and binds loopback only.
+
+    `tailscale_checker(host) -> (ok, reason)` is required. Publication to the
+    tailnet is done by `tailscale serve`, never by this process.
+    """
+    problems = remote_config_problems(config)
+    if problems:
+        raise ValueError("remote gateway is not configured: %s" % "; ".join(problems))
+    if tailscale_checker is None:
+        raise ValueError("a Tailscale check is required")
+    ok, why = tailscale_checker(config["allowed_host"])
+    if not ok:
+        raise ValueError("private network check failed: %s" % why)
+    gateway = RemoteGateway(config, launcher=launcher)
+    server = _LoopbackServer(("127.0.0.1", port if port is not None else config["port"]), make_remote_handler(gateway))
+    server.gateway = gateway
+    return server
+
+
+def cmd_remote(args):
+    action = args.action
+    if action == "configure":
+        config = remote_config()
+        if args.host:
+            config["allowed_host"] = args.host.lower()
+        if args.tailscale_user:
+            config["tailscale_users"] = sorted(set(config.get("tailscale_users", []) + [args.tailscale_user]))
+        config.setdefault("port", 8787)
+        if args.port:
+            config["port"] = args.port
+        write_json_private(remote_config_path(), config)
+        problems = remote_config_problems(config)
+        print(json.dumps(config, indent=2))
+        print("configuration incomplete: " + "; ".join(problems) if problems else "configuration complete")
+        return 0 if not problems else 3
+    if action == "enroll-device":
+        code, why = device_enroll_begin(args.name, args.ttl_days)
+        if code is None:
+            print(why)
+            return 3
+        host = remote_config().get("allowed_host", "<this-mac>.ts.net")
+        print("One-time code (valid %d minutes, single use):\n  %s" % (ENROLLMENT_TTL_SECONDS // 60, code))
+        print("Open https://%s/ on the device, choose Enroll, and enter the code." % host)
+        return 0
+    if action == "list-devices":
+        print(json.dumps(device_list(), indent=2))
+        return 0
+    if action == "revoke-device":
+        ok = device_revoke(args.device)
+        print("revoked" if ok else "no such active device")
+        return 0 if ok else 3
+    if action == "check":
+        config = remote_config()
+        problems = remote_config_problems(config)
+        ok, why = check_tailscale(config.get("allowed_host", "")) if not problems else (False, None)
+        print(json.dumps({"config_problems": problems, "tailscale_ok": ok, "tailscale_reason": why}, indent=2))
+        return 0 if not problems and ok else 3
+    if action == "serve":
+        config = remote_config()
+        try:
+            server = make_remote_server(config, tailscale_checker=check_tailscale, launcher=remote_create_session_handler)
+        except ValueError as exc:
+            print("refusing to start: %s" % exc)
+            return 3
+        print("Terminal Handoff gateway listening on 127.0.0.1:%d (loopback only)." % server.server_address[1])
+        print("It is NOT published. Publish deliberately with: tailscale serve --bg --https=443 http://127.0.0.1:%d" % server.server_address[1])
+        log_event("remote_gateway_started", port=server.server_address[1])
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        return 0
+    return 2
+
+
+def remote_create_session_handler(body, ctx):
+    return 501, {"error": "remote session creation is not enabled"}
+
+
+# ---------------------------------------------------------------------------
 # Automatic continuation and remote-control readiness
 # ---------------------------------------------------------------------------
 #
@@ -7421,6 +8356,22 @@ def main(argv=None):
     p.add_argument("--key", default=None)
     p.add_argument("--message-id", default=None)
     p.set_defaults(func=cmd_session)
+
+    p = sub.add_parser("project", help="Remote project registry and permission profiles")
+    p.add_argument("action", choices=("list", "add", "remove", "enable-remote", "disable-remote", "permissions"))
+    p.add_argument("rest", nargs="*")
+    p.add_argument("--from-file", default=None)
+    p.set_defaults(func=cmd_project)
+
+    p = sub.add_parser("remote", help="Remote gateway: configure, enroll and revoke devices, serve")
+    p.add_argument("action", choices=("configure", "enroll-device", "list-devices", "revoke-device", "check", "serve"))
+    p.add_argument("--host", default=None)
+    p.add_argument("--tailscale-user", default=None)
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--name", default=None)
+    p.add_argument("--ttl-days", type=int, default=DEFAULT_DEVICE_TTL_DAYS)
+    p.add_argument("--device", default=None)
+    p.set_defaults(func=cmd_remote)
 
     p = sub.add_parser("build-command", help="Print the successor launch argv for a manifest")
     p.add_argument("--manifest", required=True)
