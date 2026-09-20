@@ -308,7 +308,7 @@ class TestNoInjection(LaunchCase):
         allow = settings["permissions"]["allow"]
         self.assertEqual(allow[: len(good_profile()["allow"])], good_profile()["allow"])
         extra = allow[len(good_profile()["allow"]):]
-        self.assertEqual(len(extra), len(CORE.AGENT_CLI_SUBCOMMANDS))
+        self.assertEqual(len(extra), len(CORE.AGENT_CLI_SUBCOMMANDS) + len(CORE.agent_read_allow_rules(self.real_repo)))
         joined = " ".join(extra)
         for admin in ("decide", "stop", "pause", "resume", "post", "recover", "reconcile", "session show", "session list"):
             self.assertNotIn("session %s" % admin, joined)  # the agent may not approve its own gate or clear STOP
@@ -317,6 +317,24 @@ class TestNoInjection(LaunchCase):
         self.assertIn("statusline", settings["statusLine"]["command"])
         self.assertIn("hook-stop", json.dumps(settings["hooks"]))
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+
+class TestAgentReadRules(LaunchCase):
+    def test_successor_read_access_is_narrow_and_never_covers_launch_tokens(self):
+        rules = CORE.agent_read_allow_rules(self.real_repo)
+        joined = "\n".join(rules)
+        self.assertEqual(len(rules), 5)
+        for rule in rules:
+            self.assertTrue(rule.startswith("Read(//"), rule)  # Claude's absolute-path prefix
+        self.assertIn("/handoffs/**", joined)
+        self.assertIn("/transfers/**", joined)
+        self.assertIn("prompts/successor-*.md", joined)
+        self.assertIn("prompts/remote-*.md", joined)
+        self.assertNotIn(".tok", joined)
+        self.assertNotIn("prompts/**", joined)  # would expose one-time launch tokens
+        self.assertNotIn("/.claude/projects/**", joined)  # other projects' transcripts stay private
+        self.assertIn(re.sub(r"[^A-Za-z0-9]", "-", self.real_repo), joined)
+        self.assertEqual(len(CORE.agent_read_allow_rules(None)), 4)
 
 
 class TestRegistration(LaunchCase):
@@ -382,6 +400,7 @@ class TestSessionCheck(LaunchCase):
             self.assertIn(gate, prompt)
         self.assertIn("Never use the\n--dangerously-skip-permissions flag", prompt)
         self.assertIn("session inbox", prompt)
+        self.assertIn("DO NOT end\nyour turn", prompt)  # a halted agent must keep waiting, or it can never be resumed
         self.assertNotIn("{{", prompt)
 
 
@@ -436,6 +455,18 @@ class TestHandoffKeepsTheSessionControllable(ContinuationCase):
         self.assertEqual(self.cont("wait")[1]["directive"], "CONTINUE")
         _, out, _ = (lambda r: (r[0], json.loads(r[1]), r[2]))(run_th(["session", "check", "--logical-session", lsid, "--session-id", SUCCESSOR], env=self.th_env()))
         self.assertEqual(out["directive"], "CONTINUE")
+
+    def test_the_successor_prompt_names_the_command_the_allow_rules_cover(self):
+        lsid = self.logical()
+        CORE.logical_mutate(lsid, lambda r: r.update(th_command={"python": "/opt/py/bin/python3.99", "core": "/opt/th/core.py"}))
+        manifest = {"model": {"id": "claude-opus-5"}, "effort": {"level": "high", "available": True}, "chain_id": "abcdef012345",
+                    "generation": 1, "display": {"successor_display_name": "S 2"}, "logical_session_id": lsid,
+                    "outgoing": {"session_id": self.parent_id}}
+        prompt = CORE.render_successor_prompt(manifest)
+        self.assertIn("/opt/py/bin/python3.99 /opt/th/core.py continuation wait", prompt)
+        self.assertNotIn(CORE.shlex.quote(CORE.sys.executable) + " " + CORE.shlex.quote(CORE.os.path.abspath(CORE.__file__)) + " continuation", prompt)
+        plain = dict(manifest, logical_session_id=None)
+        self.assertIn(CORE.os.path.abspath(CORE.__file__), CORE.render_successor_prompt(plain))  # ordinary handoffs unchanged
 
     def test_successor_argv_carries_the_same_permission_settings_and_gates(self):
         lsid = self.logical()

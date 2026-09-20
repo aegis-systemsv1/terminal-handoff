@@ -2628,6 +2628,19 @@ def successor_prompt_template_path():
     return th_path("successor-prompt.md")
 
 
+def _th_command_for(lsid):
+    """The interpreter and script an agent is told to run.
+
+    For a remote session this must be exactly what its allow rules cover. The
+    detached launcher can run under a different Python than the gateway, which
+    would otherwise make every `session`/`continuation` call raise a prompt.
+    """
+    recorded = ((logical_read(lsid) or {}).get("th_command") if lsid else None) or {}
+    python = recorded.get("python") or sys.executable or "python3"
+    core = recorded.get("core") or os.path.abspath(__file__)
+    return "%s %s" % (shlex.quote(python), shlex.quote(core))
+
+
 def render_successor_prompt(manifest, template_path=None):
     template_path = template_path or successor_prompt_template_path()
     try:
@@ -2660,8 +2673,7 @@ def render_successor_prompt(manifest, template_path=None):
         "{{WORKING_DIRECTORY}}": str((manifest.get("outgoing") or {}).get("current_dir")),
         "{{THRESHOLD}}": str(manifest.get("trigger", {}).get("configured_threshold")),
         "{{TH_VERSION}}": TERMINAL_HANDOFF_VERSION,
-        "{{TH_COMMAND}}": "%s %s"
-        % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__))),
+        "{{TH_COMMAND}}": _th_command_for(manifest.get("logical_session_id")),
     }
     rendered = template
     for key, value in values.items():
@@ -8119,7 +8131,11 @@ FIRST, confirm you are the registered owner:
 
 If the directive is STOP or is_owner is false, you were not registered: do
 nothing else and tell the user in this terminal. If it is HALT, the user has
-STOPPED or PAUSED this session: perform no autonomous mutation.
+STOPPED or PAUSED this session: perform no autonomous mutation, but DO NOT end
+your turn. Keep running `{{TH_COMMAND}} session wait --timeout 540` (Bash timeout
+600000 ms); while halted it blocks quietly and returns CONTINUE when the human
+deliberately resumes. Nobody can wake you once your turn ends, so a halted agent
+that stops looping can never be resumed remotely.
 
 YOUR TASK is the first message in your durable instruction inbox:
 
@@ -8232,7 +8248,27 @@ def agent_cli_allow_rules():
     return ["Bash(%s %s:*)" % (base, sub) for sub in AGENT_CLI_SUBCOMMANDS]
 
 
-def write_permission_settings(lsid, profile):
+def agent_read_allow_rules(repository=None):
+    """Read access a handoff successor needs outside the project, and nothing more.
+
+    Terminal Handoff's own manifest, transfer and prompt files (never the one-time
+    launch-token files), and this project's own Claude transcripts. `//` is
+    Claude's absolute-path prefix.
+    """
+    home = os.path.realpath(th_home())
+    rules = [
+        "Read(/%s/handoffs/**)" % home,
+        "Read(/%s/transfers/**)" % home,
+        "Read(/%s/prompts/successor-*.md)" % home,
+        "Read(/%s/prompts/remote-*.md)" % home,
+    ]
+    if repository:
+        munged = re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(repository))
+        rules.append("Read(/%s/.claude/projects/%s/**)" % (os.path.realpath(os.path.expanduser("~")), munged))
+    return rules
+
+
+def write_permission_settings(lsid, profile, repository=None):
     """The whole settings a remote session runs with (user/project/local are excluded).
 
     Existing Claude settings are never edited. Because those sources are not
@@ -8243,7 +8279,7 @@ def write_permission_settings(lsid, profile):
     hook = "%s %s session hook-stop" % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__)))
     settings = {
         "permissions": {
-            "allow": list(profile["allow"]) + agent_cli_allow_rules(),
+            "allow": list(profile["allow"]) + agent_cli_allow_rules() + agent_read_allow_rules(repository),
             "deny": list(profile.get("deny", [])),
             "disableBypassPermissionsMode": "disable",
             "disableAutoMode": "disable",
@@ -8378,10 +8414,11 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
             title=task.splitlines()[0][:120],
         )
         lsid = record["logical_session_id"]
-        settings_file = write_permission_settings(lsid, profile)
+        settings_file = write_permission_settings(lsid, profile, repository=real)
 
         def annotate(rec):
             rec["created_request_id"] = request_key
+            rec["th_command"] = {"python": sys.executable or "python3", "core": os.path.abspath(__file__)}
             rec["permissions"] = {
                 "profile": profile["profile"],
                 "human_gate": list(profile["human_gate"]),
@@ -8742,6 +8779,9 @@ def logical_wait(lsid, agent_session_id, timeout, sleep=time.sleep, clock=time.t
                 "orphaned": "the logical session is ORPHANED",
             }
             return {"directive": "STOP", "reason": reasons[event]}
+        if halt and not started_halted:
+            # STOP or pause began while we were blocked: tell the agent now, not at the timeout.
+            return {"directive": "HALT", "halt": halt, "reason": "the logical session was just %s" % ("STOPPED" if halt == "stop" else "PAUSED")}
         if not halt:
             if started_halted:
                 return {"directive": "CONTINUE", "reason": "the logical session was deliberately resumed"}

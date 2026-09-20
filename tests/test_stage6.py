@@ -376,6 +376,18 @@ class TestWake(LogicalCase):
         self.assertEqual(result["directive"], "CONTINUE")
         self.assertEqual(CORE.logical_wait(lsid, OWNER, 0, sleep=NOSLEEP)["directive"], "INSTRUCTIONS")
 
+    def test_a_stop_that_begins_while_blocked_is_reported_immediately(self):
+        lsid = self.new_session()
+        threading.Timer(0.3, lambda: CORE.logical_stop(lsid, by="phone", reason="hold")).start()
+        started = time.time()
+        result = CORE.logical_wait(lsid, OWNER, 30, sleep=lambda s: time.sleep(0.05))
+        self.assertEqual((result["directive"], result["halt"]), ("HALT", "stop"))
+        self.assertLess(time.time() - started, 5)  # not at the 30 s timeout
+        # the next wait then blocks quietly until a deliberate resume
+        self.assertTrue(CORE.logical_wait(lsid, OWNER, 0, sleep=NOSLEEP)["timeout"])
+        threading.Timer(0.3, lambda: CORE.logical_resume(lsid, by="phone", clear_stop=True, reason="ok")).start()
+        self.assertEqual(CORE.logical_wait(lsid, OWNER, 30, sleep=lambda s: time.sleep(0.05))["directive"], "CONTINUE")
+
     def test_a_decision_wakes_the_agent_once(self):
         lsid = self.new_session()
         approval = approve_ready(self, lsid)

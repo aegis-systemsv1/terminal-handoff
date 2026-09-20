@@ -26,7 +26,9 @@ of the following are true:
 
   c. The transfer state authorises you to continue. Check it with:
 
-         cat {{TRANSFER_PATH}}
+         {{TH_COMMAND}} continuation status
+
+     (or read {{TRANSFER_PATH}} with the Read tool)
 
      Only `"state": "TRANSFER_COMPLETE"` means you own continuation.
      `"LAUNCHING"` or `"SUCCESSOR_VERIFIED"` means the parent still owns the
@@ -184,6 +186,10 @@ Before modifying anything:
       then immediately resume the unfinished work from the brief. Choose the
       next step yourself. The user may be away; being away means proceed
       autonomously, not idle.
+    - HALT: the human STOPPED or PAUSED the session. Do no autonomous mutation, but
+      do NOT end your turn: keep running `{{TH_COMMAND}} session wait --timeout 540`
+      (Bash timeout 600000 ms), which blocks until a deliberate resume. Nobody can wake
+      you after your turn ends.
     - HOLD_FOR_HUMAN: a gate is already recorded. Do nothing gated.
     - STOP: you are not the owner (the transfer failed, or another session is
       the verified successor). Report it and mutate nothing.
