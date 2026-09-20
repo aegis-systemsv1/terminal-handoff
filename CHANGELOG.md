@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-20
+
+This is the milestone that turns Terminal Handoff from basic session transfer into persistent remote Claude Code session control: a logical session that outlives individual Claude processes, hands off automatically, and can be started and steered from an enrolled iPhone over Tailscale while Claude keeps running on the Mac. Physical iPhone acceptance completed 2026-09-20 (see docs/ACCEPTANCE.md).
+
 ### Added
 
 - **Automatic continuation.** After `TRANSFER_COMPLETE` the successor verifies

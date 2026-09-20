@@ -95,3 +95,9 @@ controlling process. If that permission is denied or revoked, launches fail with
 a logged reason and a visible `TH blocked` badge; the outgoing session remains
 fully operational. Terminal Handoff never attempts to work around a macOS
 security control.
+
+## Remote control
+
+The remote gateway (loopback only, published through Tailscale, device-credential authenticated) has its own
+threat model in [docs/REMOTE_CONTROL.md](docs/REMOTE_CONTROL.md#threat-model). Please report vulnerabilities in it the
+same way, and never include enrollment codes, device credentials or your tailnet hostname in a report.

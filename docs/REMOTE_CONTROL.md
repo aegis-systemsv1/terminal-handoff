@@ -4,10 +4,10 @@ Terminal Handoff can hand a session over to a successor **and** be steered from
 an authorised phone while your Mac does the work. This document is the complete
 description: architecture, threat model, set-up, behaviour and limits.
 
-> **Status.** Everything here is implemented and tested locally. It has not yet
-> been exposed on a real tailnet or used from a real phone. Nothing starts a
-> network service unless you run `remote serve`, and nothing is published to
-> Tailscale unless you run `tailscale serve` yourself.
+> **Status.** Implemented, tested (581 tests) and accepted on a physical iPhone
+> on 2026-09-20; see [ACCEPTANCE.md](ACCEPTANCE.md). Nothing starts a network
+> service unless you run `remote serve`, and nothing is published to Tailscale
+> unless you run `tailscale serve` yourself.
 
 ## Contents
 
@@ -542,6 +542,11 @@ first use.
 
 ## Set-up, enrolment and rollback
 
+Per-project prerequisites: register the project, validate its permission profile, open Claude once in the
+folder and accept its trust question, then `project enable-remote`. The README's
+[Installation and setup](../README.md#installation-and-setup) has the ordered checklist; the commands
+below are the same ones.
+
 Nothing below has been run against your live tailnet yet.
 
 ```sh
@@ -588,7 +593,10 @@ handoffs.
 
 ## Limitations
 
-* **Not yet run** on a real tailnet or iPhone.
+* **Interactive Stop hook unverified**: it works in headless runs, and the durable inbox is the delivery guarantee.
+* **Claude's runtime permission mode can change independently** of Terminal Handoff (see [decision 0005](decisions/0005-preserve-the-users-permission-mode.md)).
+* **Auto Mode profiles are not an OS-level sandbox.**
+* **A new project needs one-time Claude folder trust**, done manually.
 * **Wake is delivered by a bounded long-poll**, not a push. If the agent is
   mid-task or not in a `wait` loop, latency is up to its next check.
 * **`--setting-sources` is undocumented**; isolation is proven per Claude version
