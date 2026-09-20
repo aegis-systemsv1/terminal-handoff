@@ -89,6 +89,20 @@ class TestStaticRules(unittest.TestCase):
         self.assertNotRegex(js, r"setAttribute\(\s*['\"]style")
         self.assertNotRegex(js, r"['\"]on[a-z]+['\"]\s*:\s*['\"]")  # no string event handlers
 
+    def test_nothing_in_the_page_can_interfere_with_native_ios_paste(self):
+        code = "\n".join(line.split("//")[0] for line in CORE.UI_APP_JS.splitlines())  # ignore comments
+        for forbidden in ("paste", "clipboard", "beforeinput", "preventDefault", "stopPropagation", ".focus(", "setSelectionRange", ".select(",
+                          "execCommand", "selectionStart", "selectionEnd", "contenteditable", "touchstart", "touchend", "pointerdown", "keydown", "keyup",
+                          "addEventListener('input'", "oninput", "onpaste", "onbeforeinput"):
+            self.assertNotIn(forbidden, code, forbidden)
+        # the only listeners on the instruction box merely record a timestamp
+        self.assertEqual(sorted(re.findall(r"text\.addEventListener\('([a-z]+)'", code)), ["blur", "focus"])
+        for body in re.findall(r"text\.addEventListener\('[a-z]+', function \(\) \{([^}]*)\}", code):
+            self.assertEqual(body.strip(), "lastFocusEvent = Date.now();")
+        # the box's value is written in exactly one place: clearing it after a successful Send
+        self.assertEqual(re.findall(r"\btext\.value\s*=[^=]", code), ["text.value = "])
+        self.assertEqual(re.findall(r"\btext\.value\s*=\s*''", code), ["text.value = ''"])  # and it is only ever set to empty
+
     def test_the_only_network_calls_are_same_origin_api_paths(self):
         for path in re.findall(r"api\('(?:GET|POST)',\s*'([^']+)'", CORE.UI_APP_JS):
             self.assertTrue(path.startswith("/api/v1/"), path)
@@ -216,7 +230,7 @@ class TestScreens(unittest.TestCase):
 
     def test_the_instruction_box_is_never_recreated_by_polling(self):
         steps = [{"snap": "a"}, {"type": "textarea", "value": "half-typed draft"}, {"snap": "b"}, self.newer(), {"poll": True}, {"snap": "c"},
-                 self.newer("and another one"), {"poll": True}, {"poll": True}, {"snap": "d"}]
+                 self.newer("and another one"), {"poll": True}, {"poll": True}, {"snap": "d"}]  # never focused: refreshes freely
         out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
         first = self.box(out["a"])
         self.assertEqual(len(first), 1)
@@ -231,14 +245,16 @@ class TestScreens(unittest.TestCase):
         out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
         self.assertEqual(self.box(out["a"])[0]["uid"], self.box(out["b"])[0]["uid"])
 
-    def test_the_layout_is_held_still_while_the_box_has_focus_and_catches_up_on_blur(self):
+    def test_the_layout_is_held_still_while_focused_and_for_a_quiet_period_after(self):
+        """iOS can blur the box while its own paste dialog is up: nothing may shift around it then."""
         steps = [{"focus": "textarea"}, {"type": "textarea", "value": "pasted text"}, {"snap": "a"}, self.newer("changed while typing"), {"poll": True},
-                 {"snap": "b"}, {"blur": True}, {"snap": "c"}]
+                 {"snap": "b"}, {"blur": True}, {"poll": True}, {"snap": "c"}, {"advance": 9000}, {"poll": True}, {"snap": "d"}]
         out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
-        self.assertNotIn("changed while typing", out["b"]["text"])  # nothing shifts under the keyboard or paste menu
-        self.assertIn("changed while typing", out["c"]["text"])  # applied as soon as focus leaves
-        self.assertEqual([b["uid"] for b in self.box(out["a"])], [b["uid"] for b in self.box(out["c"])])
-        self.assertEqual(self.box(out["c"])[0]["value"], "pasted text")
+        self.assertNotIn("changed while typing", out["b"]["text"])  # focused: nothing shifts
+        self.assertNotIn("changed while typing", out["c"]["text"])  # just blurred (the paste dialog case): still held
+        self.assertIn("changed while typing", out["d"]["text"])  # applied by a later poll once quiet
+        self.assertEqual([b["uid"] for b in self.box(out["a"])], [b["uid"] for b in self.box(out["d"])])
+        self.assertEqual(self.box(out["d"])[0]["value"], "pasted text")
 
     def test_something_the_user_must_not_miss_is_shown_even_while_typing(self):
         gate = {"id": "ap_" + "3" * 16, "action": "Deploy build abc123", "reason": "needed", "nonce": "n", "status": "pending", "bound_epoch": 3}
@@ -294,11 +310,57 @@ class TestScreens(unittest.TestCase):
         routes = {ME[0]: ME[1], "GET /api/v1/projects": [200, {"projects": ["nova", "vertex"]}],
                   "POST /api/v1/sessions": [201, view()]}
         out = run_ui("#/new", routes, [{"type": "textarea", "value": "Audit first. Do not deploy."}, {"click": "Start Session"}])
-        self.assertEqual(sorted(set(out["inputs"])), ["select", "textarea"])  # no free-text path or command input
+        self.assertEqual(sorted(set(out["inputs"])), ["input", "select", "textarea"])
+        labels = [a[2] for a in out["attrs"] if a[1] == "aria-label"]
+        self.assertEqual(sorted(labels), ["Project", "Session name", "Task"])  # the one text input is the display name, never a path or command
         self.assertIn("nova", out["texts"])
         post = [c for c in out["calls"] if c["method"] == "POST"][0]
         self.assertEqual(sorted(post["body"]), ["project", "request_id", "task"])
         self.assertEqual(post["body"]["project"], "nova")
+
+    def test_new_session_sends_a_name_only_when_one_is_given(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/projects": [200, {"projects": ["nova"]}], "POST /api/v1/sessions": [201, view()]}
+        blank = run_ui("#/new", routes, [{"type": "textarea", "value": "task"}, {"click": "Start Session"}])
+        self.assertNotIn("name", [c for c in blank["calls"] if c["method"] == "POST"][0]["body"])
+        named = run_ui("#/new", routes, [{"type": "input", "value": "  Nova Voice Fix "}, {"type": "textarea", "value": "task"}, {"click": "Start Session"}])
+        self.assertEqual([c for c in named["calls"] if c["method"] == "POST"][0]["body"]["name"], "Nova Voice Fix")
+        self.assertIn(["input", "maxlength", "60"], named["attrs"])
+
+    def test_names_show_in_the_list_and_on_the_session_page(self):
+        s = view(name="Nova Voice Fix")
+        lst = run_ui("#/", {ME[0]: ME[1], "GET /api/v1/sessions": [200, {"sessions": [s, view(logical_session_id="ls_" + "b" * 24)]}]})
+        self.assertIn("Nova Voice Fix", lst["all"])
+        self.assertIn("Project: Nova", lst["all"])
+        page = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, s]})
+        self.assertIn("Nova Voice Fix", page["all"])
+        self.assertIn("Rename", page["buttons"])
+        plain = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view()]})
+        self.assertIn("Nova", plain["all"])  # no custom name: the default label
+
+    def test_renaming_from_the_phone(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(name="Remote scratch")],
+                  "POST /api/v1/sessions/%s/rename" % LSID: [200, view(name="Nova Voice Fix")]}
+        out = run_ui("#/s/" + LSID, routes, [{"click": "Rename"}, {"snap": "open"}, {"type": "input", "value": "Nova Voice Fix"}, {"click": "Save name"}])
+        self.assertIn("Rename this session", out["snaps"]["open"]["text"])
+        self.assertEqual([b["value"] for b in out["snaps"]["open"]["boxes"] if b["tag"] == "input"], ["Remote scratch"])  # prefilled
+        post = [c for c in out["calls"] if c["method"] == "POST"][0]
+        self.assertTrue(post["path"].endswith("/rename"))
+        self.assertEqual(sorted(post["body"]), ["name", "request_id"])
+        self.assertEqual(post["body"]["name"], "Nova Voice Fix")
+
+    def test_the_rename_box_survives_polling_and_never_touches_the_instruction_box(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view()]}
+        steps = [{"type": "textarea", "value": "half-typed instruction"}, {"click": "Rename"}, {"type": "input", "value": "New nam"}, {"snap": "a"},
+                 self.newer("output moved on"), {"poll": True}, {"poll": True}, {"snap": "b"}]
+        out = run_ui("#/s/" + LSID, routes, steps)["snaps"]
+        self.assertEqual(out["a"]["boxes"], out["b"]["boxes"])  # both boxes: same nodes, same text
+        self.assertEqual([b["value"] for b in out["b"]["boxes"]], ["half-typed instruction", "New nam"])
+
+    def test_a_hostile_name_is_only_ever_text(self):
+        evil = "<img src=x onerror=alert(1)>"
+        out = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(name=evil)]})
+        self.assertIn(evil, out["all"])
+        self.assertEqual([a for a in out["attrs"] if a[1].startswith("on")], [])
 
     def test_a_failed_start_is_reported_plainly(self):
         routes = {ME[0]: ME[1], "GET /api/v1/projects": [200, {"projects": ["nova"]}],

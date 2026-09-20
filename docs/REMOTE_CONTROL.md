@@ -399,6 +399,29 @@ registered as owner. The task text goes into the inbox and is read by the agent
 as data; it never reaches a shell or argv. Only one active session per project
 is allowed (a single writer).
 
+## Session names
+
+A session can be given a **display name** when it is created from the phone (optional; blank keeps
+the default naming) and renamed later from the session page. The name is metadata only: it is
+stored on the logical session and never changes its ID, owner, epoch, process binding, project,
+permissions, inbox, approvals, STOP state or handoff chain. It persists across page refreshes,
+disconnects, gateway restarts and every A → B handoff, and each rename is recorded in the
+session history and the audit log with the old and new names. Names are 1–60 characters of
+letters, numbers, spaces and `. , ' & ( ) + # : ! ? -`; anything that looks like a path, a command
+or an identifier (for example `../x`, `a/b`, `$(id)`, `ls_…`) is refused, and the UI only ever
+shows a name as text. A custom name given at creation also labels the Claude session (successors
+get the usual generation suffix); a later rename changes the phone label only, not the terminal
+title.
+
+## Mobile text entry
+
+The instruction box is a plain native `textarea`. The page never reads or writes the clipboard,
+never calls `focus()` or changes the selection, and registers no `paste`, `input` or
+`beforeinput` handler. While the box has focus, and for eight seconds after it loses it (iOS can
+blur it while its own paste dialog is up), polling changes nothing on the page except an urgent
+change (state, an approval, STOP, orphaned). The iOS "Pasting from <device>…" dialog is Apple's
+Universal Clipboard transfer, which a web page cannot start or stop.
+
 ## Dead-owner detection and recovery
 
 A session must not keep showing `RUNNING` after its owner died. Every 15 s the

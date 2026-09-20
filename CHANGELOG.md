@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Dead-owner detection, ORPHANED state and service-restart recovery.**
 - New notification kinds: `human_gate`, `remote_degraded`, `owner_lost`.
 
+### Added (mobile)
+
+- Optional session names, set at creation and changed from the session page (display metadata only).
+- The instruction box is stable under polling and around iOS focus changes.
+
 ### Changed
 
 - The single graceful-stop signalling call moved into `send_graceful_stop()`;

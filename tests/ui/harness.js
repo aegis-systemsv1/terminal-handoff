@@ -17,6 +17,7 @@ process.stdin.on('end', async () => {
   N.prototype.querySelector = function (sel) { let hit = null; this.walk((n) => { if (!hit && n.tag === sel) hit = n; }); return hit; };
   const app = new N('main');
   const calls = [];
+  let NOW = 1000000000000; Date.now = () => NOW;
   const intervals = [];
   global.document = { activeElement: null, createElement: (t) => new N(t), createTextNode: (t) => { const n = new N('#text'); n._text = t; return n; }, getElementById: () => app, hidden: false };
   global.window = { crypto: { randomUUID: () => 'uuid-' + calls.length }, addEventListener() {} };
@@ -37,7 +38,8 @@ process.stdin.on('end', async () => {
   for (const step of cfg.steps || []) {
     if (step.routes) { Object.assign(cfg.routes, step.routes); continue; }
     if (step.poll) { intervals.slice().forEach((f) => f()); await tick(); await tick(); continue; }
-    if (step.focus) { let t = null; app.walk((n) => { if (n.tag === step.focus && !t) t = n; }); document.activeElement = t; continue; }
+    if (step.advance) { NOW += step.advance; continue; }
+    if (step.focus) { let t = null; app.walk((n) => { if (n.tag === step.focus && !t) t = n; }); document.activeElement = t; if (t && t.listeners.focus) t.listeners.focus({}); continue; }
     if (step.blur) { const t = document.activeElement; document.activeElement = null; if (t && t.listeners.blur) t.listeners.blur({}); await tick(); continue; }
     if (step.snap) { snaps[step.snap] = { boxes: boxes(), text: app.textContent, buttons: (() => { const b = []; app.walk((n) => { if (n.tag === 'button') b.push(n.textContent); }); return b; })() }; continue; }
     if (step.type) { let t = null; app.walk((n) => { if (n.tag === step.type && !t) t = n; }); if (t) t.value = step.value; continue; }

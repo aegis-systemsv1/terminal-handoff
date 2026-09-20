@@ -6091,6 +6091,49 @@ class LogicalRefusal(Exception):
     """A logical-session operation refused before changing anything."""
 
 
+SESSION_NAME_MAX = 60
+SESSION_NAME_RE = re.compile(r"^[\w .,'&()+#:!?-]+$")
+
+
+def clean_session_name(value):
+    """`(ok, name_or_None, reason)`. A display label only: never a path, command or identifier.
+
+    Blank clears the custom name (the default label applies again).
+    """
+    if value is None:
+        return True, None, None
+    if not isinstance(value, str):
+        return False, None, "the name must be text"
+    name = " ".join(value.split())  # collapses whitespace and drops newlines and tabs
+    if not name:
+        return True, None, None
+    if len(name) > SESSION_NAME_MAX:
+        return False, None, "the name is longer than %d characters" % SESSION_NAME_MAX
+    if not SESSION_NAME_RE.match(name):
+        return False, None, "use letters, numbers, spaces and . , ' & ( ) + # : ! ? - only"
+    if name[0] in ".-#" or LOGICAL_ID_RE.match(name) or re.match(r"^(ls_|ap_|im_|d_)[a-f0-9]+$", name):
+        return False, None, "that name looks like an identifier or path"
+    return True, name, None
+
+
+def logical_rename(lsid, value, by="local"):
+    """Change the display name only. Nothing about identity, ownership or state changes."""
+    ok, name, why = clean_session_name(value)
+    if not ok:
+        return False, why, None
+    old = {}
+
+    def mutate(record):
+        old["name"] = record.get("name")
+        record["name"] = name
+        logical_history(record, "renamed", by=by, old_name=old["name"], new_name=name)
+
+    done, reason, _, record = logical_mutate(lsid, mutate)
+    if done:
+        log_event("logical_renamed", logical_session_id=lsid, by=by, old_name=old["name"], new_name=name)
+    return done, reason, record
+
+
 def logical_session_valid(lsid):
     return isinstance(lsid, str) and bool(LOGICAL_ID_RE.match(lsid))
 
@@ -6162,6 +6205,7 @@ def logical_create(
         "repository": repository,
         "branch": branch,
         "title": clean_untrusted_text(title, 200) if title else None,
+        "name": None,
         "state": state,
         "created_by": created_by,
         "created_utc": utc_stamp(),
@@ -6589,6 +6633,7 @@ def logical_public_view(record):
         "project": record.get("project"),
         "branch": record.get("branch"),
         "title": record.get("title"),
+        "name": record.get("name"),
         "state": record.get("state"),
         "created_utc": record.get("created_utc"),
         "updated_utc": record.get("updated_utc"),
@@ -6700,6 +6745,8 @@ def cmd_session(args):
         ok, why, approval = approval_decide(lsid, args.approval_id, args.decision, args.nonce, args.owner_epoch, "local")
     elif action == "recover":
         ok, why, _ = logical_recover(lsid, args.recover_action, by="local")
+    elif action == "rename":
+        ok, why, _ = logical_rename(lsid, args.text, by="local")
     elif action == "check":
         halt = logical_halt_reason(record)
         owner = _is_owner(record, agent)
@@ -7390,13 +7437,15 @@ SENSITIVE_LIMITS = {
     "pause": (30, 60),
     "resume": (30, 60),
     "recover": (10, 60),
+    "rename": (30, 60),
 }
 ALLOWED_BODY_KEYS = {
     "instructions": {"text", "request_id"},
     "pause": {"request_id"},
     "resume": {"request_id", "reason", "clear_stop"},
     "stop": {"request_id", "reason", "hard"},
-    "create": {"project", "task", "request_id"},
+    "create": {"project", "task", "name", "request_id"},
+    "rename": {"name", "request_id"},
     "approve": {"nonce", "owner_epoch", "request_id"},
     "deny": {"nonce", "owner_epoch", "request_id"},
     "recover": {"action", "request_id"},
@@ -7599,7 +7648,8 @@ UI_APP_JS = r"""
           if (s.state === 'STOPPED') sub = 'STOPPED by you';
           if (s.state === 'ORPHANED') sub = 'Claude stopped responding';
           box.appendChild(el('a', { 'class': 'card', href: '#/s/' + s.logical_session_id }, [
-            el('div', { 'class': 'row' }, [el('strong', { text: s.project || 'session' }), stateEl(s.state)]),
+            el('div', { 'class': 'row' }, [el('strong', { text: s.name || s.project || 'session' }), stateEl(s.state)]),
+            s.name ? el('div', { 'class': 'muted', text: 'Project: ' + (s.project || '') }) : null,
             el('div', { 'class': 'muted', text: sub }),
             el('div', { 'class': 'muted', text: 'Remote Control: ' + remoteLabel(s.remote_control) })]));
         });
@@ -7617,19 +7667,22 @@ UI_APP_JS = r"""
     stop(); clear();
     formRequestId = rid();
     var select = el('select', { 'aria-label': 'Project' });
+    var nameBox = el('input', { type: 'text', maxlength: '60', placeholder: 'Session name (optional)', 'aria-label': 'Session name', autocomplete: 'off' });
     var task = el('textarea', { placeholder: 'What should Claude do? (dictation works here)', 'aria-label': 'Task' });
     var msg = el('p', { 'class': 'err', text: '' });
     var go = el('button', { text: 'Start Session', onclick: function () {
       if (!select.value || !task.value.trim()) { msg.textContent = 'Choose a project and describe the task.'; return; }
       go.disabled = true; msg.textContent = ''; msg.className = 'note'; msg.textContent = 'Starting on your Mac…';
-      api('POST', '/api/v1/sessions', { project: select.value, task: task.value, request_id: formRequestId }).then(function (r) {
+      var body = { project: select.value, task: task.value, request_id: formRequestId };
+      if (nameBox.value.trim()) body.name = nameBox.value.trim();
+      api('POST', '/api/v1/sessions', body).then(function (r) {
         var d = r.data || {};
         if ((r.status === 201 || r.status === 200 || r.status === 202) && d.logical_session_id) nav('#/s/' + d.logical_session_id);
         else { go.disabled = false; msg.className = 'err'; msg.textContent = 'Not started: ' + (d.reason || d.error || ('error ' + r.status)); }
       });
     } });
     app.appendChild(el('a', { 'class': 'back', href: '#/', text: '‹ Sessions' }));
-    app.appendChild(el('div', { 'class': 'card' }, [el('h2', { text: 'New Session' }), el('label', { text: 'Project' }), select, el('label', { text: 'Task' }), task, go, msg]));
+    app.appendChild(el('div', { 'class': 'card' }, [el('h2', { text: 'New Session' }), el('label', { text: 'Project' }), select, el('label', { text: 'Name' }), nameBox, el('label', { text: 'Task' }), task, go, msg]));
     api('GET', '/api/v1/projects').then(function (r) {
       var names = (r.data && r.data.projects) || [];
       if (!names.length) { msg.textContent = 'No project is enabled for remote launch.'; go.disabled = true; }
@@ -7645,7 +7698,8 @@ UI_APP_JS = r"""
     var head = el('div'), tail = el('div'), composer = el('div');
     var flash = el('p', { 'class': 'note', text: '' });
     var text = el('textarea', { placeholder: 'Tell Claude…', 'aria-label': 'Instruction', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
-    var sending = false, view = null, pending = null, panel = null, lastKey = null, lastImportant = null;
+    var sending = false, view = null, panel = null, lastKey = null, lastImportant = null, lastFocusEvent = 0;
+    var QUIET_MS = 8000; // no non-urgent redraw within this long of the box gaining or losing focus
     composer.hidden = true;
     var sendBtn = el('button', { text: 'Send', onclick: send });
     composer.appendChild(text); composer.appendChild(sendBtn);
@@ -7679,7 +7733,8 @@ UI_APP_JS = r"""
     function drawHead() {
       var s = view;
       while (head.firstChild) head.removeChild(head.firstChild);
-      head.appendChild(el('div', { 'class': 'row' }, [el('h2', { text: s.project || 'Session' }), stateEl(s.state)]));
+      head.appendChild(el('div', { 'class': 'row' }, [el('h2', { text: s.name || s.project || 'Session' }), stateEl(s.state)]));
+      head.appendChild(el('button', { 'class': 'secondary', text: 'Rename', onclick: function () { panel = 'rename'; drawTail(true); } }));
       if (s.human_gate) {
         var g = s.human_gate;
         head.appendChild(el('div', { 'class': 'card gate' }, [
@@ -7723,6 +7778,16 @@ UI_APP_JS = r"""
       while (tail.firstChild) tail.removeChild(tail.firstChild);
       var ended = view.state === 'FAILED' || view.state === 'COMPLETED';
       composer.hidden = ended;
+      if (panel === 'rename') {
+        var nm = el('input', { type: 'text', maxlength: '60', placeholder: 'Session name', 'aria-label': 'Session name', autocomplete: 'off' });
+        nm.value = view.name || '';
+        tail.appendChild(el('div', { 'class': 'card' }, [
+          el('strong', { text: 'Rename this session' }),
+          el('div', { 'class': 'muted', text: 'A label for you only. Nothing about the session changes. Leave blank to use the default.' }), nm,
+          el('div', { 'class': 'grid2' }, [
+            el('button', { 'class': 'secondary', text: 'Cancel', onclick: function () { panel = null; drawTail(true); } }),
+            el('button', { text: 'Save name', onclick: function () { control('/api/v1/sessions/' + id + '/rename', { name: nm.value }, 'Renamed.'); } })])]));
+      }
       if (ended) return;
       var stopped = view.state === 'STOPPED';
       tail.appendChild(el('div', { 'class': 'grid3' }, [
@@ -7751,18 +7816,22 @@ UI_APP_JS = r"""
               control('/api/v1/sessions/' + id + '/resume', { clear_stop: true, reason: why.value }, 'STOP cleared.'); } })])]));
       }
     }
-    // Redraw only what changed, and while the instruction box has focus hold back everything
-    // except a change the user must not miss (state, approval, STOP, orphaned): the layout must
-    // not shift under an open keyboard or paste menu.
+    // Redraw only what changed. While the instruction box has focus, and for a few seconds after
+    // it loses it (iOS can blur the box while its own paste dialog is up), hold back everything
+    // except a change the user must not miss (state, approval, STOP, orphaned). The page never
+    // changes the DOM around the box while iOS owns typing, selection or paste. The listeners
+    // below only record a timestamp; they never touch the box, focus, selection or the clipboard.
     function applyView() {
       var key = JSON.stringify(view);
       if (key === lastKey) return;
       var important = JSON.stringify([view.state, view.human_gate && view.human_gate.id, view.stop, view.orphaned]);
-      if (document.activeElement === text && important === lastImportant && lastKey !== null) { pending = true; return; }
-      lastKey = key; lastImportant = important; pending = false;
+      var busy = document.activeElement === text || (Date.now() - lastFocusEvent) < QUIET_MS;
+      if (busy && important === lastImportant && lastKey !== null) return; // the next poll applies it once quiet
+      lastKey = key; lastImportant = important;
       drawHead(); drawTail(false);
     }
-    text.addEventListener('blur', function () { if (pending) applyView(); });
+    text.addEventListener('focus', function () { lastFocusEvent = Date.now(); });
+    text.addEventListener('blur', function () { lastFocusEvent = Date.now(); });
     function load() {
       api('GET', '/api/v1/sessions/' + id).then(function (r) {
         if (r.status === 401) return boot();
@@ -7943,7 +8012,7 @@ def make_remote_handler(gateway):
                 lsid, approval_id, action = APPROVAL_PATH_RE.match(path).groups()
             else:
                 match = SESSION_PATH_RE.match(path)
-                if not match or match.group(2) not in ("instructions", "pause", "resume", "stop", "recover"):
+                if not match or match.group(2) not in ("instructions", "pause", "resume", "stop", "recover", "rename"):
                     return self._deny(404, "not_found")
                 lsid, action = match.group(1), match.group(2)
             unknown = set(body) - ALLOWED_BODY_KEYS[action]
@@ -8010,6 +8079,11 @@ def make_remote_handler(gateway):
                 if not ok:
                     status = 404 if why in ("unknown approval",) else 409
                     return status, {"error": "refused", "reason": why, "session": logical_public_view(logical_read(lsid))}
+                return 200, logical_public_view(logical_read(lsid))
+            if action == "rename":
+                ok, why, _ = logical_rename(lsid, body.get("name"), by=by)
+                if not ok:
+                    return 400, {"error": "bad_request", "reason": why}
                 return 200, logical_public_view(logical_read(lsid))
             if action == "recover":
                 ok, why, _ = logical_recover(lsid, body.get("action"), by=by)
@@ -8455,6 +8529,9 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     task = clean_untrusted_text(body.get("task"), MAX_INSTRUCTION_CHARS)
     if not isinstance(project_name, str) or task is None:
         return 400, {"error": "bad_request", "reason": "project and a non-empty task are required"}
+    name_ok, custom_name, name_why = clean_session_name(body.get("name"))
+    if not name_ok:
+        return 400, {"error": "bad_request", "reason": name_why}
 
     real, project, why = project_resolve(project_name)
     if real is None:
@@ -8500,6 +8577,7 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
 
         def annotate(rec):
             rec["created_request_id"] = request_key
+            rec["name"] = custom_name
             rec["th_command"] = {"python": sys.executable or "python3", "core": os.path.abspath(__file__)}
             rec["permissions"] = {
                 "profile": profile["profile"],
@@ -8518,7 +8596,8 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     prompt_file = th_path("prompts", "remote-%s.md" % lsid)
     write_text_private(prompt_file, render_remote_prompt(record, profile))
     bootstrap = "TERMINAL HANDOFF REMOTE SESSION %s. Read %s in full and follow it exactly before anything else." % (lsid, prompt_file)
-    name = sanitize_display_name("Remote %s" % project_name) or "Remote session"
+    # A custom name also labels the Claude session and, through the existing chain naming, its successors.
+    name = (sanitize_display_name(custom_name) if custom_name else None) or sanitize_display_name("Remote %s" % project_name) or "Remote session"
     argv = build_remote_launch_argv(claude_bin, name, settings_file, bootstrap)
     problems = assert_remote_argv_safe(argv)
     if problems:
@@ -10137,7 +10216,7 @@ def main(argv=None):
         "action",
         choices=(
             "list", "show", "stop", "pause", "resume", "post", "inbox", "ack", "note", "check",
-            "wait", "gate", "consume", "decide", "recover", "reconcile", "hook-stop",
+            "wait", "gate", "consume", "decide", "recover", "reconcile", "hook-stop", "rename",
         ),
     )
     p.add_argument("--timeout", type=float, default=540.0)
