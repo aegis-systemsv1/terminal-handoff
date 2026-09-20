@@ -407,4 +407,4 @@ sequenceDiagram
 
 See [REMOTE_CONTROL.md](REMOTE_CONTROL.md) for the gateway, approvals, STOP,
 recovery and threat model, and
-[decisions/0003-remote-session-control.md](decisions/0003-remote-session-control.md).
+[decisions/0004-remote-session-control.md](decisions/0004-remote-session-control.md).

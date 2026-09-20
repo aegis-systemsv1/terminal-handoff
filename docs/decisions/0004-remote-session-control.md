@@ -1,4 +1,4 @@
-# 3. Remote session control sits above, and never replaces, the transfer state machine
+# 4. Remote session control sits above, and never replaces, the transfer state machine
 
 Status: accepted
 
