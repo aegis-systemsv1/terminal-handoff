@@ -659,5 +659,77 @@ class TestNonDefaultPublicPort(LogicalCase):
         self.assertEqual(self.call("POST", path, body, origin="https://%s:8444" % HOST), 403)
 
 
+class TestTranscriptAndArchiveApi(RemoteCase):
+    """The two endpoints the phone's transcript and cleanup controls depend on."""
+
+    def setUp(self):
+        super().setUp()
+        _, self.token = self.enroll_token()
+        self.lsid = self.session()
+        self.base = "/api/v1/sessions/%s" % self.lsid
+
+    def post(self, suffix, body, **kw):
+        return self.call("POST", self.base + suffix, body, token=self.token, **kw)
+
+    def test_the_transcript_is_served_in_order_and_bounded(self):
+        for n in range(5):
+            CORE.logical_append_output(self.lsid, "agent-A-session", "line %d" % n)
+        status, payload, _ = self.call("GET", self.base + "/transcript", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual([i["ordinal"] for i in payload["items"]], sorted(i["ordinal"] for i in payload["items"]))
+        self.assertIn("line 4", [i["text"] for i in payload["items"]])
+        status, small, _ = self.call("GET", self.base + "/transcript?limit=2", token=self.token)
+        self.assertEqual(len(small["items"]), 2)
+        self.assertTrue(small["has_more"])
+
+    def test_a_nonsense_transcript_query_is_ignored_rather_than_fatal(self):
+        for query in ("?limit=abc", "?limit=-5", "?before=nonsense", "?limit=99999", "?before=-1"):
+            status, payload, _ = self.call("GET", self.base + "/transcript" + query, token=self.token)
+            self.assertEqual(status, 200, query)
+            self.assertLessEqual(len(payload["items"]), CORE.MAX_TRANSCRIPT_PAGE)
+
+    def test_the_transcript_needs_the_device_credential(self):
+        self.assertEqual(self.call("GET", self.base + "/transcript")[0], 401)
+
+    def test_an_unknown_session_transcript_is_a_404(self):
+        self.assertEqual(self.call("GET", "/api/v1/sessions/ls_" + "f" * 24 + "/transcript", token=self.token)[0], 404)
+
+    def test_archiving_a_finished_session_and_restoring_it(self):
+        CORE.logical_mutate(self.lsid, lambda record: record.update({"state": "COMPLETED"}))
+        status, payload, _ = self.post("/archive", {"request_id": "req-ar000001"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["archived"])
+        status, payload, _ = self.post("/restore", {"request_id": "req-ar000002"})
+        self.assertEqual((status, payload["archived"]), (200, None))
+
+    def test_archiving_a_live_session_is_refused_over_the_api(self):
+        status, payload, _ = self.post("/archive", {"request_id": "req-ar000003"})
+        self.assertEqual(status, 409)
+        self.assertIn("finished", payload["reason"])
+        self.assertIsNone(CORE.logical_read(self.lsid).get("archived"))
+
+    def test_archive_takes_no_path_command_or_pid(self):
+        CORE.logical_mutate(self.lsid, lambda record: record.update({"state": "COMPLETED"}))
+        for field, value in (("path", "/etc"), ("command", "rm -rf /"), ("pid", 1), ("repository", "/tmp"), ("force", True)):
+            status, _, _ = self.post("/archive", {"request_id": "req-ar000004", field: value})
+            self.assertEqual(status, 400, field)
+        self.assertIsNone(CORE.logical_read(self.lsid).get("archived"))
+
+    def test_archive_is_replay_safe(self):
+        CORE.logical_mutate(self.lsid, lambda record: record.update({"state": "COMPLETED"}))
+        body = {"request_id": "req-ar000005"}
+        self.assertEqual(self.post("/archive", body)[0], 200)
+        status, payload, _ = self.post("/archive", body)
+        self.assertEqual(status, 200, "the same request id replays its own answer, not a second archive")
+        self.assertTrue(payload.get("replayed"))
+
+    def test_archiving_leaves_every_other_session_alone(self):
+        other = self.new_session(owner="agent-other")
+        before = CORE.logical_read(other)
+        CORE.logical_mutate(self.lsid, lambda record: record.update({"state": "COMPLETED"}))
+        self.assertEqual(self.post("/archive", {"request_id": "req-ar000006"})[0], 200)
+        self.assertEqual(CORE.logical_read(other), before)
+
+
 if __name__ == "__main__":
     unittest.main()

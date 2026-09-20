@@ -30,6 +30,17 @@ def view(**over):
     return base
 
 
+def item(n, text, kind="output", generation=1):
+    """One transcript item as the gateway serves it."""
+    return {"id": ("h%d" % n) if kind == "event" else ("o%d" % n), "kind": kind, "ts": "2026-01-01T00:00:%02dZ" % min(n, 59),
+            "text": text, "ordinal": n, "generation": generation}
+
+
+def transcript_route(items, has_more=False, lsid=None, query="?limit=200"):
+    path = "GET /api/v1/sessions/%s/transcript%s" % (lsid or LSID, query)
+    return {path: [200, {"items": items, "has_more": has_more, "total": len(items)}]}
+
+
 def run_ui(hash_, routes, steps=None):
     payload = {"js": CORE.UI_APP_JS, "hash": hash_, "routes": routes, "steps": steps or []}
     proc = subprocess.run([NODE, HARNESS], input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
@@ -150,7 +161,9 @@ class TestScreens(unittest.TestCase):
         self.assertIn("+ New Session", out["buttons"])
 
     def test_session_view_shows_everything_needed(self):
-        out = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view()]})
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view()]}
+        routes.update(transcript_route([item(1, "reading tests")]))
+        out = run_ui("#/s/" + LSID, routes)
         text = out["all"]
         for expected in ("Nova", "RUNNING", "Audit retrieval latency", "Branch: main", "Owner generation: 3", "Remote Control: Healthy", "Instructions pending: 1", "reading tests", "Claude is listening"):
             self.assertIn(expected, text)
@@ -218,11 +231,18 @@ class TestScreens(unittest.TestCase):
     # ---- the instruction box must survive polling (iPhone Safari copy/paste, keyboard, draft) ----
 
     def session_routes(self, **over):
-        return {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(**over)],
-                "POST /api/v1/sessions/%s/instructions" % LSID: [202, {"message_id": "im_1", "seq": 2}]}
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(**over)],
+                  "POST /api/v1/sessions/%s/instructions" % LSID: [202, {"message_id": "im_1", "seq": 2}]}
+        routes.update(transcript_route([item(1, "reading tests")]))
+        return routes
 
     def newer(self, text="a brand new output line", **over):
-        return {"routes": {"GET /api/v1/sessions/" + LSID: [200, view(recent_output=[{"ts": "t", "text": text}], **over)]}}
+        # Each distinct line is a distinct transcript item, exactly as the gateway numbers them.
+        self._seq = getattr(self, "_seq", 1) + 1
+        self._lines = getattr(self, "_lines", [item(1, "reading tests")]) + [item(self._seq, text)]
+        routes = {"GET /api/v1/sessions/" + LSID: [200, view(recent_output=[{"ts": "t", "text": text}], **over)]}
+        routes.update(transcript_route(list(self._lines)))
+        return {"routes": routes}
 
     def box(self, snap):
         return [b for b in snap["boxes"] if b["tag"] == "textarea"]
@@ -245,13 +265,19 @@ class TestScreens(unittest.TestCase):
         self.assertEqual(self.box(out["a"])[0]["uid"], self.box(out["b"])[0]["uid"])
 
     def test_the_layout_is_held_still_while_focused_and_for_a_quiet_period_after(self):
-        """iOS can blur the box while its own paste dialog is up: nothing may shift around it then."""
-        steps = [{"focus": "textarea"}, {"type": "textarea", "value": "pasted text"}, {"snap": "a"}, self.newer("changed while typing"), {"poll": True},
+        """iOS can blur the box while its own paste dialog is up: nothing may shift around it then.
+
+        The transcript is exempt: it is a fixed-height container that is only ever appended
+        to, so it never reflows the box, and holding it back would defeat live follow.
+        """
+        steps = [{"focus": "textarea"}, {"type": "textarea", "value": "pasted text"}, {"snap": "a"},
+                 self.newer("streamed while typing", title="changed while typing"), {"poll": True},
                  {"snap": "b"}, {"blur": True}, {"poll": True}, {"snap": "c"}, {"advance": 9000}, {"poll": True}, {"snap": "d"}]
         out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
-        self.assertNotIn("changed while typing", out["b"]["text"])  # focused: nothing shifts
+        self.assertNotIn("changed while typing", out["b"]["text"])  # focused: the details do not shift
         self.assertNotIn("changed while typing", out["c"]["text"])  # just blurred (the paste dialog case): still held
         self.assertIn("changed while typing", out["d"]["text"])  # applied by a later poll once quiet
+        self.assertIn("streamed while typing", out["b"]["text"])  # the transcript keeps up regardless
         self.assertEqual([b["uid"] for b in self.box(out["a"])], [b["uid"] for b in self.box(out["d"])])
         self.assertEqual(self.box(out["d"])[0]["value"], "pasted text")
 
@@ -363,7 +389,7 @@ class TestScreens(unittest.TestCase):
         out = run_ui("#/s/" + LSID, routes, [{"click": "Rename"}, {"snap": "open"}])["snaps"]["open"]["text"]
         self.assertIn("Rename this session", out)
         self.assertLess(out.index("Rename this session"), out.index("Current task"))  # above the details
-        self.assertLess(out.index("Rename this session"), out.index("Recent output"))
+        self.assertLess(out.index("Rename this session"), out.index("Transcript"))
         self.assertLess(out.index("Rename this session"), out.index("Instructions pending"))
 
     def test_saving_or_cancelling_closes_the_panel_and_a_refused_name_keeps_it_open(self):
@@ -391,6 +417,150 @@ class TestScreens(unittest.TestCase):
                   "POST /api/v1/sessions": [503, {"error": "isolation_unverified", "reason": "permission isolation has not been verified"}]}
         out = run_ui("#/new", routes, [{"type": "textarea", "value": "task"}, {"click": "Start Session"}])
         self.assertIn("Not started: permission isolation has not been verified", out["all"])
+
+
+@unittest.skipIf(NODE is None, "node is required for the UI tests")
+class TestTranscript(unittest.TestCase):
+    """Reading the session on a phone: follow the latest, or hold still while you read."""
+
+    GEOM = {"measure": {"lineHeight": 10, "clientHeight": 100, "toBottom": True}}
+
+    def routes(self, items, **over):
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(**over)]}
+        routes.update(transcript_route(items))
+        return routes
+
+    def start(self, count=30):
+        return self.routes([item(n, "line %d" % n) for n in range(count)])
+
+    def arrive(self, count, extra):
+        """The next poll carries `extra` more lines."""
+        items = [item(n, "line %d" % n) for n in range(count + extra)]
+        return {"routes": transcript_route(items)}
+
+    def test_the_transcript_shows_the_session_history_not_a_tiny_snapshot(self):
+        out = run_ui("#/s/" + LSID, self.start(30), [self.GEOM])
+        self.assertIn("Transcript", out["all"])
+        self.assertEqual(len(out["transcript"]["lines"]), 30)
+        self.assertIn("line 29", out["transcript"]["lines"][-1])
+
+    def test_at_the_bottom_new_output_follows_automatically(self):
+        steps = [self.GEOM, {"scrollTo": "bottom"}, self.arrive(30, 3), {"poll": True}, {"readTranscript": "after"}]
+        after = run_ui("#/s/" + LSID, self.start(30), steps)["snaps"]["after"]
+        self.assertEqual(len(after["lines"]), 33)
+        self.assertTrue(after["atBottom"], "a reader already at the bottom must keep seeing the newest line")
+        self.assertTrue(after["pillHidden"], "no catch-up prompt is needed while following")
+
+    def test_scrolling_up_stops_the_auto_scroll_and_holds_the_reading_position(self):
+        steps = [self.GEOM, {"scrollTo": 40}, {"readTranscript": "reading"},
+                 self.arrive(30, 5), {"poll": True}, {"readTranscript": "after"}]
+        snaps = run_ui("#/s/" + LSID, self.start(30), steps)["snaps"]
+        self.assertEqual(snaps["reading"]["scrollTop"], 40)
+        self.assertEqual(snaps["after"]["scrollTop"], 40, "incoming output must not move what the reader is looking at")
+        self.assertFalse(snaps["after"]["atBottom"], "it must not drag the reader back down")
+        self.assertEqual(len(snaps["after"]["lines"]), 35, "the new output is still received in the background")
+
+    def test_new_output_while_reading_is_announced_and_counted(self):
+        steps = [self.GEOM, {"scrollTo": 40}, self.arrive(30, 3), {"poll": True}, {"readTranscript": "after"}]
+        after = run_ui("#/s/" + LSID, self.start(30), steps)["snaps"]["after"]
+        self.assertFalse(after["pillHidden"])
+        self.assertEqual(after["pillText"], "3 new updates ↓")
+
+    def test_one_new_update_is_not_announced_in_the_plural(self):
+        steps = [self.GEOM, {"scrollTo": 40}, self.arrive(30, 1), {"poll": True}, {"readTranscript": "after"}]
+        self.assertEqual(run_ui("#/s/" + LSID, self.start(30), steps)["snaps"]["after"]["pillText"], "1 new update ↓")
+
+    def test_jump_to_latest_returns_to_the_bottom_and_follows_again(self):
+        steps = [self.GEOM, {"scrollTo": 40}, self.arrive(30, 3), {"poll": True},
+                 {"click": "3 new updates ↓"}, {"readTranscript": "jumped"},
+                 self.arrive(30, 6), {"poll": True}, {"readTranscript": "following"}]
+        snaps = run_ui("#/s/" + LSID, self.start(30), steps)["snaps"]
+        self.assertTrue(snaps["jumped"]["atBottom"])
+        self.assertTrue(snaps["jumped"]["pillHidden"])
+        self.assertTrue(snaps["following"]["atBottom"], "tapping it must restore live follow")
+        self.assertEqual(len(snaps["following"]["lines"]), 36)
+
+    def test_the_latest_button_is_always_available(self):
+        steps = [self.GEOM, {"scrollTo": 40}, {"click": "↓ Latest"}, {"readTranscript": "after"}]
+        self.assertTrue(run_ui("#/s/" + LSID, self.start(30), steps)["snaps"]["after"]["atBottom"])
+
+    def test_polling_appends_and_never_rebuilds_the_transcript(self):
+        steps = [self.GEOM, {"scrollTo": "bottom"}, self.arrive(30, 2), {"poll": True}, {"poll": True}, {"poll": True}]
+        out = run_ui("#/s/" + LSID, self.start(30), steps)
+        self.assertEqual(len(out["transcript"]["lines"]), 32, "repeated polls must not duplicate or rebuild lines")
+
+    def test_lifecycle_events_are_marked_in_the_one_logical_history(self):
+        items = [item(0, "generation 1 working"), item(1, "Handoff started", kind="event"),
+                 item(2, "Generation 2 became owner", kind="event"), item(3, "generation 2 working", generation=2),
+                 item(4, "STOPPED", kind="event"), item(5, "Resumed", kind="event")]
+        out = run_ui("#/s/" + LSID, self.routes(items), [self.GEOM])
+        for marker in ("Handoff started", "Generation 2 became owner", "STOPPED", "Resumed"):
+            self.assertIn("— %s —" % marker, out["transcript"]["lines"])
+        self.assertIn("generation 1 working", out["transcript"]["lines"])
+        self.assertIn("generation 2 working", out["transcript"]["lines"])
+
+    def test_older_history_is_fetched_lazily_when_the_reader_scrolls_to_the_top(self):
+        routes = self.routes([item(n, "line %d" % n) for n in range(10, 30)])
+        routes.update(transcript_route([item(n, "line %d" % n) for n in range(0, 10)], query="?limit=200&before=10"))
+        steps = [self.GEOM, {"scrollTo": 0}, {"readTranscript": "after"}]
+        after = run_ui("#/s/" + LSID, routes, steps)["snaps"]["after"]
+        self.assertEqual(len(after["lines"]), 30, "older output is prepended")
+        self.assertIn("line 0", after["lines"][0])
+        self.assertGreater(after["scrollTop"], 0, "prepending must not throw the reader to the very top")
+
+    def test_the_instruction_box_survives_the_transcript_updating(self):
+        steps = [self.GEOM, {"type": "textarea", "value": "draft I am still writing"}, {"focus": "textarea"},
+                 self.arrive(30, 4), {"poll": True}, {"poll": True}, {"snap": "after"}]
+        out = run_ui("#/s/" + LSID, self.start(30), steps)
+        boxes = [b for b in out["snaps"]["after"]["boxes"] if b["tag"] == "textarea"]
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0]["value"], "draft I am still writing", "the draft must survive transcript updates")
+        self.assertEqual(len(out["transcript"]["lines"]), 34, "the transcript still updates while the box is focused")
+
+
+@unittest.skipIf(NODE is None, "node is required for the UI tests")
+class TestSessionCleanup(unittest.TestCase):
+    """Old sessions can be cleared off the phone; live ones cannot."""
+
+    def listing(self, sessions, **extra):
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions": [200, {"sessions": sessions}]}
+        routes.update(extra)
+        return routes
+
+    def test_the_list_separates_active_closed_and_archived(self):
+        sessions = [view(name="Live one", state="RUNNING"),
+                    view(logical_session_id="ls_" + "b" * 24, name="Done one", state="COMPLETED"),
+                    view(logical_session_id="ls_" + "c" * 24, name="Old one", state="FAILED", archived={"utc": "2026-01-01T00:00:00Z", "by": "device:d_1"})]
+        out = run_ui("#/", self.listing(sessions))
+        for expected in ("Active sessions", "Recent / closed", "Archived", "Live one", "Done one", "Old one"):
+            self.assertIn(expected, out["all"])
+
+    def test_a_closed_session_can_be_removed_after_a_clear_confirmation(self):
+        closed = view(logical_session_id="ls_" + "b" * 24, name="Done one", state="COMPLETED")
+        routes = self.listing([closed], **{"POST /api/v1/sessions/%s/archive" % closed["logical_session_id"]: [200, dict(closed, archived={"utc": "t", "by": "device:d_1"})]})
+        out = run_ui("#/", routes, [{"click": "Remove session"}, {"snap": "asked"}, {"click": "Remove session"}])
+        self.assertIn("Remove this session from Terminal Handoff history?", out["snaps"]["asked"]["text"])
+        self.assertIn("files and its repository are not touched", out["snaps"]["asked"]["text"])
+        posts = [c for c in out["calls"] if c["method"] == "POST"]
+        self.assertEqual([c["path"] for c in posts], ["/api/v1/sessions/%s/archive" % closed["logical_session_id"]])
+        self.assertEqual(set(posts[0]["body"]), {"request_id"}, "removal carries no path, project or command")
+
+    def test_an_active_session_offers_no_removal_control(self):
+        for state in ("RUNNING", "WAITING_FOR_HUMAN", "PAUSED", "STOPPED"):
+            out = run_ui("#/", self.listing([view(state=state)]))
+            self.assertNotIn("Remove session", out["buttons"], "%s must not be removable from the list" % state)
+
+    def test_an_archived_session_can_be_restored(self):
+        old = view(logical_session_id="ls_" + "c" * 24, name="Old one", state="COMPLETED", archived={"utc": "t", "by": "device:d_1"})
+        routes = self.listing([old], **{"POST /api/v1/sessions/%s/restore" % old["logical_session_id"]: [200, view(state="COMPLETED")]})
+        out = run_ui("#/", routes, [{"click": "Restore"}])
+        self.assertEqual([c["path"] for c in out["calls"] if c["method"] == "POST"], ["/api/v1/sessions/%s/restore" % old["logical_session_id"]])
+
+    def test_a_refusal_is_shown_plainly(self):
+        closed = view(logical_session_id="ls_" + "b" * 24, state="COMPLETED")
+        routes = self.listing([closed], **{"POST /api/v1/sessions/%s/archive" % closed["logical_session_id"]: [409, {"error": "refused", "reason": "this session still has a live owner"}]})
+        out = run_ui("#/", routes, [{"click": "Remove session"}, {"click": "Remove session"}, {"snap": "after"}])
+        self.assertIn("Refused: this session still has a live owner", out["snaps"]["after"]["text"])
 
 
 if __name__ == "__main__":

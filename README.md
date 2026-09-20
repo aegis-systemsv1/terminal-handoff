@@ -134,12 +134,33 @@ The threshold is a **production setting of 80%**. A lower value exists only as a
 5. Choose an **authorised project** (only projects you enabled for remote launch appear).
 6. Optionally **name** the session.
 7. Enter the task and tap **Start Session**.
-8. **Monitor** status, owner generation, Remote Control health and recent output.
+8. **Monitor** status, owner generation, Remote Control health and the **transcript**.
 9. **Send further instructions** ("Tell Claude…").
 10. **Rename**, **Pause**, **STOP** or **Resume** when required.
 11. **Disconnect and reconnect** at any time; the logical session is unaffected.
 
 When the phone disconnects, **nothing changes** for the session. Claude keeps working unless the session is STOPPED or paused, is waiting at a gate, has finished, or has failed. On reconnect the page shows the authoritative current state.
+
+### Reading the transcript
+
+The session page shows one scrollable history for the **logical** session, not for whichever Claude process happens to own it: Claude's output and the lifecycle events in one ordered list, with generation boundaries marked (`— Handoff complete — generation 2 became owner —`) rather than hidden. Individual processes are replaceable; the history is not.
+
+- **At the bottom, it follows.** New output stays in view as it arrives.
+- **Scroll up and it holds still.** Auto-scroll stops the moment you scroll, and incoming output can neither drag you back down nor shift the lines you are reading. It keeps arriving in the background.
+- **You are told what you missed.** A **"N new updates ↓"** pill appears while you are reading older output. Tap it, or **↓ Latest**, to return to the newest line and resume following.
+- **Older history loads as you need it.** Scrolling to the top fetches the previous page. Retention is bounded (2000 lines per session, 100 lifecycle events), so neither the record nor the page grows without limit.
+
+The transcript is appended to, never rebuilt, which is what keeps the instruction box's focus, draft, selection, the iOS keyboard and native iOS paste stable while it updates.
+
+### Clearing out old sessions
+
+The list is grouped into **Active sessions**, **Recent / closed** and **Archived**, with the session's own name first and its project underneath.
+
+A finished session (`COMPLETED`, `FAILED`, `ORPHANED`) offers **Remove session**, which asks *"Remove this session from Terminal Handoff history?"* before doing anything, and can be undone with **Restore**.
+
+**What removal does and does not do.** It is a soft delete of *Terminal Handoff's own record*: the session is hidden from the normal lists, while its record, name, project and audit history are kept. It does **not** delete your project, its files or its repository, does not run any Git command, does not end any Claude process, and does not touch any other logical session.
+
+An **active** session (`RUNNING`, `WAITING_FOR_HUMAN`, `PAUSED`, `STOPPED`, `CREATING`) has no removal control at all — STOP and the recovery controls remain the only way to end work — and the gateway refuses removal for any session whose owner is still verified alive, whatever the phone asks.
 
 > Documentation screenshots must never contain a real hostname, enrollment code, credential, personal path or private project. See [docs/screenshots/README.md](docs/screenshots/README.md).
 

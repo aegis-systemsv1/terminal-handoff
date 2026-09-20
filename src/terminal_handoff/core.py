@@ -44,7 +44,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.4.0"
+TERMINAL_HANDOFF_VERSION = "1.4.1"
 MANIFEST_SCHEMA_VERSION = 2
 NOTIFICATION_SCHEMA_VERSION = 1
 
@@ -6123,8 +6123,10 @@ LS_TERMINAL = (LS_COMPLETED, LS_FAILED)
 MAX_INSTRUCTION_CHARS = 8000
 MAX_IDEMPOTENCY_KEY = 80
 MAX_INBOX_KEPT = 300
-MAX_OUTPUT_LINES = 200
+MAX_OUTPUT_LINES = 2000
 MAX_OUTPUT_LINE_CHARS = 600
+MAX_TRANSCRIPT_PAGE = 200
+ARCHIVABLE_STATES = (LS_COMPLETED, LS_FAILED, LS_ORPHANED)
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
@@ -6247,11 +6249,115 @@ def logical_find_by_agent_session(agent_session_id):
 
 
 def logical_history(record, event, **fields):
-    entry = {"event": event, "ts": utc_stamp()}
+    seq = int(record.get("history_next_seq") or 0) + 1
+    record["history_next_seq"] = seq
+    entry = {"event": event, "ts": utc_stamp(), "seq": seq}
     entry.update(fields)
     history = record.setdefault("history", [])
     history.append(entry)
     del history[:-100]
+
+
+# Lifecycle events a reader of the transcript must see, and how to say them plainly.
+TRANSCRIPT_EVENTS = {
+    "created": "Session created",
+    "owner_registered": "Generation %(generation)s became owner",
+    "ownership_changed": "Handoff complete — generation %(generation)s became owner",
+    "stop": "STOPPED",
+    "hard_stop": "STOPPED (Claude process ended)",
+    "stop_cleared": "STOP cleared",
+    "pause": "Paused",
+    "resume": "Resumed",
+    "renamed": "Renamed",
+    "orphaned": "Claude stopped responding (ORPHANED)",
+    "abandoned": "Abandoned",
+    "reattached": "Re-attached to Claude",
+    "failed": "FAILED",
+    "archived": "Archived",
+    "restored": "Restored from archive",
+}
+
+
+def _transcript_event_text(entry):
+    template = TRANSCRIPT_EVENTS.get(entry.get("event"))
+    if template is None:
+        return str(entry.get("event") or "").replace("_", " ") or "event"
+    try:
+        return template % entry
+    except (KeyError, TypeError, ValueError):
+        return template
+
+
+def logical_transcript(record, limit=MAX_TRANSCRIPT_PAGE, before=None):
+    """One logical-session history: Claude's output and the lifecycle events, in order.
+
+    Items carry a stable `id` so the page can append without rebuilding, and an
+    `ordinal` so it can page backwards. Bounded by construction: the record itself
+    keeps at most MAX_OUTPUT_LINES lines and 100 events.
+    """
+    merged = []
+    for item in record.get("output") or []:
+        merged.append(
+            {
+                "kind": "output",
+                "id": "o%s" % item.get("seq", item.get("ts")),
+                "ts": item.get("ts"),
+                "text": item.get("text", ""),
+                "generation": item.get("generation"),
+            }
+        )
+    for entry in record.get("history") or []:
+        if entry.get("event") not in TRANSCRIPT_EVENTS:
+            continue
+        merged.append(
+            {
+                "kind": "event",
+                "id": "h%s" % entry.get("seq", entry.get("ts")),
+                "ts": entry.get("ts"),
+                "text": _transcript_event_text(entry),
+                "generation": entry.get("generation"),
+            }
+        )
+    merged.sort(key=lambda i: (i["ts"] or "", i["kind"] != "event", i["id"]))
+    for ordinal, item in enumerate(merged):
+        item["ordinal"] = ordinal
+    if before is not None:
+        merged = [i for i in merged if i["ordinal"] < before]
+    limit = max(1, min(int(limit or MAX_TRANSCRIPT_PAGE), MAX_TRANSCRIPT_PAGE))
+    page = merged[-limit:]
+    return {"items": page, "has_more": len(page) < len(merged), "total": len(merged)}
+
+
+def logical_archive(lsid, by="local", restore=False):
+    """Soft-delete: hide a finished session from the phone's lists, keep its record.
+
+    Refuses while the session could still be doing work, or while an owner is
+    still verified alive. Nothing outside Terminal Handoff's own state is touched:
+    no project file, no repository, no other logical session.
+    """
+
+    def mutate(record):
+        if restore:
+            if not record.get("archived"):
+                raise LogicalRefusal("this session is not archived")
+            record.pop("archived", None)
+            logical_history(record, "restored", by=by)
+            return
+        if record.get("archived"):
+            raise LogicalRefusal("this session is already archived")
+        state = record.get("state")
+        if state not in ARCHIVABLE_STATES:
+            raise LogicalRefusal("only a finished session can be archived (this one is %s)" % state)
+        owner = record.get("owner") or {}
+        if owner.get("agent_session_id") and str((record.get("owner_health") or {}).get("verdict") or "").lower() == "alive":
+            raise LogicalRefusal("this session still has a live owner")
+        record["archived"] = {"utc": utc_stamp(), "by": by}
+        logical_history(record, "archived", by=by)
+
+    ok, why, record, _ = logical_mutate(lsid, mutate)
+    if ok:
+        log_event("logical_archived" if not restore else "logical_restored", logical_session_id=lsid, by=by)
+    return ok, why, record
 
 
 def logical_create(
@@ -6681,7 +6787,9 @@ def logical_append_output(lsid, agent_session_id, text):
     def mutate(record):
         if not _is_owner(record, agent_session_id):
             raise LogicalRefusal("not the current owner of this logical session")
-        record["output"].append({"ts": utc_stamp(), "text": line})
+        seq = int(record.get("output_next_seq") or 0) + 1
+        record["output_next_seq"] = seq
+        record["output"].append({"ts": utc_stamp(), "text": line, "seq": seq, "generation": (record.get("owner") or {}).get("generation")})
         del record["output"][:-MAX_OUTPUT_LINES]
 
     ok, why, _, _ = logical_mutate(lsid, mutate)
@@ -6723,6 +6831,7 @@ def logical_public_view(record):
             "acked": sum(1 for m in inbox if m["status"] == "acked"),
         },
         "recent_output": list(record.get("output") or [])[-20:],
+        "archived": record.get("archived"),
         "owner_health": {
             k: v for k, v in (record.get("owner_health") or {}).items() if k in ("verdict", "detail", "checked_utc", "failures")
         },
@@ -7499,6 +7608,18 @@ class RateLimiter(object):
 MAX_BODY_BYTES = 32768
 SESSION_PATH_RE = re.compile(r"^/api/v1/sessions/(ls_[a-f0-9]{24})(?:/([a-z]+))?$")
 APPROVAL_PATH_RE = re.compile(r"^/api/v1/sessions/(ls_[a-f0-9]{24})/approvals/(ap_[a-f0-9]{16})/(approve|deny)$")
+def _int_param(query, name):
+    """One non-negative integer from a parsed query string, or None. Never raises."""
+    values = query.get(name) or []
+    if not values:
+        return None
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
 SENSITIVE_LIMITS = {
     "create": (5, 600),
     "approve": (20, 60),
@@ -7508,6 +7629,8 @@ SENSITIVE_LIMITS = {
     "resume": (30, 60),
     "recover": (10, 60),
     "rename": (30, 60),
+    "archive": (20, 60),
+    "restore": (20, 60),
 }
 ALLOWED_BODY_KEYS = {
     "instructions": {"text", "request_id"},
@@ -7519,6 +7642,8 @@ ALLOWED_BODY_KEYS = {
     "approve": {"nonce", "owner_epoch", "request_id"},
     "deny": {"nonce", "owner_epoch", "request_id"},
     "recover": {"action", "request_id"},
+    "archive": {"request_id"},
+    "restore": {"request_id"},
     "enroll": {"code"},
 }
 AUTH_FAIL_LIMIT = 8
@@ -7640,6 +7765,12 @@ button:disabled { opacity:.5; }
 .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; } .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
 .gate { border:2px solid var(--warn); } .gate .action { font-size:18px; font-weight:600; margin:8px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
 .out { white-space:pre-wrap; overflow-wrap:anywhere; max-height:260px; overflow:auto; }
+.transcript { max-height:52vh; min-height:200px; overflow-y:auto; -webkit-overflow-scrolling:touch; overscroll-behavior:contain; }
+.tline { white-space:pre-wrap; overflow-wrap:anywhere; padding:1px 0; }
+.tline.event { color:var(--accent); font-weight:700; text-align:center; padding:8px 0; }
+.pill { width:auto; min-height:38px; padding:6px 14px; margin:0; border-radius:19px; font-size:14px; }
+.s-ARCHIVED { color:var(--muted); }
+a.cardlink { color:inherit; text-decoration:none; display:block; }
 .err { color:var(--bad); font-weight:600; } .note { color:var(--warn); }
 a.back { display:inline-block; padding:10px 0; color:var(--accent); text-decoration:none; }
 """
@@ -7704,29 +7835,72 @@ UI_APP_JS = r"""
   }
 
   // ---- session list -------------------------------------------------------
+  var ACTIVE_STATES = { CREATING: 1, RUNNING: 1, WAITING_FOR_HUMAN: 1, PAUSED: 1, RECOVERING: 1 };
+  var ARCHIVABLE = { COMPLETED: 1, FAILED: 1, ORPHANED: 1 };
   function renderList() {
     stop();
-    var box = el('div');
+    var box = el('div'), confirming = null, flash = el('p', { 'class': 'note', text: '' });
+    function subtitle(s) {
+      if (s.state === 'WAITING_FOR_HUMAN') return 'Approval required';
+      if (s.state === 'STOPPED') return 'STOPPED by you';
+      if (s.state === 'ORPHANED') return 'Claude stopped responding';
+      if (s.archived) return 'Archived ' + ago(s.archived.utc) + ' ago';
+      if (ARCHIVABLE[s.state]) return label(s.state) + ' ' + ago(s.updated_utc || s.created_utc) + ' ago';
+      return 'Working for ' + ago(s.created_utc);
+    }
+    function act(s, action, ok) {
+      api('POST', '/api/v1/sessions/' + s.logical_session_id + '/' + action, { request_id: rid() }).then(function (r) {
+        if (r.status === 401) return boot();
+        confirming = null;
+        flash.textContent = (r.status >= 200 && r.status < 300) ? ok : ('Refused: ' + ((r.data && (r.data.reason || r.data.error)) || r.status));
+        load();
+      });
+    }
+    function card(s) {
+      var kids = [
+        el('a', { 'class': 'cardlink', href: '#/s/' + s.logical_session_id }, [
+          el('div', { 'class': 'row' }, [el('strong', { text: s.name || s.project || 'session' }), stateEl(s.archived ? 'ARCHIVED' : s.state)]),
+          el('div', { 'class': 'muted', text: 'Project: ' + (s.project || 'n/a') }),
+          el('div', { 'class': 'muted', text: subtitle(s) }),
+          s.archived ? null : el('div', { 'class': 'muted', text: 'Remote Control: ' + remoteLabel(s.remote_control) })])];
+      if (s.archived) {
+        kids.push(el('button', { 'class': 'secondary', text: 'Restore', onclick: function () { act(s, 'restore', 'Restored.'); } }));
+      } else if (ARCHIVABLE[s.state]) {
+        if (confirming === s.logical_session_id) {
+          kids.push(el('div', { 'class': 'muted', text: 'Remove this session from Terminal Handoff history? This removes Terminal Handoff’s stored record only. Your project, its files and its repository are not touched.' }));
+          kids.push(el('div', { 'class': 'grid2' }, [
+            el('button', { 'class': 'secondary', text: 'Cancel', onclick: function () { confirming = null; load(); } }),
+            el('button', { 'class': 'danger', text: 'Remove session', onclick: function () { act(s, 'archive', 'Removed from the list.'); } })]));
+        } else {
+          kids.push(el('button', { 'class': 'secondary', text: 'Remove session', onclick: function () { confirming = s.logical_session_id; load(); } }));
+        }
+      }
+      return el('div', { 'class': 'card' }, kids);
+    }
+    function group(title, rows, empty) {
+      if (!rows.length && !empty) return;
+      box.appendChild(el('h2', { text: title }));
+      if (!rows.length) { box.appendChild(el('p', { 'class': 'muted', text: empty })); return; }
+      rows.forEach(function (s) { box.appendChild(card(s)); });
+    }
     function load() {
       api('GET', '/api/v1/sessions').then(function (r) {
         if (r.status === 401) return boot();
         while (box.firstChild) box.removeChild(box.firstChild);
         var sessions = r.data.sessions || [];
-        if (!sessions.length) box.appendChild(el('p', { 'class': 'muted', text: 'No sessions yet.' }));
+        var active = [], closed = [], archived = [];
         sessions.forEach(function (s) {
-          var sub = s.state === 'WAITING_FOR_HUMAN' ? 'Approval required' : ('Working for ' + ago(s.created_utc));
-          if (s.state === 'STOPPED') sub = 'STOPPED by you';
-          if (s.state === 'ORPHANED') sub = 'Claude stopped responding';
-          box.appendChild(el('a', { 'class': 'card', href: '#/s/' + s.logical_session_id }, [
-            el('div', { 'class': 'row' }, [el('strong', { text: s.name || s.project || 'session' }), stateEl(s.state)]),
-            s.name ? el('div', { 'class': 'muted', text: 'Project: ' + (s.project || '') }) : null,
-            el('div', { 'class': 'muted', text: sub }),
-            el('div', { 'class': 'muted', text: 'Remote Control: ' + remoteLabel(s.remote_control) })]));
+          if (s.archived) archived.push(s);
+          else if (ACTIVE_STATES[s.state] || s.state === 'STOPPED') active.push(s);
+          else closed.push(s);
         });
+        group('Active sessions', active, 'No active sessions.');
+        group('Recent / closed', closed);
+        group('Archived', archived);
       });
     }
     clear();
-    app.appendChild(el('h2', { text: 'Active sessions' }));
+    app.appendChild(flash);
     app.appendChild(box);
     app.appendChild(el('button', { text: '+ New Session', onclick: function () { nav('#/new'); } }));
     load(); poll(load, 5000);
@@ -7771,10 +7945,77 @@ UI_APP_JS = r"""
     var sending = false, view = null, panel = null, lastKey = null, lastImportant = null, lastFocusEvent = 0;
     var QUIET_MS = 8000; // no non-urgent redraw within this long of the box gaining or losing focus
     composer.hidden = true;
+
+    // ---- transcript ---------------------------------------------------------
+    // Built once and only ever appended to. Polling never rebuilds it, so the reader's
+    // scroll position, the textarea's focus, selection, draft and the iOS paste menu all survive.
+    var transcript = el('div', { 'class': 'card out mono transcript', 'aria-label': 'Session transcript', tabindex: '0' });
+    var seen = {}, following = true, pendingNew = 0, oldest = null, loadingOlder = false, transcriptReady = false;
+    var pill = el('button', { 'class': 'pill', text: 'Jump to latest', onclick: toLatest });
+    pill.hidden = true;
+    var latestBtn = el('button', { 'class': 'secondary', text: '↓ Latest', onclick: toLatest });
+
+    function atBottom() {
+      var slack = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight;
+      return !(slack > 40); // an unmeasurable (test/older) box counts as "at the bottom"
+    }
+    function toBottom() { transcript.scrollTop = transcript.scrollHeight; }
+    function toLatest() { following = true; pendingNew = 0; paintPill(); toBottom(); }
+    function paintPill() {
+      pill.hidden = !(pendingNew > 0 && !following);
+      pill.textContent = pendingNew === 1 ? '1 new update ↓' : (pendingNew + ' new updates ↓');
+    }
+    function lineFor(item) {
+      var cls = item.kind === 'event' ? 'tline event' : 'tline';
+      if (item.kind === 'event') return el('div', { 'class': cls, text: '— ' + item.text + ' —' });
+      return el('div', { 'class': cls, text: item.text });
+    }
+    // The user's own scrolling is what decides follow mode; nothing else may set it.
+    transcript.addEventListener('scroll', function () {
+      if (atBottom()) { following = true; pendingNew = 0; paintPill(); }
+      else { following = false; if (transcript.scrollTop < 40) loadOlder(); }
+    });
+    function addItems(items, prepend) {
+      var fresh = [];
+      items.forEach(function (i) { if (i && i.id && !seen[i.id]) { seen[i.id] = true; fresh.push(i); } });
+      if (!fresh.length) return 0;
+      if (oldest === null || fresh[0].ordinal < oldest) oldest = fresh[0].ordinal;
+      if (prepend) {
+        // Keep the reader looking at the same line: restore the scroll offset by how much taller it got.
+        var before = transcript.scrollHeight, keep = transcript.scrollTop, first = transcript.firstChild;
+        fresh.forEach(function (i) { transcript.insertBefore(lineFor(i), first); });
+        transcript.scrollTop = keep + (transcript.scrollHeight - before);
+        return fresh.length;
+      }
+      fresh.forEach(function (i) { transcript.appendChild(lineFor(i)); });
+      return fresh.length;
+    }
+    function loadOlder() {
+      if (loadingOlder || oldest === null || oldest <= 0) return;
+      loadingOlder = true;
+      api('GET', '/api/v1/sessions/' + id + '/transcript?limit=200&before=' + oldest).then(function (r) {
+        loadingOlder = false;
+        if (r.status === 200 && r.data) addItems(r.data.items || [], true);
+      }, function () { loadingOlder = false; });
+    }
+    function loadTranscript() {
+      api('GET', '/api/v1/sessions/' + id + '/transcript?limit=200').then(function (r) {
+        if (r.status !== 200 || !r.data) return;
+        var added = addItems(r.data.items || [], false);
+        if (!transcriptReady) { transcriptReady = true; toBottom(); return; }
+        if (!added) return;
+        if (following) toBottom();
+        else { pendingNew += added; paintPill(); } // reading older output: never drag them down
+      });
+    }
     var sendBtn = el('button', { text: 'Send', onclick: send });
     composer.appendChild(text); composer.appendChild(sendBtn);
     app.appendChild(el('a', { 'class': 'back', href: '#/', text: '‹ Sessions' }));
-    app.appendChild(flash); app.appendChild(renameBox); app.appendChild(head); app.appendChild(composer); app.appendChild(tail);
+    var transcriptBox = el('div', {}, [
+      el('div', { 'class': 'row' }, [el('h2', { text: 'Transcript' }), pill]),
+      transcript, latestBtn]);
+    app.appendChild(flash); app.appendChild(renameBox); app.appendChild(head);
+    app.appendChild(transcriptBox); app.appendChild(composer); app.appendChild(tail);
 
     function post(path, body, ok) {
       return api('POST', path, Object.assign({ request_id: rid() }, body)).then(function (r) {
@@ -7860,9 +8101,6 @@ UI_APP_JS = r"""
         el('div', { 'class': 'muted', text: wake }),
         el('div', { 'class': 'muted', text: 'Instructions pending: ' + (s.inbox ? s.inbox.pending : 0) }),
         s.project_available === false ? el('div', { 'class': 'err', text: 'This project is no longer available on the Mac.' }) : null]));
-      var out = (s.recent_output || []).map(function (o) { return o.text; }).join('\n');
-      head.appendChild(el('h2', { text: 'Recent output' }));
-      head.appendChild(el('div', { 'class': 'card out mono', text: out || '(nothing yet)' }));
     }
     function drawTail(force) {
       if (!view || (panel && !force)) return; // never rebuild a panel the user is filling in
@@ -7919,6 +8157,7 @@ UI_APP_JS = r"""
         if (r.status !== 200) { head.textContent = 'Session not found.'; return; }
         view = r.data; applyView();
       });
+      loadTranscript(); // its own container: never gated by the quiet period around the textarea
     }
     load(); poll(load, 3000);
   }
@@ -8068,11 +8307,14 @@ def make_remote_handler(gateway):
                 self._send(200, {"sessions": [logical_public_view(r) for r in logical_list()]})
             else:
                 match = SESSION_PATH_RE.match(path)
-                record = logical_read(match.group(1)) if match and match.group(2) in (None, "output") else None
+                record = logical_read(match.group(1)) if match and match.group(2) in (None, "output", "transcript") else None
                 if record is None:
                     self._deny(404, "not_found")
                 elif match.group(2) == "output":
                     self._send(200, {"output": list(record.get("output") or [])[-100:]})
+                elif match.group(2) == "transcript":
+                    query = urllib.parse.parse_qs(self.path.partition("?")[2])
+                    self._send(200, logical_transcript(record, limit=_int_param(query, "limit"), before=_int_param(query, "before")))
                 else:
                     self._send(200, logical_public_view(record))
 
@@ -8093,7 +8335,7 @@ def make_remote_handler(gateway):
                 lsid, approval_id, action = APPROVAL_PATH_RE.match(path).groups()
             else:
                 match = SESSION_PATH_RE.match(path)
-                if not match or match.group(2) not in ("instructions", "pause", "resume", "stop", "recover", "rename"):
+                if not match or match.group(2) not in ("instructions", "pause", "resume", "stop", "recover", "rename", "archive", "restore"):
                     return self._deny(404, "not_found")
                 lsid, action = match.group(1), match.group(2)
             unknown = set(body) - ALLOWED_BODY_KEYS[action]
@@ -8168,6 +8410,12 @@ def make_remote_handler(gateway):
                 return 200, logical_public_view(logical_read(lsid))
             if action == "recover":
                 ok, why, _ = logical_recover(lsid, body.get("action"), by=by)
+                if not ok:
+                    return 409, {"error": "refused", "reason": why}
+                return 200, logical_public_view(logical_read(lsid))
+            if action in ("archive", "restore"):
+                ok, why, _ = logical_archive(lsid, by=by, restore=(action == "restore"))
+                log_event("remote_control_action", logical_session_id=lsid, action=action, device_id=ctx["device_id"], ok=ok)
                 if not ok:
                     return 409, {"error": "refused", "reason": why}
                 return 200, logical_public_view(logical_read(lsid))

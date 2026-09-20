@@ -423,5 +423,140 @@ class TestContinuationIntegration(ContinuationCase):
         self.assertIn("export CLAUDE_TERMINAL_HANDOFF_LOGICAL_SESSION=ls_" + "b" * 24, script)
 
 
+class TestTranscript(LogicalCase):
+    """One readable history per logical session: Claude's output and the lifecycle events."""
+
+    def say(self, lsid, owner, *lines):
+        for line in lines:
+            ok, why, _ = CORE.logical_append_output(lsid, owner, line)
+            self.assertTrue(ok, why)
+
+    def test_output_and_lifecycle_events_are_one_ordered_history(self):
+        lsid = self.new_session()
+        self.say(lsid, "agent-A-session", "first line", "second line")
+        CORE.logical_stop(lsid, by="device:d_1", reason="hold")
+        page = CORE.logical_transcript(CORE.logical_read(lsid))
+        kinds = [i["kind"] for i in page["items"]]
+        texts = [i["text"] for i in page["items"]]
+        self.assertIn("output", kinds)
+        self.assertIn("event", kinds)
+        self.assertIn("first line", texts)
+        self.assertIn("Session created", texts)
+        self.assertIn("Generation 1 became owner", texts)
+        self.assertIn("STOPPED", texts)
+        self.assertEqual([i["ordinal"] for i in page["items"]], sorted(i["ordinal"] for i in page["items"]))
+
+    def test_every_item_has_a_stable_id_so_the_page_can_append_instead_of_rebuilding(self):
+        lsid = self.new_session()
+        self.say(lsid, "agent-A-session", "one", "two")
+        first = CORE.logical_transcript(CORE.logical_read(lsid))["items"]
+        self.say(lsid, "agent-A-session", "three")
+        second = CORE.logical_transcript(CORE.logical_read(lsid))["items"]
+        ids = {i["id"] for i in first}
+        self.assertTrue(ids.issubset({i["id"] for i in second}), "existing items keep their identity")
+        self.assertEqual(len([i for i in second if i["id"] not in ids]), 1)
+
+    def test_the_transcript_survives_a_handoff_and_marks_the_generation_boundary(self):
+        lsid = self.new_session(owner="agent-A-session", generation=1)
+        self.say(lsid, "agent-A-session", "generation one working")
+        ok, why, _ = CORE.logical_adopt_successor(lsid, self.transfer_complete(lsid, "agent-A-session", "agent-B-session"))
+        self.assertTrue(ok, why)
+        self.say(lsid, "agent-B-session", "generation two working")
+        texts = [i["text"] for i in CORE.logical_transcript(CORE.logical_read(lsid))["items"]]
+        self.assertIn("generation one working", texts, "the predecessor's output is still readable")
+        self.assertIn("generation two working", texts)
+        self.assertIn("Handoff complete — generation 2 became owner", texts, "the boundary is visible, not pretended away")
+
+    def test_paging_backwards_is_bounded_and_does_not_repeat_items(self):
+        lsid = self.new_session()
+        self.say(lsid, "agent-A-session", *["line %d" % n for n in range(40)])
+        latest = CORE.logical_transcript(CORE.logical_read(lsid), limit=10)
+        self.assertEqual(len(latest["items"]), 10)
+        self.assertTrue(latest["has_more"])
+        older = CORE.logical_transcript(CORE.logical_read(lsid), limit=10, before=latest["items"][0]["ordinal"])
+        self.assertEqual(len(older["items"]), 10)
+        self.assertFalse({i["id"] for i in older["items"]} & {i["id"] for i in latest["items"]})
+
+    def test_a_secret_in_the_output_is_still_redacted_in_the_transcript(self):
+        lsid = self.new_session()
+        self.say(lsid, "agent-A-session", "token: Bearer abcdefghijklmnop1234")
+        texts = " ".join(i["text"] for i in CORE.logical_transcript(CORE.logical_read(lsid))["items"])
+        self.assertNotIn("abcdefghijklmnop1234", texts)
+
+
+class TestArchive(LogicalCase):
+    """Clearing an old session off the phone: safe, reversible, and only ever our own record."""
+
+    def finished(self, state="COMPLETED"):
+        lsid = self.new_session()
+        CORE.logical_mutate(lsid, lambda record: record.update({"state": state}))
+        return lsid
+
+    def test_a_finished_session_can_be_archived_and_restored(self):
+        lsid = self.finished()
+        ok, why, _ = CORE.logical_archive(lsid, by="device:d_1")
+        self.assertTrue(ok, why)
+        self.assertTrue(CORE.logical_read(lsid)["archived"])
+        ok, why, _ = CORE.logical_archive(lsid, by="device:d_1", restore=True)
+        self.assertTrue(ok, why)
+        self.assertIsNone(CORE.logical_read(lsid).get("archived"))
+
+    def test_an_active_session_is_refused(self):
+        for state in ("RUNNING", "WAITING_FOR_HUMAN", "PAUSED", "STOPPED", "CREATING"):
+            lsid = self.finished(state)
+            ok, why, _ = CORE.logical_archive(lsid, by="device:d_1")
+            self.assertFalse(ok, "%s must not be archivable" % state)
+            self.assertIn("finished", why)
+            self.assertIsNone(CORE.logical_read(lsid).get("archived"))
+
+    def test_a_session_whose_owner_is_still_verified_alive_is_refused(self):
+        lsid = self.finished("ORPHANED")
+        CORE.logical_mutate(lsid, lambda record: record.update({"owner_health": {"verdict": "alive"}}))
+        ok, why, _ = CORE.logical_archive(lsid, by="device:d_1")
+        self.assertFalse(ok)
+        self.assertIn("live owner", why)
+
+    def test_archiving_keeps_the_record_and_its_audit_history(self):
+        lsid = self.finished()
+        before = CORE.logical_read(lsid)
+        self.assertTrue(CORE.logical_archive(lsid, by="device:d_1")[0])
+        after = CORE.logical_read(lsid)
+        self.assertEqual(after["logical_session_id"], before["logical_session_id"])
+        self.assertEqual(after["project"], before["project"])
+        self.assertIn("archived", [e["event"] for e in after["history"]])
+        self.assertGreaterEqual(len(after["history"]), len(before["history"]))
+
+    def test_archiving_touches_no_project_file_and_no_other_session(self):
+        keeper = self.new_session()
+        lsid = self.finished()
+        marker = os.path.join(self.workdir, "important.txt")
+        with open(marker, "w") as handle:
+            handle.write("do not touch")
+        before_tree = sorted(os.listdir(self.workdir))
+        before_other = CORE.logical_read(keeper)
+        self.assertTrue(CORE.logical_archive(lsid, by="device:d_1")[0])
+        self.assertEqual(sorted(os.listdir(self.workdir)), before_tree, "the project directory is untouched")
+        with open(marker) as handle:
+            self.assertEqual(handle.read(), "do not touch")
+        self.assertEqual(CORE.logical_read(keeper), before_other, "no other logical session is altered")
+
+    def test_archiving_twice_is_refused_rather_than_silently_repeated(self):
+        lsid = self.finished()
+        self.assertTrue(CORE.logical_archive(lsid, by="device:d_1")[0])
+        ok, why, _ = CORE.logical_archive(lsid, by="device:d_1")
+        self.assertFalse(ok)
+        self.assertIn("already archived", why)
+
+    def test_restoring_something_that_was_never_archived_is_refused(self):
+        ok, why, _ = CORE.logical_archive(self.finished(), by="device:d_1", restore=True)
+        self.assertFalse(ok)
+        self.assertIn("not archived", why)
+
+    def test_the_archived_flag_is_visible_to_the_phone(self):
+        lsid = self.finished()
+        CORE.logical_archive(lsid, by="device:d_1")
+        self.assertTrue(CORE.logical_public_view(CORE.logical_read(lsid))["archived"])
+
+
 if __name__ == "__main__":
     unittest.main()
