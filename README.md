@@ -213,6 +213,20 @@ Messages/SMS relay, signed webhooks, presence routing, retry and Keychain setup.
 
 ---
 
+## Automatic continuation and remote control
+
+A successful handoff continues the unfinished task: once the successor owns the
+session it verifies Remote Control and carries on, stopping only at a genuine
+human gate. A logical session sits above the disposable Claude processes, so a
+phone (over Tailscale) can start a session on your Mac, send instructions, see
+progress, approve or deny Terminal Handoff gates, pause, or STOP it, across
+successor handoffs. The phone controls Terminal Handoff and registered agent
+sessions; it never receives a shell, path or credential, and Terminal Handoff
+approvals never answer Claude's own permission prompts. Nothing is exposed
+unless you run `remote serve` and `tailscale serve` yourself.
+
+Full description, threat model and set-up: [docs/REMOTE_CONTROL.md](docs/REMOTE_CONTROL.md).
+
 ## Same model, same effort
 
 The successor is launched with the outgoing session's exact values, taken from the live status-line JSON:

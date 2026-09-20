@@ -176,3 +176,17 @@ Use the CLI instead of placing credentials in the file. It records only a
 Keychain service/account reference or an environment-variable name, never the
 webhook secret itself. Full channel, retry, presence and SMS setup is in
 [NOTIFICATIONS.md](NOTIFICATIONS.md).
+
+## Remote control and continuation
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `CLAUDE_TERMINAL_HANDOFF_REMOTE_CONTROL` | `0` stops passing `--remote-control` and reports Remote Control as `disabled` | on |
+| `CLAUDE_TERMINAL_HANDOFF_REMOTE_VERIFY_SECONDS` | how long a successor polls for a registered Remote Control bridge | `20` |
+| `CLAUDE_TERMINAL_HANDOFF_CLAUDE_SESSIONS_DIR` | where Claude's live session records are read from | `~/.claude/sessions` |
+| `CLAUDE_TERMINAL_HANDOFF_APPROVAL_TTL` | seconds an approval request stays valid (minimum 30) | `21600` |
+| `CLAUDE_TERMINAL_HANDOFF_OWNER_GRACE` | seconds an owner must look dead before `ORPHANED` | `60` |
+
+Gateway settings live in `remote/config.json`, projects in `remote/projects.json`,
+devices in `remote/devices.json`; all are mode 0600. See
+[REMOTE_CONTROL.md](REMOTE_CONTROL.md).

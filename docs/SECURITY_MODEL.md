@@ -538,3 +538,13 @@ preserve the model or effort, the answer is "fail and tell the user" — never
 "launch something else". When a parent process cannot be proved to be the exact
 one that was bound, the answer is "leave it running" — never "signal anyway". A
 circuit-breaker activation is logged and displayed, never hidden.
+
+# Remote control boundaries
+
+The remote gateway adds a second trust boundary; it is documented in
+[REMOTE_CONTROL.md](REMOTE_CONTROL.md#threat-model). The controls that apply to
+the rest of this model still hold: no permission bypass flag is ever used, the
+one graceful signal is the only process control, transcripts are never read
+into a main context, and no secret is written to a log. Automatic continuation
+never implies approval, and a Terminal Handoff approval never answers a Claude
+native permission prompt.

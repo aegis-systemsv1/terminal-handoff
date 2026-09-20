@@ -20,6 +20,13 @@ tests/
   test_security.py            config integrity, restoration, boundary units
   test_transfer.py            the heartbeat gate and transfer state machine
   test_wrap_integrity.py      the wrapped command is unreachable from input
+  test_continuation.py        automatic continuation, gates, Remote Control health
+  test_logical.py             logical sessions, owner fencing, inbox, STOP
+  test_remote_api.py          registry, permission profiles, devices, HTTP API
+  test_remote_launch.py       remote session launcher and registration
+  test_stage6.py              approvals, wake, dead owner, recovery, isolation
+  test_ui.py + ui/harness.js  the mobile interface (Node fake-DOM harness)
+  test_acceptance.py          end-to-end remote lifecycle
   test_install_layouts.py     install and uninstall under unusual layouts
   fixtures/                   synthetic status-line payloads
 scripts/

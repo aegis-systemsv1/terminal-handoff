@@ -176,3 +176,11 @@ or messaging apps.
 - modify application repositories
 - transmit anything off the machine unless the user explicitly enables the
   signed webhook or Messages notification adapter
+
+## Remote control
+
+See [REMOTE_CONTROL.md](REMOTE_CONTROL.md#limitations): waking is a bounded
+long-poll rather than a push, native Claude permission prompts cannot be
+answered remotely, `--setting-sources` is undocumented and verified per Claude
+version, ORPHANED sessions are not relaunched, and Mac reboot recovery is not
+implemented.
