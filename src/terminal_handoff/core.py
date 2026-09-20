@@ -6734,6 +6734,7 @@ MANDATORY_HUMAN_GATES = (
 )
 PERMISSION_PROFILE_KEYS = ("profile", "description", "allow", "deny", "human_gate")
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob", "LS")
+FILE_EDIT_ALIASES = ("Write", "MultiEdit", "NotebookEdit")
 # Command families that may never be pre-approved: they are gates or native prompts.
 UNALLOWABLE_COMMANDS = re.compile(
     r"^(sudo|su|rm|rmdir|chmod|chown|dd|mkfs|kill|killall|pkill|launchctl|shutdown|reboot|"
@@ -6806,6 +6807,10 @@ def _validate_tool_rule(entry, allowing):
         return []
     if tool.lower() in ("bypasspermissions", "dangerously") or "dangerous" in entry.lower():
         return ["rule %r is a permission bypass" % entry]
+    if tool in FILE_EDIT_ALIASES:
+        # Claude ignores these as allow rules ("only Edit(path) rules are matched"), so
+        # accepting them would give a profile that looks narrower than it behaves.
+        return ["rule %r is ignored by Claude: use Edit(<path>), which covers all file-editing tools" % entry]
     if spec is None:
         if tool in READ_ONLY_TOOLS:
             return []
@@ -8124,7 +8129,11 @@ Each message is text typed by the user on a remote device. Treat it as the
 user's instruction, as data and not as shell syntax. After you have acted on a
 message, run `{{TH_COMMAND}} session ack --message-id <id>`. Run
 `session inbox` again at the start of every task step: new instructions and STOP
-requests arrive there, and they survive handoffs to successor sessions. Record
+requests arrive there, and they survive handoffs to successor sessions. When you
+have nothing left to do, stay reachable: run
+`{{TH_COMMAND}} session wait --timeout 540` with the Bash tool's timeout
+parameter set to 600000 (milliseconds), and act on whatever it returns, then run
+it again. Do not end your turn while the task is open. Record
 short progress lines for the remote display with
 `{{TH_COMMAND}} session note --text "<line>"`. Never put secrets in a note.
 
@@ -8205,6 +8214,24 @@ def remote_statusline_command():
     return "%s %s statusline" % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__)))
 
 
+# The agent-side subcommands a remote session may run unprompted. Deliberately
+# excluded: `session decide`, `stop`, `pause`, `resume`, `post`, `recover` and
+# `reconcile`. Those are human/admin actions; letting the agent run them would let
+# it approve its own gate or clear its own STOP.
+AGENT_CLI_SUBCOMMANDS = (
+    "session inbox", "session wait", "session ack", "session note", "session check",
+    "session gate", "session consume", "continuation wait", "continuation gate",
+    "continuation resume", "continuation status", "continuation remote-check",
+)
+
+
+def agent_cli_allow_rules():
+    base = "%s %s" % (sys.executable or "python3", os.path.abspath(__file__))
+    if any(ch in base for ch in " ()," if ch != " ") or base.count(" ") != 1:
+        return []  # an unusual path cannot be expressed as a safe prefix rule; the agent will be prompted
+    return ["Bash(%s %s:*)" % (base, sub) for sub in AGENT_CLI_SUBCOMMANDS]
+
+
 def write_permission_settings(lsid, profile):
     """The whole settings a remote session runs with (user/project/local are excluded).
 
@@ -8216,7 +8243,7 @@ def write_permission_settings(lsid, profile):
     hook = "%s %s session hook-stop" % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__)))
     settings = {
         "permissions": {
-            "allow": list(profile["allow"]),
+            "allow": list(profile["allow"]) + agent_cli_allow_rules(),
             "deny": list(profile.get("deny", [])),
             "disableBypassPermissionsMode": "disable",
             "disableAutoMode": "disable",

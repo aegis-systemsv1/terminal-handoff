@@ -406,6 +406,8 @@ class TestPermissionProfiles(LogicalCase):
             "Bash star": good_profile(allow=["Bash(*)"]),
             "Bash colon star": good_profile(allow=["Bash(:*)"]),
             "bare Edit": good_profile(allow=["Edit"]),
+            "Write path rule ignored by Claude": good_profile(allow=["Write(src/**)"]),
+            "MultiEdit path rule": good_profile(allow=["MultiEdit(src/**)"]),
             "rm": good_profile(allow=["Bash(rm:*)"]),
             "sudo": good_profile(allow=["Bash(sudo make:*)"]),
             "git push": good_profile(allow=["Bash(git push:*)"]),

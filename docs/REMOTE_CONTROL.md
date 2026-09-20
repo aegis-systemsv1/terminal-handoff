@@ -285,6 +285,10 @@ terminal-handoff project enable-remote nova            # deliberate, and only if
 }
 ```
 
+Use `Edit(<path>)` for file changes: Claude reports that `Write(...)` allow rules are
+not matched and only `Edit(path)` rules are (they cover all file-editing tools), so
+validation rejects `Write`, `MultiEdit` and `NotebookEdit` rules.
+
 Validation rejects: unknown keys (so no `defaultMode`, permission mode or
 bypass can be set); bare `Bash`, `Bash(*)` and unrestricted `Edit`/`Write`;
 pre-approval of `rm`, `sudo`, `git push`, `curl`, `kubectl`, `docker`, deploy
@@ -325,6 +329,16 @@ upgrade requires re-verification.
 Trade-off: a remote session does not load the repository's own
 `.claude/settings*.json` (including any project hooks). `CLAUDE.md` files still
 load.
+
+## Folder trust (one-time human step per project)
+
+Claude Code asks *"Is this a project you created or one you trust?"* the first
+time it opens a folder. An unattended launch cannot answer that, and Terminal
+Handoff never answers it for you (no keystroke injection, no editing of Claude's
+own configuration). Before a project can be launched remotely, open Claude in that
+folder **once** yourself and choose *Yes, I trust this folder*. Until then a remote
+create is reported as `FAILED` ("the Mac did not confirm the session started")
+and the Terminal window shows the trust question.
 
 ## Starting a session from the phone
 

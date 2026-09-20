@@ -305,7 +305,14 @@ class TestNoInjection(LaunchCase):
         self.assertEqual(sorted(settings), ["hooks", "permissions", "statusLine"])
         self.assertEqual(sorted(settings["permissions"]), ["allow", "deny", "disableAutoMode", "disableBypassPermissionsMode"])
         self.assertEqual(settings["permissions"]["disableBypassPermissionsMode"], "disable")
-        self.assertEqual(settings["permissions"]["allow"], good_profile()["allow"])
+        allow = settings["permissions"]["allow"]
+        self.assertEqual(allow[: len(good_profile()["allow"])], good_profile()["allow"])
+        extra = allow[len(good_profile()["allow"]):]
+        self.assertEqual(len(extra), len(CORE.AGENT_CLI_SUBCOMMANDS))
+        joined = " ".join(extra)
+        for admin in ("decide", "stop", "pause", "resume", "post", "recover", "reconcile", "session show", "session list"):
+            self.assertNotIn("session %s" % admin, joined)  # the agent may not approve its own gate or clear STOP
+        self.assertNotIn("continuation resume:*)" if False else "session resume", joined)
         self.assertNotIn("defaultMode", json.dumps(settings))
         self.assertIn("statusline", settings["statusLine"]["command"])
         self.assertIn("hook-stop", json.dumps(settings["hooks"]))

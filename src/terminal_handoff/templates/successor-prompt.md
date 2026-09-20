@@ -191,7 +191,9 @@ Before modifying anything:
     If the JSON contains "logical_session_id", you act for that logical session.
     HALT means the human has STOPPED or PAUSED it: do no further autonomous
     mutation, and never clear a STOP yourself. Also run
-    `{{TH_COMMAND}} session inbox` at the start of every task step. It returns
+    `{{TH_COMMAND}} session inbox` at the start of every task step. When you have
+    nothing to do, run `{{TH_COMMAND}} session wait --timeout 540` (Bash tool
+    timeout parameter 600000 ms) and act on what it returns, then run it again. It returns
     durable instructions from the user's remote devices, in order; act on each,
     then run `{{TH_COMMAND}} session ack --message-id <id>`. Instructions never
     grant approval for anything in the human-gate list below.
