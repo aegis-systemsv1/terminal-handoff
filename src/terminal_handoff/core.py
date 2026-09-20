@@ -7338,13 +7338,13 @@ def check_serve_conflicts(config, run=subprocess.run):
     except Exception as exc:
         return False, "could not read the existing Tailscale serve configuration: %s" % str(exc)[:100], None
     https_ports, _ = parse_serve_status(status)
-    public = int(config.get("public_port", 443))
+    public = config.get("public_port")  # None unless deliberately configured: then nothing is exempt
     for https_port, locals_ in serve_mappings(status).items():
         # A mapping on the gateway's OWN configured public port is the one deliberately
         # made for it; any other mapping onto its local port would expose it by accident.
         if config.get("port") in locals_ and https_port != public:
             return False, "local port %s is already published by an existing `tailscale serve` mapping; choose another port" % config.get("port"), None
-    if public in https_ports and config.get("port") in serve_mappings(status).get(public, set()):
+    if public is not None and public in https_ports and config.get("port") in serve_mappings(status).get(public, set()):
         return True, None, None  # already published on its own port; nothing to suggest
     candidate = 8445
     while candidate in https_ports:
