@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-09-20
+
+Two things physical iPhone use showed were not good enough. No change to handoff,
+ownership, STOP or approval behaviour.
+
+### Added
+
+- **A real session transcript on the phone.** The session page now shows one
+  scrollable logical-session history instead of a twenty-line snapshot: Claude's
+  output and the lifecycle events (created, owner registered, handoff complete,
+  STOPPED, STOP cleared, resumed, orphaned, abandoned, archived) in one ordered
+  list, with generation boundaries marked rather than hidden. Retention rose from
+  200 to 2000 lines, and older history is fetched lazily, a bounded page at a
+  time, when you scroll to the top. New `GET /api/v1/sessions/<id>/transcript`.
+- **Live follow, and a reading mode that holds still.** While you are at the
+  bottom the newest output stays in view. The moment you scroll up, auto-scroll
+  stops and your position is kept exactly: incoming output can no longer drag
+  you down or shift what you are reading. A "N new updates ↓" pill and a
+  "↓ Latest" button return you to the bottom and re-enable follow.
+- **Archive old sessions from the phone.** A finished session (`COMPLETED`,
+  `FAILED`, `ORPHANED`) can be removed from the list after a clear confirmation,
+  and restored again. The session list is now grouped into Active,
+  Recent / closed and Archived.
+  New `POST /api/v1/sessions/<id>/archive` and `/restore`.
+
+### Safety
+
+- Archiving is a **soft delete of Terminal Handoff's own record only**: the
+  record, its name, project and audit history are kept. No project file,
+  repository or other logical session is touched, and nothing is deleted from
+  disk. An active session (`RUNNING`, `WAITING_FOR_HUMAN`, `PAUSED`, `STOPPED`,
+  `CREATING`) is refused, as is any session whose owner is still verified alive.
+- The transcript is drawn from the same already-redacted output the gateway
+  served before; it exposes nothing new.
+
+### Fixed
+
+- The transcript is appended to, never rebuilt, so polling no longer disturbs the
+  instruction box: focus, draft, selection, the iOS keyboard and native iOS paste
+  all behave exactly as they did after the 1.4.0 fix.
+
 ## [1.4.0] - 2026-09-20
 
 This is the milestone that turns Terminal Handoff from basic session transfer into persistent remote Claude Code session control: a logical session that outlives individual Claude processes, hands off automatically, and can be started and steered from an enrolled iPhone over Tailscale while Claude keeps running on the Mac. Physical iPhone acceptance completed 2026-09-20 (see docs/ACCEPTANCE.md).
