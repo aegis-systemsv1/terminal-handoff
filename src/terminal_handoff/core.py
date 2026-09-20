@@ -7561,7 +7561,7 @@ def cmd_remote(args):
             print("refusing to start: %s" % exc)
             return 3
         print("Terminal Handoff gateway listening on 127.0.0.1:%d (loopback only)." % server.server_address[1])
-        print("It is NOT published. Publish deliberately with: tailscale serve --bg --https=443 http://127.0.0.1:%d" % server.server_address[1])
+        print("It is NOT published. Publish deliberately with: tailscale serve --bg %d" % server.server_address[1])
         log_event("remote_gateway_started", port=server.server_address[1])
         try:
             server.serve_forever()
