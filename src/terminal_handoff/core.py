@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import socketserver
 import subprocess
@@ -2576,7 +2577,7 @@ def build_launch_argv(manifest, claude_bin, prompt_text):
     argv += ["--name", successor_name]
     settings_file = logical_settings_file(manifest.get("logical_session_id"))
     if settings_file:
-        argv += ["--settings", settings_file]
+        argv += ["--setting-sources", "", "--settings", settings_file]
     argv += [prompt_text]
     return argv
 
@@ -6189,6 +6190,7 @@ def logical_mutate(lsid, mutator):
             out["result"] = mutator(data)
             out["ok"] = True
             data["updated_utc"] = utc_stamp()
+            data["updated_epoch"] = time.time()
         except LogicalRefusal as exc:
             out["reason"] = str(exc)
 
@@ -6289,11 +6291,16 @@ def logical_adopt_successor(lsid, transfer_record, binding=None):
                 message["status"] = "pending"
                 message["redelivered"] = int(message.get("redelivered") or 0) + 1
                 message["delivered_epoch"] = None
-        # A pending approval survives, re-bound to the new epoch (Stage 6).
+        # A pending request survives, re-bound to the new epoch: a phone that
+        # displayed it under the old epoch must look again before it can decide.
+        # An approval granted but not yet used does NOT cross a handoff: the new
+        # owner must ask again for the same action.
         for approval in record.get("approvals") or []:
-            if approval.get("status") in ("pending", "approved"):
+            if approval.get("status") == "pending":
                 approval["rebound_from_epoch"] = approval.get("bound_epoch")
                 approval["bound_epoch"] = record["owner_epoch"]
+            elif approval.get("status") == "approved":
+                approval["status"] = "invalidated_by_handoff"
         record["remote_control"] = {"state": REMOTE_UNKNOWN}  # re-verified for the new owner
         # STOP, pause and the inbox are deliberately untouched.
         logical_history(
@@ -6494,11 +6501,20 @@ def inbox_claim(lsid, agent_session_id, limit=20):
         if logical_halt_reason(record):
             raise LogicalRefusal("halted:%s" % logical_halt_reason(record))
         epoch = record.get("owner_epoch")
+        now = time.time()
         claimed = []
         for message in record["inbox"]["messages"]:
-            if message["status"] == "pending" and len(claimed) < limit:
+            leased_out = (
+                message["status"] == "delivered"
+                and message.get("delivered_epoch") == epoch
+                and now - float(message.get("delivered_time") or now) > DELIVERY_LEASE_SECONDS
+            )
+            if (message["status"] == "pending" or leased_out) and len(claimed) < limit:
+                if leased_out:  # the earlier delivery was never acknowledged: offer it again
+                    message["redelivered"] = int(message.get("redelivered") or 0) + 1
                 message["status"] = "delivered"
                 message["delivered_epoch"] = epoch
+                message["delivered_time"] = now
                 message["delivered_utc"] = utc_stamp()
                 claimed.append(dict(message))
         if claimed:
@@ -6548,6 +6564,12 @@ def logical_append_output(lsid, agent_session_id, text):
 
 def logical_public_view(record):
     """What a remote client may see. No PIDs, bindings, hashes or paths."""
+    import copy
+
+    record = copy.deepcopy(record)
+    _sweep_approvals(record)
+    if record.get("state") == LS_WAITING_FOR_HUMAN and not _pending_approval(record):
+        record["state"] = _effective_active_state(record)
     owner = record.get("owner") or {}
     inbox = (record.get("inbox") or {}).get("messages") or []
     return {
@@ -6574,6 +6596,21 @@ def logical_public_view(record):
             "acked": sum(1 for m in inbox if m["status"] == "acked"),
         },
         "recent_output": list(record.get("output") or [])[-20:],
+        "owner_health": {
+            k: v for k, v in (record.get("owner_health") or {}).items() if k in ("verdict", "detail", "checked_utc", "failures")
+        },
+        "orphaned": record.get("orphaned"),
+        "agent_poll_age_seconds": (
+            round(time.time() - float(record["agent_poll_epoch"]), 1) if record.get("agent_poll_epoch") else None
+        ),
+        "approvals": [
+            approval_public(a, True)
+            for a in (record.get("approvals") or [])
+            if a.get("status") in ("pending", "approved")
+            or (a.get("status") in ("denied", "consumed") and time.time() - float(a.get("created_epoch") or 0) < 86400)
+        ][-5:],
+        "human_gate": next((approval_public(a, True) for a in (record.get("approvals") or []) if a.get("status") == "pending"), None),
+        "project_available": record.get("project_available", True),
     }
 
 
@@ -6592,7 +6629,18 @@ def cmd_session(args):
     if action == "list":
         print(json.dumps([logical_public_view(r) for r in logical_list()], indent=2, sort_keys=True))
         return 0
-    if action in ("inbox", "ack", "note", "check"):
+    if action == "hook-stop":
+        code, message = session_hook_stop(sys.stdin.read())
+        if message:
+            sys.stderr.write(message)
+        return code
+    if action == "reconcile":
+        if args.startup:
+            print(json.dumps(service_recover(), indent=2, sort_keys=True))
+        else:
+            print(json.dumps({r["logical_session_id"]: r["state"] for r in logical_reconcile_all(strict=args.strict)}, indent=2, sort_keys=True))
+        return 0
+    if action in ("inbox", "ack", "note", "check", "wait", "gate", "consume"):
         lsid = logical_link_for_agent(lsid, agent)
     if not lsid:
         print(json.dumps({"error": "no logical session"}))
@@ -6625,6 +6673,21 @@ def cmd_session(args):
         out["result"] = result
     elif action == "note":
         ok, why, _ = logical_append_output(lsid, agent, args.text or "")
+    elif action == "wait":
+        out = dict(logical_wait(lsid, agent, args.timeout), logical_session_id=lsid)
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
+    elif action == "gate":
+        ok, why, approval = approval_request(lsid, agent, args.requested_action, args.reason)
+        out["approval"] = approval_public(approval, False) if approval else None
+    elif action == "consume":
+        ok, why, approval = approval_consume(lsid, agent, args.approval_id, args.requested_action)
+        out["approval"] = approval_public(approval, False) if approval else None
+        out["proceed"] = bool(ok)
+    elif action == "decide":
+        ok, why, approval = approval_decide(lsid, args.approval_id, args.decision, args.nonce, args.owner_epoch, "local")
+    elif action == "recover":
+        ok, why, _ = logical_recover(lsid, args.recover_action, by="local")
     elif action == "check":
         halt = logical_halt_reason(record)
         owner = _is_owner(record, agent)
@@ -7002,6 +7065,7 @@ def cmd_project(args):
 # -- Remote configuration and devices ---------------------------------------
 
 
+DEFAULT_GATEWAY_PORT = 18790  # deliberately unusual: 8787 and 8443 are commonly taken
 DEFAULT_DEVICE_TTL_DAYS = 14
 MAX_DEVICE_TTL_DAYS = 90
 ENROLLMENT_TTL_SECONDS = 600
@@ -7026,8 +7090,11 @@ def remote_config_problems(config):
     if not isinstance(users, list) or not users or not all(isinstance(u, str) and "@" in u for u in users):
         problems.append("tailscale_users must list at least one Tailscale login")
     port = config.get("port")
-    if not isinstance(port, int) or not (1024 <= port <= 65535):
+    if not isinstance(port, int) or isinstance(port, bool) or not (1024 <= port <= 65535):
         problems.append("port must be an integer between 1024 and 65535")
+    public = config.get("public_port", 443)
+    if not isinstance(public, int) or isinstance(public, bool) or not (1 <= public <= 65535):
+        problems.append("public_port must be a valid HTTPS port")
     return problems
 
 
@@ -7153,6 +7220,9 @@ def device_list():
                 "expires_utc": utc_stamp(datetime.fromtimestamp(device.get("expires_epoch", 0), timezone.utc)),
                 "revoked": bool(device.get("revoked_epoch")),
                 "last_seen": device.get("last_seen_epoch"),
+                "last_used_utc": utc_stamp(datetime.fromtimestamp(device["last_seen_epoch"], timezone.utc))
+                if device.get("last_seen_epoch")
+                else None,
             }
         )
     return rows
@@ -7200,6 +7270,51 @@ def tailscale_status_ok(status, allowed_host):
     return True, None
 
 
+def tailscale_binary():
+    for candidate in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def parse_serve_status(status):
+    """`(https_ports, local_targets)` from `tailscale serve status --json`."""
+    https_ports, targets = set(), set()
+    if isinstance(status, dict):
+        for port in (status.get("TCP") or {}):
+            if str(port).isdigit():
+                https_ports.add(int(port))
+        for cfg in (status.get("Web") or {}).values():
+            for handler in ((cfg or {}).get("Handlers") or {}).values():
+                match = re.search(r"(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)", str((handler or {}).get("Proxy") or ""))
+                if match:
+                    targets.add(int(match.group(1)))
+    return https_ports, targets
+
+
+def check_serve_conflicts(config, run=subprocess.run):
+    """Refuse to run on a local port that an existing `tailscale serve` mapping already
+    publishes: starting there would expose the gateway without anyone choosing to.
+
+    Returns `(ok, reason, suggested_https_port)`. Read-only: it never changes serve.
+    """
+    binary = tailscale_binary()
+    if binary is None:
+        return False, "the tailscale CLI was not found", None
+    try:
+        proc = run([binary, "serve", "status", "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        status = json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
+    except Exception as exc:
+        return False, "could not read the existing Tailscale serve configuration: %s" % str(exc)[:100], None
+    https_ports, targets = parse_serve_status(status)
+    if config.get("port") in targets:
+        return False, "local port %s is already published by an existing `tailscale serve` mapping; choose another port" % config.get("port"), None
+    candidate = 8445
+    while candidate in https_ports:
+        candidate += 1
+    return True, None, candidate
+
+
 class RateLimiter(object):
     """Small in-memory sliding-window limiter with a failure lockout."""
 
@@ -7229,12 +7344,25 @@ class RateLimiter(object):
 
 MAX_BODY_BYTES = 32768
 SESSION_PATH_RE = re.compile(r"^/api/v1/sessions/(ls_[a-f0-9]{24})(?:/([a-z]+))?$")
+APPROVAL_PATH_RE = re.compile(r"^/api/v1/sessions/(ls_[a-f0-9]{24})/approvals/(ap_[a-f0-9]{16})/(approve|deny)$")
+SENSITIVE_LIMITS = {
+    "create": (5, 600),
+    "approve": (20, 60),
+    "deny": (20, 60),
+    "stop": (30, 60),
+    "pause": (30, 60),
+    "resume": (30, 60),
+    "recover": (10, 60),
+}
 ALLOWED_BODY_KEYS = {
     "instructions": {"text", "request_id"},
     "pause": {"request_id"},
     "resume": {"request_id", "reason", "clear_stop"},
     "stop": {"request_id", "reason", "hard"},
     "create": {"project", "task", "request_id"},
+    "approve": {"nonce", "owner_epoch", "request_id"},
+    "deny": {"nonce", "owner_epoch", "request_id"},
+    "recover": {"action", "request_id"},
     "enroll": {"code"},
 }
 AUTH_FAIL_LIMIT = 8
@@ -7248,6 +7376,7 @@ class RemoteGateway(object):
         self.config = config
         self.clock = clock
         self.limiter = RateLimiter(clock)
+        self.plimiter = PersistentLimiter(clock)
         self.replay = {}
         self.replay_lock = threading.Lock()
         self.launcher = launcher
@@ -7258,8 +7387,19 @@ class RemoteGateway(object):
         return self.config["allowed_host"].lower()
 
     @property
+    def public_port(self):
+        return int(self.config.get("public_port", 443))
+
+    @property
     def origin(self):
-        return "https://%s" % self.host
+        return "https://%s" % self.host if self.public_port == 443 else "https://%s:%d" % (self.host, self.public_port)
+
+    def host_ok(self, header):
+        """The Host header must be our tailnet name, with our public port if it has one."""
+        name, _, port = (header or "").lower().partition(":")
+        if name != self.host:
+            return False
+        return port == "" or (port.isdigit() and int(port) == self.public_port)
 
     def tailscale_user(self, headers):
         login = (headers.get("Tailscale-User-Login") or "").strip().lower()
@@ -7291,6 +7431,310 @@ def _json_body(handler):
     return (body, None) if isinstance(body, dict) else (None, "body must be an object")
 
 
+# ---------------------------------------------------------------------------
+# Mobile web interface (served by the gateway, embedded so the install stays one file)
+# ---------------------------------------------------------------------------
+#
+# Deliberately plain. All dynamic text is set with textContent, nothing is
+# written as HTML, no script is inline, and no credential is ever stored by
+# the page: the device token lives only in an HttpOnly cookie.
+
+UI_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+    "img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
+
+UI_INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Terminal Handoff</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header><h1>Terminal Handoff</h1></header>
+<main id="app"><p class="muted">Loading&hellip;</p></main>
+<noscript><p>This page needs JavaScript.</p></noscript>
+<script src="/app.js"></script>
+</body>
+</html>
+"""
+
+UI_APP_CSS = """
+:root { --bg:#fff; --fg:#111; --muted:#666; --card:#f2f2f6; --line:#d0d0d8; --ok:#0a7d33; --warn:#a15c00; --bad:#b00020; --accent:#0a4fd6; }
+@media (prefers-color-scheme: dark) { :root { --bg:#000; --fg:#f2f2f2; --muted:#9a9aa2; --card:#1c1c22; --line:#33333b; --ok:#3fcf6b; --warn:#ffb340; --bad:#ff6b6b; --accent:#6ea0ff; } }
+* { box-sizing:border-box; }
+body { margin:0; padding:0 16px 48px; background:var(--bg); color:var(--fg); font:17px/1.4 -apple-system, system-ui, sans-serif; }
+header { padding:16px 0 4px; } h1 { font-size:22px; margin:0; } h2 { font-size:18px; margin:20px 0 8px; }
+.muted { color:var(--muted); } .mono { font-family:ui-monospace, Menlo, monospace; font-size:13px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin:12px 0; display:block; color:inherit; text-decoration:none; }
+.row { display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+.state { font-weight:700; letter-spacing:.03em; font-size:14px; }
+.s-RUNNING, .s-healthy { color:var(--ok); } .s-WAITING_FOR_HUMAN, .s-PAUSED, .s-degraded, .s-CREATING { color:var(--warn); }
+.s-STOPPED, .s-ORPHANED, .s-FAILED { color:var(--bad); }
+button, select, textarea, input { font:inherit; width:100%; min-height:52px; border-radius:12px; border:1px solid var(--line); background:var(--bg); color:var(--fg); padding:10px 12px; margin:6px 0; }
+textarea { min-height:120px; }
+button { background:var(--accent); color:#fff; border:0; font-weight:700; }
+button.secondary { background:var(--card); color:var(--fg); border:1px solid var(--line); }
+button.danger { background:var(--bad); color:#fff; } button.ok { background:var(--ok); color:#fff; }
+button:disabled { opacity:.5; }
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; } .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
+.gate { border:2px solid var(--warn); } .gate .action { font-size:18px; font-weight:600; margin:8px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+.out { white-space:pre-wrap; overflow-wrap:anywhere; max-height:260px; overflow:auto; }
+.err { color:var(--bad); font-weight:600; } .note { color:var(--warn); }
+a.back { display:inline-block; padding:10px 0; color:var(--accent); text-decoration:none; }
+"""
+
+UI_APP_JS = r"""
+(function () {
+  'use strict';
+  var app = document.getElementById('app');
+  var csrf = null, timer = null, formRequestId = null;
+
+  function el(tag, attrs, kids) {
+    var e = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function (k) {
+      var v = attrs[k];
+      if (k === 'text') e.textContent = v;
+      else if (k === 'class') e.className = v;
+      else if (k.slice(0, 2) === 'on') e.addEventListener(k.slice(2), v);
+      else e.setAttribute(k, v);
+    });
+    (kids || []).forEach(function (c) { if (c !== null && c !== undefined) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+    return e;
+  }
+  function rid() {
+    var raw = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+    return ('req-' + raw).replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 60);
+  }
+  function api(method, path, body) {
+    var headers = { 'Content-Type': 'application/json' };
+    if (csrf) headers['X-CSRF-Token'] = csrf;
+    return fetch(path, { method: method, credentials: 'same-origin', headers: headers, body: body ? JSON.stringify(body) : undefined })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (d) { return { status: r.status, data: d }; }); });
+  }
+  function clear() { while (app.firstChild) app.removeChild(app.firstChild); }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } }
+  function poll(fn, ms) { stop(); timer = setInterval(function () { if (!document.hidden) fn(); }, ms); }
+  function ago(iso) {
+    var s = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
+    if (isNaN(s)) return '';
+    if (s < 90) return s + 's'; var m = Math.floor(s / 60); if (m < 120) return m + 'm';
+    var h = Math.floor(m / 60); return h < 48 ? h + 'h ' + (m % 60) + 'm' : Math.floor(h / 24) + 'd';
+  }
+  function short(id) { return id ? id.slice(0, 7) + '…' + id.slice(-4) : ''; }
+  function label(state) { return (state || '').replace(/_/g, ' '); }
+  function stateEl(state) { return el('span', { 'class': 'state s-' + state, text: label(state) }); }
+  function remoteLabel(rc) { var s = (rc && rc.state) || 'unknown'; return s === 'healthy' ? 'Healthy' : s === 'degraded' ? 'Degraded' : s === 'disabled' ? 'Off' : 'Unknown'; }
+  function nav(hash) { location.hash = hash; }
+
+  // ---- enrolment ----------------------------------------------------------
+  function renderEnroll(message) {
+    stop(); clear();
+    var input = el('input', { type: 'text', autocomplete: 'off', autocapitalize: 'off', placeholder: 'One-time enrollment code', 'aria-label': 'Enrollment code' });
+    var msg = el('p', { 'class': 'err', text: message || '' });
+    var btn = el('button', { text: 'Enroll this device', onclick: function () {
+      btn.disabled = true;
+      api('POST', '/api/v1/enroll', { code: input.value.trim() }).then(function (r) {
+        if (r.status === 200) { csrf = r.data.csrf; boot(); }
+        else { btn.disabled = false; msg.textContent = r.status === 429 ? 'Too many attempts. Wait and try again.' : 'That code was not accepted.'; }
+      });
+    } });
+    app.appendChild(el('div', { 'class': 'card' }, [el('h2', { text: 'Enroll this device' }),
+      el('p', { 'class': 'muted', text: 'On the Mac, run: terminal-handoff remote enroll-device' }), input, btn, msg]));
+  }
+
+  // ---- session list -------------------------------------------------------
+  function renderList() {
+    stop();
+    var box = el('div');
+    function load() {
+      api('GET', '/api/v1/sessions').then(function (r) {
+        if (r.status === 401) return boot();
+        while (box.firstChild) box.removeChild(box.firstChild);
+        var sessions = r.data.sessions || [];
+        if (!sessions.length) box.appendChild(el('p', { 'class': 'muted', text: 'No sessions yet.' }));
+        sessions.forEach(function (s) {
+          var sub = s.state === 'WAITING_FOR_HUMAN' ? 'Approval required' : ('Working for ' + ago(s.created_utc));
+          if (s.state === 'STOPPED') sub = 'STOPPED by you';
+          if (s.state === 'ORPHANED') sub = 'Claude stopped responding';
+          box.appendChild(el('a', { 'class': 'card', href: '#/s/' + s.logical_session_id }, [
+            el('div', { 'class': 'row' }, [el('strong', { text: s.project || 'session' }), stateEl(s.state)]),
+            el('div', { 'class': 'muted', text: sub }),
+            el('div', { 'class': 'muted', text: 'Remote Control: ' + remoteLabel(s.remote_control) })]));
+        });
+      });
+    }
+    clear();
+    app.appendChild(el('h2', { text: 'Active sessions' }));
+    app.appendChild(box);
+    app.appendChild(el('button', { text: '+ New Session', onclick: function () { nav('#/new'); } }));
+    load(); poll(load, 5000);
+  }
+
+  // ---- new session --------------------------------------------------------
+  function renderNew() {
+    stop(); clear();
+    formRequestId = rid();
+    var select = el('select', { 'aria-label': 'Project' });
+    var task = el('textarea', { placeholder: 'What should Claude do? (dictation works here)', 'aria-label': 'Task' });
+    var msg = el('p', { 'class': 'err', text: '' });
+    var go = el('button', { text: 'Start Session', onclick: function () {
+      if (!select.value || !task.value.trim()) { msg.textContent = 'Choose a project and describe the task.'; return; }
+      go.disabled = true; msg.textContent = ''; msg.className = 'note'; msg.textContent = 'Starting on your Mac…';
+      api('POST', '/api/v1/sessions', { project: select.value, task: task.value, request_id: formRequestId }).then(function (r) {
+        var d = r.data || {};
+        if ((r.status === 201 || r.status === 200 || r.status === 202) && d.logical_session_id) nav('#/s/' + d.logical_session_id);
+        else { go.disabled = false; msg.className = 'err'; msg.textContent = 'Not started: ' + (d.reason || d.error || ('error ' + r.status)); }
+      });
+    } });
+    app.appendChild(el('a', { 'class': 'back', href: '#/', text: '‹ Sessions' }));
+    app.appendChild(el('div', { 'class': 'card' }, [el('h2', { text: 'New Session' }), el('label', { text: 'Project' }), select, el('label', { text: 'Task' }), task, go, msg]));
+    api('GET', '/api/v1/projects').then(function (r) {
+      var names = (r.data && r.data.projects) || [];
+      if (!names.length) { msg.textContent = 'No project is enabled for remote launch.'; go.disabled = true; }
+      names.forEach(function (n) { select.appendChild(el('option', { value: n, text: n })); });
+    });
+  }
+
+  // ---- one session ----------------------------------------------------------
+  function renderSession(id) {
+    stop(); clear();
+    var box = el('div');
+    var flash = el('p', { 'class': 'note', text: '' });
+    app.appendChild(el('a', { 'class': 'back', href: '#/', text: '‹ Sessions' }));
+    app.appendChild(box);
+    var view = null;
+    var panel = null; // 'stop' | 'clear' | null
+
+    function post(path, body, ok) {
+      return api('POST', path, Object.assign({ request_id: rid() }, body)).then(function (r) {
+        if (r.status === 401) return boot();
+        var reason = r.data && (r.data.reason || r.data.error);
+        flash.textContent = (r.status >= 200 && r.status < 300) ? (ok || 'Done.') : ('Refused: ' + reason);
+        panel = null; load();
+        return r;
+      });
+    }
+    function decide(gate, decision) {
+      return post('/api/v1/sessions/' + id + '/approvals/' + gate.id + '/' + decision,
+        { nonce: gate.nonce, owner_epoch: view.owner && view.owner.epoch }, decision === 'approve' ? 'Approved.' : 'Denied.');
+    }
+    function draw() {
+      var s = view;
+      while (box.firstChild) box.removeChild(box.firstChild);
+      box.appendChild(el('div', { 'class': 'row' }, [el('h2', { text: s.project || 'Session' }), stateEl(s.state)]));
+      box.appendChild(flash);
+      if (s.human_gate) {
+        var g = s.human_gate;
+        box.appendChild(el('div', { 'class': 'card gate' }, [
+          el('strong', { text: 'APPROVAL REQUIRED' }),
+          el('div', { 'class': 'muted', text: 'Project: ' + (s.project || '') }),
+          el('div', { 'class': 'muted', text: 'Requested action:' }),
+          el('div', { 'class': 'action', text: g.action }),
+          el('div', { 'class': 'muted', text: 'Reason:' }),
+          el('div', { text: g.reason }),
+          el('div', { 'class': 'muted', text: 'This answers a Terminal Handoff gate, not a Claude permission prompt.' }),
+          el('div', { 'class': 'grid2' }, [
+            el('button', { 'class': 'danger', text: 'DENY', onclick: function () { decide(g, 'deny'); } }),
+            el('button', { 'class': 'ok', text: 'APPROVE', onclick: function () { decide(g, 'approve'); } })])]));
+      }
+      if (s.state === 'ORPHANED') {
+        box.appendChild(el('div', { 'class': 'card' }, [
+          el('strong', { 'class': 'err', text: 'Claude stopped responding.' }),
+          el('div', { 'class': 'muted', text: (s.orphaned && s.orphaned.reason) || '' }),
+          el('div', { 'class': 'muted', text: 'It will not be replaced automatically.' }),
+          el('div', { 'class': 'grid2' }, [
+            el('button', { 'class': 'secondary', text: 'Re-check', onclick: function () { post('/api/v1/sessions/' + id + '/recover', { action: 'reattach' }, 'Re-attached.'); } }),
+            el('button', { 'class': 'danger', text: 'Abandon', onclick: function () { post('/api/v1/sessions/' + id + '/recover', { action: 'abandon' }, 'Abandoned.'); } })])]));
+      }
+      var poll_age = s.agent_poll_age_seconds;
+      var wake = poll_age === null || poll_age === undefined ? 'Claude has not checked in yet' : (poll_age < 45 ? 'Claude is listening' : 'Claude is busy or away; it will see new instructions at its next check');
+      box.appendChild(el('div', { 'class': 'card' }, [
+        el('div', { 'class': 'muted', text: 'Current task' }), el('div', { text: s.title || '(none)' }),
+        el('div', { 'class': 'muted', text: 'Branch: ' + (s.branch || 'n/a') }),
+        el('div', { 'class': 'muted', text: 'Owner generation: ' + (s.owner ? s.owner.generation : 'none') + ' · ID ' + short(s.logical_session_id) }),
+        el('div', { 'class': 'muted', text: 'Elapsed: ' + ago(s.created_utc) }),
+        el('div', { 'class': 'muted', text: 'Remote Control: ' + remoteLabel(s.remote_control) }),
+        el('div', { 'class': 'muted', text: wake }),
+        el('div', { 'class': 'muted', text: 'Instructions pending: ' + (s.inbox ? s.inbox.pending : 0) }),
+        s.project_available === false ? el('div', { 'class': 'err', text: 'This project is no longer available on the Mac.' }) : null]));
+      var out = (s.recent_output || []).map(function (o) { return o.text; }).join('\n');
+      box.appendChild(el('h2', { text: 'Recent output' }));
+      box.appendChild(el('div', { 'class': 'card out mono', text: out || '(nothing yet)' }));
+
+      var ended = s.state === 'FAILED' || s.state === 'COMPLETED';
+      if (!ended) {
+        var text = el('textarea', { placeholder: 'Tell Claude…', 'aria-label': 'Instruction' });
+        box.appendChild(text);
+        box.appendChild(el('button', { text: 'Send', onclick: function () {
+          if (!text.value.trim()) return;
+          post('/api/v1/sessions/' + id + '/instructions', { text: text.value }, 'Sent. It is queued for Claude.').then(function () { text.value = ''; });
+        } }));
+        var stopped = s.state === 'STOPPED';
+        box.appendChild(el('div', { 'class': 'grid3' }, [
+          el('button', { 'class': 'secondary', text: 'Pause', onclick: function () { post('/api/v1/sessions/' + id + '/pause', {}, 'Paused.'); } }),
+          el('button', { 'class': 'secondary', text: stopped ? 'Resume…' : 'Resume', onclick: function () {
+            if (stopped) { panel = 'clear'; draw(); } else post('/api/v1/sessions/' + id + '/resume', {}, 'Resumed.'); } }),
+          el('button', { 'class': 'danger', text: 'STOP', onclick: function () { panel = 'stop'; draw(); } })]));
+        if (panel === 'stop') {
+          var hard = el('input', { type: 'checkbox', id: 'hard' });
+          box.appendChild(el('div', { 'class': 'card' }, [
+            el('strong', { text: 'Stop this session?' }),
+            el('div', { 'class': 'muted', text: 'Claude will do no further autonomous work until you deliberately clear the STOP.' }),
+            el('label', {}, [hard, ' Also end the Claude process']),
+            el('div', { 'class': 'grid2' }, [
+              el('button', { 'class': 'secondary', text: 'Cancel', onclick: function () { panel = null; draw(); } }),
+              el('button', { 'class': 'danger', text: 'Confirm STOP', onclick: function () { post('/api/v1/sessions/' + id + '/stop', { reason: 'Stopped from phone', hard: !!hard.checked }, 'STOPPED.'); } })])]));
+        }
+        if (panel === 'clear') {
+          var why = el('input', { type: 'text', placeholder: 'Why is it safe to resume?', 'aria-label': 'Reason' });
+          box.appendChild(el('div', { 'class': 'card' }, [
+            el('strong', { text: 'Clear the STOP and resume?' }), why,
+            el('div', { 'class': 'grid2' }, [
+              el('button', { 'class': 'secondary', text: 'Cancel', onclick: function () { panel = null; draw(); } }),
+              el('button', { text: 'Clear STOP', onclick: function () {
+                if (!why.value.trim()) { flash.textContent = 'Give a reason.'; return; }
+                post('/api/v1/sessions/' + id + '/resume', { clear_stop: true, reason: why.value }, 'STOP cleared.'); } })])]));
+        }
+      }
+    }
+    function load() {
+      api('GET', '/api/v1/sessions/' + id).then(function (r) {
+        if (r.status === 401) return boot();
+        if (r.status !== 200) { clear(); app.appendChild(el('p', { 'class': 'err', text: 'Session not found.' })); return; }
+        var typing = box.querySelector && box.querySelector('textarea');
+        if (typing && typing.value) { view = r.data; return; } // never redraw over text being typed
+        view = r.data; draw();
+      });
+    }
+    load(); poll(load, 3000);
+  }
+
+  // ---- routing -------------------------------------------------------------------
+  function route() {
+    var h = location.hash || '#/';
+    var m = /^#\/s\/(ls_[a-f0-9]{24})$/.exec(h);
+    if (m) return renderSession(m[1]);
+    if (h === '#/new') return renderNew();
+    return renderList();
+  }
+  function boot() {
+    api('GET', '/api/v1/me').then(function (r) {
+      if (r.status === 200) { csrf = r.data.csrf; route(); }
+      else if (r.status === 401) renderEnroll('');
+      else { stop(); clear(); app.appendChild(el('p', { 'class': 'err', text: r.status === 429 ? 'Too many attempts. Wait and try again.' : 'Not available from this network.' })); }
+    }).catch(function () { clear(); app.appendChild(el('p', { 'class': 'err', text: 'Cannot reach your Mac.' })); });
+  }
+  window.addEventListener('hashchange', function () { if (csrf) route(); });
+  boot();
+})();
+"""
+
+
 def make_remote_handler(gateway):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "TerminalHandoff"
@@ -7315,14 +7759,26 @@ def make_remote_handler(gateway):
             self.end_headers()
             self.wfile.write(data)
 
+        def _send_static(self, content_type, text):
+            data = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", UI_CSP)
+            self.end_headers()
+            self.wfile.write(data)
+
         def _deny(self, status, code, why=None):
             log_event("remote_request_refused", status=status, code=code, why=why, path=self.path.split("?")[0][:80])
             self._send(status, {"error": code})
 
         # ---- gate: every request passes here first
         def _gate(self, mutating, need_device=True):
-            host = (self.headers.get("Host") or "").split(":")[0].lower()
-            if host != gateway.host:
+            if not gateway.host_ok(self.headers.get("Host")):
                 self._deny(403, "forbidden", "bad host")
                 return None
             login = gateway.tailscale_user(self.headers)
@@ -7330,7 +7786,7 @@ def make_remote_handler(gateway):
                 self._deny(403, "forbidden", "not a permitted tailnet identity")
                 return None
             peer = "%s|%s" % (login, self.client_address[0])
-            if gateway.limiter.blocked(("authfail", peer), AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW):
+            if gateway.plimiter.blocked("authfail|" + peer, AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW):
                 self._deny(429, "rate_limited", "auth lockout")
                 return None
             if not gateway.limiter.allow(("req", peer), 240, 60):
@@ -7343,7 +7799,7 @@ def make_remote_handler(gateway):
             token, via_cookie = self._token()
             device_id, device = device_authenticate(token, gateway.clock())
             if device_id is None:
-                gateway.limiter.allow(("authfail", peer), 10 ** 6, AUTH_FAIL_WINDOW)
+                gateway.plimiter.record("authfail|" + peer, AUTH_FAIL_WINDOW)
                 log_event("remote_auth_failed", reason=device, peer_login=login)
                 self._send(401, {"error": "unauthorized"})
                 return None
@@ -7381,6 +7837,11 @@ def make_remote_handler(gateway):
         # ---- verbs
         def do_GET(self):
             path = self.path.split("?")[0]
+            assets = {"/": ("text/html; charset=utf-8", UI_INDEX_HTML), "/app.js": ("application/javascript; charset=utf-8", UI_APP_JS), "/app.css": ("text/css; charset=utf-8", UI_APP_CSS)}
+            if path in assets:
+                if self._gate(False, need_device=False):  # the page holds nothing sensitive, but still needs the private network identity
+                    self._send_static(*assets[path])
+                return
             if path == "/healthz":
                 ctx = self._gate(False, need_device=False)
                 if ctx:
@@ -7416,11 +7877,14 @@ def make_remote_handler(gateway):
             body, why = _json_body(self)
             if body is None:
                 return self._deny(400, "bad_request", why)
+            approval_id = None
             if path == "/api/v1/sessions":
                 action, lsid = "create", None
+            elif APPROVAL_PATH_RE.match(path):
+                lsid, approval_id, action = APPROVAL_PATH_RE.match(path).groups()
             else:
                 match = SESSION_PATH_RE.match(path)
-                if not match or match.group(2) not in ("instructions", "pause", "resume", "stop"):
+                if not match or match.group(2) not in ("instructions", "pause", "resume", "stop", "recover"):
                     return self._deny(404, "not_found")
                 lsid, action = match.group(1), match.group(2)
             unknown = set(body) - ALLOWED_BODY_KEYS[action]
@@ -7432,7 +7896,11 @@ def make_remote_handler(gateway):
             cached = gateway.replayed(ctx["device_id"], request_id)
             if cached is not None:
                 return self._send(cached[0], dict(cached[1], replayed=True))
-            status, payload = self._dispatch(action, lsid, body, ctx, request_id)
+            if action in SENSITIVE_LIMITS:
+                limit, window = SENSITIVE_LIMITS[action]
+                if not gateway.plimiter.allow("act|%s|%s" % (action, ctx["device_id"]), limit, window):
+                    return self._deny(429, "rate_limited", "sensitive action rate")
+            status, payload = self._dispatch(action, lsid, body, ctx, request_id, approval_id)
             gateway.remember(ctx["device_id"], request_id, (status, payload))
             self._send(status, payload)
 
@@ -7445,14 +7913,14 @@ def make_remote_handler(gateway):
             ctx = self._gate(True, need_device=False)
             if not ctx:
                 return
-            if not gateway.limiter.allow(("enroll", ctx["peer"]), 5, 600):
+            if not gateway.plimiter.allow("enroll|" + ctx["peer"], 5, 600):
                 return self._deny(429, "rate_limited", "enrollment rate")
             body, why = _json_body(self)
             if body is None or set(body) - ALLOWED_BODY_KEYS["enroll"]:
                 return self._deny(400, "bad_request", why or "unexpected fields")
             device_id, token = device_enroll_complete(body.get("code"))
             if device_id is None:
-                gateway.limiter.allow(("authfail", ctx["peer"]), 10 ** 6, AUTH_FAIL_WINDOW)
+                gateway.plimiter.record("authfail|" + ctx["peer"], AUTH_FAIL_WINDOW)
                 return self._send(401, {"error": "unauthorized"})
             device = ((read_json(devices_path(), {}) or {}).get("devices") or {}).get(device_id)
             cookie = "__Host-thd=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=%d" % (
@@ -7461,7 +7929,7 @@ def make_remote_handler(gateway):
             )
             self._send(200, {"device_id": device_id, "csrf": csrf_token_for(device_id, device)}, cookie=cookie)
 
-        def _dispatch(self, action, lsid, body, ctx, request_id):
+        def _dispatch(self, action, lsid, body, ctx, request_id, approval_id=None):
             by = "device:%s" % ctx["device_id"]
             if action == "create":
                 if gateway.launcher is None:
@@ -7475,6 +7943,20 @@ def make_remote_handler(gateway):
                 if not ok:
                     return 400, {"error": "refused", "reason": why}
                 return 202, {"message_id": message["id"], "seq": message["seq"], "duplicate": message["duplicate"]}
+            if action in ("approve", "deny"):
+                epoch = body.get("owner_epoch")
+                if not isinstance(epoch, int) or isinstance(epoch, bool):
+                    return 400, {"error": "bad_request", "reason": "owner_epoch must be an integer"}
+                ok, why, approval = approval_decide(lsid, approval_id, action, body.get("nonce"), epoch, by)
+                if not ok:
+                    status = 404 if why in ("unknown approval",) else 409
+                    return status, {"error": "refused", "reason": why, "session": logical_public_view(logical_read(lsid))}
+                return 200, logical_public_view(logical_read(lsid))
+            if action == "recover":
+                ok, why, _ = logical_recover(lsid, body.get("action"), by=by)
+                if not ok:
+                    return 409, {"error": "refused", "reason": why}
+                return 200, logical_public_view(logical_read(lsid))
             if action == "pause":
                 ok, why, _ = logical_pause(lsid, by=by)
             elif action == "stop":
@@ -7495,7 +7977,7 @@ class _LoopbackServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
-def make_remote_server(config, port=None, launcher=None, tailscale_checker=None):
+def make_remote_server(config, port=None, launcher=None, tailscale_checker=None, serve_checker=None):
     """Build the gateway server. Fails closed and binds loopback only.
 
     `tailscale_checker(host) -> (ok, reason)` is required. Publication to the
@@ -7509,23 +7991,41 @@ def make_remote_server(config, port=None, launcher=None, tailscale_checker=None)
     ok, why = tailscale_checker(config["allowed_host"])
     if not ok:
         raise ValueError("private network check failed: %s" % why)
+    if serve_checker is not None:
+        ok, why, _ = serve_checker(config)
+        if not ok:
+            raise ValueError("refusing to start: %s" % why)
     gateway = RemoteGateway(config, launcher=launcher)
     server = _LoopbackServer(("127.0.0.1", port if port is not None else config["port"]), make_remote_handler(gateway))
     server.gateway = gateway
     return server
 
 
+def _reconcile_loop(interval=15.0):
+    while True:
+        time.sleep(interval)
+        try:
+            logical_reconcile_all()
+            sweep_launch_artifacts()
+        except Exception as exc:
+            log_event("reconcile_error", error=str(exc)[:200])
+
+
 def cmd_remote(args):
     action = args.action
+    if action == "verify-isolation":
+        return cmd_verify_isolation()
     if action == "configure":
         config = remote_config()
         if args.host:
             config["allowed_host"] = args.host.lower()
         if args.tailscale_user:
             config["tailscale_users"] = sorted(set(config.get("tailscale_users", []) + [args.tailscale_user]))
-        config.setdefault("port", 8787)
+        config.setdefault("port", DEFAULT_GATEWAY_PORT)
         if args.port:
             config["port"] = args.port
+        if args.public_port:
+            config["public_port"] = args.public_port
         write_json_private(remote_config_path(), config)
         problems = remote_config_problems(config)
         print(json.dumps(config, indent=2))
@@ -7538,7 +8038,8 @@ def cmd_remote(args):
             return 3
         host = remote_config().get("allowed_host", "<this-mac>.ts.net")
         print("One-time code (valid %d minutes, single use):\n  %s" % (ENROLLMENT_TTL_SECONDS // 60, code))
-        print("Open https://%s/ on the device, choose Enroll, and enter the code." % host)
+        public = remote_config().get("public_port", 443)
+        print("Open https://%s%s/ on the device, choose Enroll, and enter the code." % (host, "" if public == 443 else ":%d" % public))
         return 0
     if action == "list-devices":
         print(json.dumps(device_list(), indent=2))
@@ -7551,17 +8052,33 @@ def cmd_remote(args):
         config = remote_config()
         problems = remote_config_problems(config)
         ok, why = check_tailscale(config.get("allowed_host", "")) if not problems else (False, None)
-        print(json.dumps({"config_problems": problems, "tailscale_ok": ok, "tailscale_reason": why}, indent=2))
-        return 0 if not problems and ok else 3
+        serve_ok, serve_why, suggested = check_serve_conflicts(config) if not problems else (False, None, None)
+        print(json.dumps({
+            "config_problems": problems,
+            "tailscale_ok": ok,
+            "tailscale_reason": why,
+            "serve_conflict_free": serve_ok,
+            "serve_reason": serve_why,
+            "suggested_publish_command": ("tailscale serve --bg --https=%d http://127.0.0.1:%s" % (suggested, config.get("port"))) if suggested else None,
+            "current_public_port": config.get("public_port", 443),
+        }, indent=2))
+        return 0 if not problems and ok and serve_ok else 3
     if action == "serve":
         config = remote_config()
         try:
-            server = make_remote_server(config, tailscale_checker=check_tailscale, launcher=remote_create_session_handler)
+            server = make_remote_server(config, tailscale_checker=check_tailscale, launcher=remote_create_session_handler, serve_checker=check_serve_conflicts)
         except ValueError as exc:
             print("refusing to start: %s" % exc)
             return 3
+        recovered = service_recover()
+        sweep_launch_artifacts()
+        threading.Thread(target=_reconcile_loop, daemon=True).start()
+        print("Recovered %d logical session(s) after start." % len(recovered))
         print("Terminal Handoff gateway listening on 127.0.0.1:%d (loopback only)." % server.server_address[1])
-        print("It is NOT published. Publish deliberately with: tailscale serve --bg %d" % server.server_address[1])
+        _, _, suggested = check_serve_conflicts(config)
+        print("It is NOT published. To publish it deliberately on its own tailnet-only HTTPS port (this does not touch your other mappings):")
+        print("  tailscale serve --bg --https=%d http://127.0.0.1:%d" % (suggested or 8445, server.server_address[1]))
+        print("Then set: remote configure --public-port %d" % (suggested or 8445))
         log_event("remote_gateway_started", port=server.server_address[1])
         try:
             server.serve_forever()
@@ -7671,7 +8188,9 @@ def build_remote_launch_argv(claude_bin, name, settings_file, prompt_text):
     if remote_control_enabled():
         argv.append("--remote-control")
     if settings_file:
-        argv += ["--settings", settings_file]
+        # `--settings` alone would ADD to the user's, project and local settings.
+        # An empty source list makes the session run on this file only.
+        argv += ["--setting-sources", "", "--settings", settings_file]
     if name:
         argv += ["--name", name]
     argv.append(prompt_text)
@@ -7682,26 +8201,51 @@ def assert_remote_argv_safe(argv):
     return ["forbidden flag present: %s" % t for t in FORBIDDEN_LAUNCH_TOKENS if t in argv[:-1]]
 
 
+def remote_statusline_command():
+    return "%s %s statusline" % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__)))
+
+
 def write_permission_settings(lsid, profile):
-    """A per-session settings file. Existing Claude settings are never edited."""
+    """The whole settings a remote session runs with (user/project/local are excluded).
+
+    Existing Claude settings are never edited. Because those sources are not
+    loaded, this file must also carry the status line Terminal Handoff needs and
+    the Stop hook that stops the agent idling past waiting work.
+    """
     path = th_path("remote", "profiles", "%s.json" % lsid)
-    settings = {"permissions": {"allow": list(profile["allow"]), "deny": list(profile.get("deny", []))}}
+    hook = "%s %s session hook-stop" % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__)))
+    settings = {
+        "permissions": {
+            "allow": list(profile["allow"]),
+            "deny": list(profile.get("deny", [])),
+            "disableBypassPermissionsMode": "disable",
+            "disableAutoMode": "disable",
+        },
+        "statusLine": {"type": "command", "command": remote_statusline_command(), "refreshInterval": 5},
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": hook, "timeout": 10}]}]},
+    }
     write_json_private(path, settings)
     return path
 
 
-def build_remote_launch_script(workdir, argv, lsid, launch_token):
+def build_remote_launch_script(workdir, argv, lsid, token_file):
+    """The launcher holds no secret: it reads the one-time token from a private
+    file and deletes both the file and itself before Claude starts."""
     lines = [
         "#!/bin/zsh",
         "# Terminal Handoff %s - remote session launcher" % TERMINAL_HANDOFF_VERSION,
         "set -e",
+        "TH_TOKEN_FILE=%s" % shlex.quote(token_file),
+        "[ -r \"$TH_TOKEN_FILE\" ] || { echo 'Terminal Handoff: launch token missing or already used'; exit 1; }",
+        "export CLAUDE_TERMINAL_HANDOFF_LAUNCH_TOKEN=\"$(cat -- \"$TH_TOKEN_FILE\")\"",
+        "rm -f -- \"$TH_TOKEN_FILE\" \"$0\"",
+        "unset TH_TOKEN_FILE",
         "cd -- %s || { echo 'Terminal Handoff: project directory unavailable'; exit 1; }" % shlex.quote(workdir),
     ]
     for key, value in propagated_environment().items():
         lines.append("export %s=%s" % (key, shlex.quote(value)))
     lines += [
         "export CLAUDE_TERMINAL_HANDOFF_LOGICAL_SESSION=%s" % shlex.quote(lsid),
-        "export CLAUDE_TERMINAL_HANDOFF_LAUNCH_TOKEN=%s" % shlex.quote(launch_token),
         "echo 'Terminal Handoff: remote session %s'" % lsid,
         "exec " + " ".join(shlex.quote(part) for part in argv),
         "",
@@ -7740,7 +8284,16 @@ def _remote_failure(record_id, why, status=502):
     return status, {"logical_session_id": record_id, "state": LS_FAILED, "error": "launch_failed", "reason": why[:200]}
 
 
-def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wait=None, sleep=time.sleep):
+def _remove_launch_material(lsid):
+    for suffix in ("tok", "sh"):
+        try:
+            os.unlink(th_path("prompts", "remote-%s.%s" % (lsid, suffix)))
+        except OSError:
+            pass
+
+
+def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wait=None, sleep=time.sleep,
+                          isolation_check=None):
     """Create a logical session and start Claude Code on this Mac.
 
     Returns `(http_status, payload)`. Success (201) means the Mac has really
@@ -7771,6 +8324,10 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     claude_bin = find_claude_executable()
     if not claude_bin:
         return 503, {"error": "claude_unavailable"}
+    isolated, why = (isolation_check or isolation_ok)(claude_bin)
+    if not isolated:
+        log_event("remote_create_refused", device_id=device_id, project=project_name, reason="isolation unverified")
+        return 503, {"error": "isolation_unverified", "reason": why}
     repo = capture_repo_state(real)
     for flag in ("merge_in_progress", "rebase_in_progress", "cherry_pick_in_progress", "revert_in_progress"):
         if repo.get(flag):
@@ -7821,11 +8378,14 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     if problems:
         return _remote_failure(lsid, "; ".join(problems), 500)
     script_file = th_path("prompts", "remote-%s.sh" % lsid)
-    write_text_private(script_file, build_remote_launch_script(real, argv, lsid, launch_token), 0o700)
+    token_file = th_path("prompts", "remote-%s.tok" % lsid)
+    write_text_private(token_file, launch_token)
+    write_text_private(script_file, build_remote_launch_script(real, argv, lsid, token_file), 0o700)
 
     result = terminal({}, script_file, "Terminal Handoff: %s" % (name,), env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE"))
     log_event("remote_claude_launched", logical_session_id=lsid, launched=bool(result.get("launched")), simulated=bool(result.get("test_mode")))
     if not (result.get("launched") or result.get("test_mode") or result.get("simulated")):
+        _remove_launch_material(lsid)
         return _remote_failure(lsid, "the Terminal window could not be opened")
 
     deadline = time.time() + wait_seconds
@@ -7837,7 +8397,9 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     if record.get("state") == LS_CREATING:
         if wait_seconds <= 0:
             return 202, dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac")
+        _remove_launch_material(lsid)
         return _remote_failure(lsid, "the Mac did not confirm the session started", 504)
+    _remove_launch_material(lsid)
     if record.get("state") in LS_TERMINAL:
         return 502, logical_public_view(record)
 
@@ -7889,6 +8451,704 @@ def remote_create_session_handler(body, ctx):
 
 
 # ---------------------------------------------------------------------------
+# Terminal Handoff human gates (approvals), wake, owner health and recovery
+# ---------------------------------------------------------------------------
+#
+# A Terminal Handoff approval answers a Terminal Handoff authority gate: the
+# agent stops before an action and asks. It is NOT an answer to a native Claude
+# permission prompt, and Terminal Handoff never pretends it is: there is no
+# supported interface for that, and nothing is typed into a terminal.
+
+APPROVAL_ACTION_MAX = 240
+APPROVAL_REASON_MAX = 400
+DEFAULT_APPROVAL_TTL = 6 * 3600.0
+DELIVERY_LEASE_SECONDS = 600.0
+AP_PENDING = "pending"
+AP_APPROVED = "approved"
+AP_DENIED = "denied"
+AP_CONSUMED = "consumed"
+AP_EXPIRED = "expired"
+AP_SUPERSEDED = "superseded"
+AP_INVALIDATED = "invalidated_by_handoff"
+APPROVAL_ID_RE = re.compile(r"^ap_[a-f0-9]{16}$")
+
+
+def approval_ttl():
+    value = env_float("CLAUDE_TERMINAL_HANDOFF_APPROVAL_TTL", DEFAULT_APPROVAL_TTL)
+    return value if value >= 30 else DEFAULT_APPROVAL_TTL
+
+
+def normalise_action(text):
+    return " ".join(str(text).split())
+
+
+def _sweep_approvals(record, now=None):
+    """Expire stale approvals in place. Call inside a mutator or on a copy."""
+    now = time.time() if now is None else now
+    for approval in record.get("approvals") or []:
+        if approval.get("status") in (AP_PENDING, AP_APPROVED) and float(approval.get("expires_epoch") or 0) < now:
+            approval["status"] = AP_EXPIRED
+            approval["expired_utc"] = utc_stamp()
+
+
+def _pending_approval(record):
+    for approval in record.get("approvals") or []:
+        if approval.get("status") == AP_PENDING:
+            return approval
+    return None
+
+
+def approval_request(lsid, agent_session_id, action, reason, notify=True):
+    """The owner asks for a human decision on one exact action."""
+    action_text = clean_untrusted_text(action, APPROVAL_ACTION_MAX)
+    reason_text = clean_untrusted_text(reason, APPROVAL_REASON_MAX)
+    if not action_text or not reason_text:
+        return False, "an approval needs both a requested action and a reason", None
+    norm = normalise_action(action_text)
+    created = {"new": False}
+
+    def mutate(record):
+        if not _is_owner(record, agent_session_id):
+            raise LogicalRefusal("not the current owner of this logical session")
+        if logical_halt_reason(record):
+            raise LogicalRefusal("halted:%s" % logical_halt_reason(record))
+        if record.get("state") in LS_TERMINAL:
+            raise LogicalRefusal("logical session has ended")
+        _sweep_approvals(record)
+        epoch = record.get("owner_epoch")
+        for approval in record["approvals"]:
+            if approval["norm_action"] == norm and approval["bound_epoch"] == epoch and approval["status"] in (AP_PENDING, AP_APPROVED):
+                return dict(approval)  # the same open request: no new gate, no new alert
+        for approval in record["approvals"]:
+            if approval["status"] in (AP_PENDING, AP_APPROVED):
+                approval["status"] = AP_SUPERSEDED  # a materially different action needs its own approval
+                approval["superseded_utc"] = utc_stamp()
+        approval = {
+            "id": "ap_" + uuid.uuid4().hex[:16],
+            "nonce": base64.urlsafe_b64encode(os.urandom(12)).decode("ascii").rstrip("="),
+            "action": action_text,
+            "norm_action": norm,
+            "reason": reason_text,
+            "status": AP_PENDING,
+            "bound_epoch": epoch,
+            "created_utc": utc_stamp(),
+            "created_epoch": time.time(),
+            "expires_epoch": time.time() + approval_ttl(),
+        }
+        record["approvals"].append(approval)
+        del record["approvals"][:-40]
+        record["state"] = LS_WAITING_FOR_HUMAN
+        logical_history(record, "approval_requested", approval_id=approval["id"], epoch=epoch)
+        created["new"] = True
+        return dict(approval)
+
+    ok, why, approval, record = logical_mutate(lsid, mutate)
+    if ok and created["new"]:
+        log_event("logical_approval_requested", logical_session_id=lsid, approval_id=approval["id"])
+        if notify:
+            remote = (record.get("remote_control") or {}).get("state")
+            tail = "Open Terminal Handoff on your phone." if remote == REMOTE_HEALTHY else "Open Terminal Handoff (remote is %s)." % (remote or REMOTE_UNKNOWN)
+            _notify_attention(
+                {"chain_id": lsid, "parent_session_id": lsid, "attempt_id": approval["id"], "successor_display_name": record.get("project") or "Session"},
+                "human_gate",
+                "approval needed: %s" % action_text,
+                "%s %s" % (reason_text, tail),
+                approval["id"],
+            )
+    return ok, why, approval
+
+
+def approval_decide(lsid, approval_id, decision, nonce, expected_epoch, by):
+    """Record a human decision. Bound to id, nonce, exact epoch and expiry."""
+    if decision not in ("approve", "deny"):
+        return False, "bad decision", None
+    if not isinstance(approval_id, str) or not APPROVAL_ID_RE.match(approval_id):
+        return False, "unknown approval", None
+
+    def mutate(record):
+        _sweep_approvals(record)
+        approval = next((a for a in record.get("approvals") or [] if a["id"] == approval_id), None)
+        if approval is None:
+            raise LogicalRefusal("unknown approval")
+        if approval["status"] != AP_PENDING:
+            raise LogicalRefusal("not pending: %s" % approval["status"])
+        if not isinstance(nonce, str) or not hmac.compare_digest(nonce, approval["nonce"]):
+            raise LogicalRefusal("nonce mismatch")
+        if record.get("state") in LS_TERMINAL or record.get("state") == LS_ORPHANED:
+            raise LogicalRefusal("session is %s" % record.get("state"))
+        epoch = record.get("owner_epoch")
+        if expected_epoch != epoch or approval["bound_epoch"] != epoch:
+            raise LogicalRefusal("stale: ownership changed since this request was displayed")
+        approval["status"] = AP_APPROVED if decision == "approve" else AP_DENIED
+        approval["decided_by"] = by
+        approval["decided_utc"] = utc_stamp()
+        approval["reported"] = False
+        record["state"] = _effective_active_state(record)
+        logical_history(record, "approval_%s" % approval["status"], approval_id=approval_id, by=by)
+        return dict(approval)
+
+    ok, why, approval, _ = logical_mutate(lsid, mutate)
+    if ok:
+        log_event("logical_approval_decided", logical_session_id=lsid, approval_id=approval_id, decision=approval["status"], by=by)
+    else:
+        log_event("logical_approval_refused", logical_session_id=lsid, approval_id=approval_id, reason=why)
+    return ok, why, approval
+
+
+def approval_consume(lsid, agent_session_id, approval_id, action):
+    """One-shot use of an approval by the current owner, for its exact action."""
+
+    def mutate(record):
+        if not _is_owner(record, agent_session_id):
+            raise LogicalRefusal("not the current owner of this logical session")
+        if logical_halt_reason(record):
+            raise LogicalRefusal("halted:%s" % logical_halt_reason(record))
+        _sweep_approvals(record)
+        approval = next((a for a in record.get("approvals") or [] if a["id"] == approval_id), None)
+        if approval is None:
+            raise LogicalRefusal("unknown approval")
+        if approval["status"] == AP_DENIED:
+            raise LogicalRefusal("the human denied this action")
+        if approval["status"] != AP_APPROVED:
+            raise LogicalRefusal("not approved: %s" % approval["status"])
+        if approval["bound_epoch"] != record.get("owner_epoch"):
+            raise LogicalRefusal("approval belongs to a different owner generation")
+        if normalise_action(action or "") != approval["norm_action"]:
+            raise LogicalRefusal("the action differs from what was approved; request a new approval")
+        approval["status"] = AP_CONSUMED
+        approval["consumed_utc"] = utc_stamp()
+        logical_history(record, "approval_consumed", approval_id=approval_id)
+        return dict(approval)
+
+    ok, why, approval, _ = logical_mutate(lsid, mutate)
+    if ok:
+        log_event("logical_approval_consumed", logical_session_id=lsid, approval_id=approval_id)
+    return ok, why, approval
+
+
+def approval_public(approval, include_nonce):
+    view = {
+        "id": approval["id"],
+        "action": approval["action"],
+        "reason": approval["reason"],
+        "status": approval["status"],
+        "bound_epoch": approval["bound_epoch"],
+        "created_utc": approval["created_utc"],
+        "expires_epoch": approval["expires_epoch"],
+    }
+    if include_nonce and approval["status"] == AP_PENDING:
+        view["nonce"] = approval["nonce"]
+    return view
+
+
+# -- Wake: durable inbox plus a bounded long-poll ------------------------------
+#
+# No supported interface lets an external process message an idle interactive
+# Claude session (the peer socket is undocumented, and injecting terminal input
+# is refused). So the agent stays reachable by blocking in `session wait`, a Bash
+# tool call of at most ten minutes that returns the moment work arrives for the
+# CURRENT owner. The inbox stays the source of truth: a lost wake loses nothing.
+
+WAIT_MAX_SECONDS = 590.0
+WAIT_POLL_ACTIVE = 1.0
+WAIT_POLL_IDLE = 3.0
+WAIT_POLL_HALTED = 5.0
+WAIT_ACTIVE_WINDOW = 120.0
+POLL_HEARTBEAT_SECONDS = 30.0
+
+
+def _touch_agent_poll(lsid, agent_session_id):
+    def mutate(record):
+        if not _is_owner(record, agent_session_id):
+            raise LogicalRefusal("not owner")
+        record["agent_poll_epoch"] = time.time()
+        record["agent_poll_utc"] = utc_stamp()
+
+    logical_mutate(lsid, mutate)
+
+
+def _next_wake_event(record, agent_session_id):
+    """`(event, detail)` if the current owner has something to act on."""
+    if not _is_owner(record, agent_session_id):
+        return "not_owner", None
+    if record.get("state") in LS_TERMINAL:
+        return "ended", None
+    if record.get("state") == LS_ORPHANED:
+        return "orphaned", None
+    epoch = record.get("owner_epoch")
+    now = time.time()
+    for message in record["inbox"]["messages"]:
+        if message["status"] == "pending":
+            return "instructions", None
+        if message["status"] == "delivered" and message.get("delivered_epoch") == epoch:
+            delivered = message.get("delivered_time") or 0
+            if delivered and now - delivered > DELIVERY_LEASE_SECONDS:
+                return "instructions", None
+    for approval in record.get("approvals") or []:
+        if approval["status"] in (AP_APPROVED, AP_DENIED) and not approval.get("reported") and approval["bound_epoch"] == epoch:
+            return "approval", approval
+    return None, None
+
+
+def logical_wait(lsid, agent_session_id, timeout, sleep=time.sleep, clock=time.time):
+    """Block until the current owner has work, or STOP/pause/ownership changes."""
+    timeout = max(0.0, min(float(timeout), WAIT_MAX_SECONDS))
+    deadline = clock() + timeout
+    last_beat = None
+    started_halted = None
+    first = True
+    while True:
+        record = logical_read(lsid)
+        if record is None:
+            return {"directive": "STOP", "reason": "unknown logical session"}
+        if last_beat is None or clock() - last_beat >= POLL_HEARTBEAT_SECONDS:
+            _touch_agent_poll(lsid, agent_session_id)
+            last_beat = clock()
+        halt = logical_halt_reason(record)
+        if first:
+            started_halted, first = halt, False
+        event, detail = _next_wake_event(record, agent_session_id)
+        if event in ("not_owner", "ended", "orphaned"):
+            reasons = {
+                "not_owner": "you are not the current owner",
+                "ended": "the logical session has ended",
+                "orphaned": "the logical session is ORPHANED",
+            }
+            return {"directive": "STOP", "reason": reasons[event]}
+        if not halt:
+            if started_halted:
+                return {"directive": "CONTINUE", "reason": "the logical session was deliberately resumed"}
+            if event == "instructions":
+                ok, why, claimed = inbox_claim(lsid, agent_session_id)
+                if ok and claimed:
+                    return {"directive": "INSTRUCTIONS", "messages": claimed}
+            elif event == "approval":
+                _mark_approval_reported(lsid, detail["id"])
+                return {"directive": "APPROVAL_DECISION", "approval": approval_public(detail, False)}
+        if clock() >= deadline:
+            return {"directive": "HALT" if halt else "WAIT", "halt": halt, "timeout": True}
+        active = bool(record.get("updated_epoch")) and (time.time() - float(record["updated_epoch"])) < WAIT_ACTIVE_WINDOW
+        interval = WAIT_POLL_HALTED if halt else (WAIT_POLL_ACTIVE if active else WAIT_POLL_IDLE)
+        sleep(min(interval, max(0.0, deadline - clock())))
+
+
+def _mark_approval_reported(lsid, approval_id):
+    def mutate(record):
+        for approval in record.get("approvals") or []:
+            if approval["id"] == approval_id:
+                approval["reported"] = True
+
+    logical_mutate(lsid, mutate)
+
+
+def session_hook_stop(stdin_text, environ=None):
+    """Claude `Stop` hook: do not let the agent idle past waiting work.
+
+    Exit code 2 (documented) makes Claude keep working with our stderr as the
+    reason. `stop_hook_active` prevents a loop; anything unexpected allows stop.
+    """
+    environ = os.environ if environ is None else environ
+    try:
+        payload = json.loads(stdin_text or "{}")
+    except ValueError:
+        return 0, ""
+    if not isinstance(payload, dict) or payload.get("stop_hook_active"):
+        return 0, ""
+    lsid = environ.get("CLAUDE_TERMINAL_HANDOFF_LOGICAL_SESSION", "").strip()
+    agent = payload.get("session_id")
+    record = logical_read(lsid) if lsid_valid_or_none(lsid) else None
+    if not record or not _is_owner(record, agent) or logical_halt_reason(record):
+        return 0, ""
+    event, _ = _next_wake_event(record, agent)
+    if event in ("instructions", "approval"):
+        return 2, "Terminal Handoff: work is waiting for you (%s). Run `session wait --timeout 5` now.\n" % event
+    return 0, ""
+
+
+def lsid_valid_or_none(value):
+    return bool(value) and logical_session_valid(value)
+
+
+# -- Owner health, dead-owner detection and recovery -------------------------------
+
+OWNER_GRACE_SECONDS = 60.0
+OWNER_MIN_FAILURES = 3
+HANDOFF_WINDOW_SECONDS = 1800.0
+ATTENTION_KINDS_EXTRA = ("owner_lost",)
+
+
+def owner_grace_seconds():
+    value = env_float("CLAUDE_TERMINAL_HANDOFF_OWNER_GRACE", OWNER_GRACE_SECONDS)
+    return value if value >= 0 else OWNER_GRACE_SECONDS
+
+
+def owner_liveness(record, now=None):
+    """`(verdict, detail)`: alive, dead or unknown, from independent signals.
+
+    Alive if any strong signal says so: the re-proved process binding, Claude's
+    own live session record, or a status-line snapshot in the last 30 s. Dead
+    only when the binding proves the process is gone (or reused) AND Claude's
+    session record does not show the session alive. Anything else is unknown.
+    """
+    now = time.time() if now is None else now
+    owner = record.get("owner") or {}
+    agent = owner.get("agent_session_id")
+    if not agent:
+        return "unknown", "no owner registered"
+    binding = owner.get("process")
+    bound_dead = False
+    if binding:
+        ok, reason = verify_parent_binding(binding, session_id=agent)
+        if ok:
+            return "alive", "process binding re-proved"
+        bound_dead = any(text in (reason or "") for text in ("no longer running", "reused", "not a Claude"))
+    snap = read_json(live_session_path(agent), {}) or {}
+    if snap.get("observed_epoch") and now - float(snap["observed_epoch"]) <= 30:
+        return "alive", "status line reported within 30s"
+    session_dead = False
+    directory = claude_sessions_dir()
+    try:
+        names = [n for n in os.listdir(directory) if n.endswith(".json")]
+    except OSError:
+        names = []
+    for name in names:
+        rec = read_json(os.path.join(directory, name))
+        if isinstance(rec, dict) and rec.get("sessionId") == agent:
+            if _pid_alive(rec.get("pid")):
+                return "alive", "Claude session record shows a live process"
+            session_dead = True
+    if bound_dead:
+        return "dead", "the bound Claude process has exited"
+    if session_dead:
+        return "dead", "Claude's session record shows the process has exited"
+    return "unknown", "no independent evidence either way"
+
+
+def _handoff_in_progress(record, now):
+    """A parent that is being replaced is meant to disappear; do not orphan it."""
+    owner = record.get("owner") or {}
+    transfer = read_transfer(transfer_path(owner.get("agent_session_id"))) if owner.get("agent_session_id") else None
+    if not transfer:
+        return False
+    if transfer.get("state") in (TRANSFER_SUCCESSOR_VERIFIED, TRANSFER_PARENT_STOP_REQUESTED, TRANSFER_COMPLETE):
+        age = now - float(transfer.get("created_epoch") or now)
+        return age < HANDOFF_WINDOW_SECONDS
+    return False
+
+
+def logical_reconcile(lsid, liveness=None, now=None, strict=False):
+    """Re-check the owner. Never launches a replacement; may mark ORPHANED."""
+    liveness = liveness or owner_liveness
+    now = time.time() if now is None else now
+    record = logical_read(lsid)
+    if not record or record.get("state") in LS_TERMINAL or record.get("state") == LS_ORPHANED:
+        return record
+    if record.get("state") == LS_CREATING:
+        launch = record.get("launch") or {}
+        expired = launch.get("expires_epoch") and now > float(launch["expires_epoch"]) + 60
+        if expired and not record.get("owner"):
+            return _remote_failure_record(lsid, "the launched session never registered")
+        return record
+    if _handoff_in_progress(record, now):
+        return record
+    verdict, detail = liveness(record, now)
+    grace = owner_grace_seconds()
+    orphaned = {"flag": False}
+
+    def mutate(rec):
+        if rec.get("state") in LS_TERMINAL or rec.get("state") == LS_ORPHANED:
+            return
+        _sweep_approvals(rec, now)
+        health = rec.setdefault("owner_health", {})
+        health["checked_epoch"] = now
+        health["checked_utc"] = utc_stamp()
+        health["verdict"] = verdict
+        health["detail"] = detail
+        if verdict == "alive":
+            health["failures"] = 0
+            health["first_failure_epoch"] = None
+            if rec.get("state") == LS_RECOVERING:
+                rec["state"] = _effective_active_state(rec)
+            elif rec.get("state") == LS_WAITING_FOR_HUMAN and not _pending_approval(rec):
+                rec["state"] = _effective_active_state(rec)
+            return
+        if verdict == "dead" or (verdict == "unknown" and strict):
+            health["failures"] = int(health.get("failures") or 0) + 1
+            health.setdefault("first_failure_epoch", now)
+            if health.get("first_failure_epoch") is None:
+                health["first_failure_epoch"] = now
+            long_enough = strict or now - float(health["first_failure_epoch"]) >= grace
+            if health["failures"] >= (2 if strict else OWNER_MIN_FAILURES) and long_enough:
+                rec["orphaned"] = {
+                    "since_utc": utc_stamp(),
+                    "previous_state": rec.get("state"),
+                    "reason": detail,
+                    "owner_epoch": rec.get("owner_epoch"),
+                }
+                rec["state"] = LS_ORPHANED
+                logical_history(rec, "orphaned", reason=detail[:100])
+                orphaned["flag"] = True
+        else:  # unknown outside strict mode: not evidence of death
+            health["failures"] = 0
+            health["first_failure_epoch"] = None
+
+    ok, _, _, record = logical_mutate(lsid, mutate)
+    if orphaned["flag"]:
+        log_event("logical_orphaned", logical_session_id=lsid, reason=detail[:100])
+        _notify_attention(
+            {"chain_id": lsid, "parent_session_id": lsid, "attempt_id": "orphaned", "successor_display_name": (record or {}).get("project") or "Session"},
+            "owner_lost",
+            "the Claude session stopped responding",
+            "It is marked ORPHANED and will not be replaced automatically. Recover or abandon it deliberately.",
+            "orphaned_%s_%s" % (lsid, (record or {}).get("owner_epoch")),
+        )
+    return record
+
+
+def _remote_failure_record(lsid, why):
+    def mutate(record):
+        if record.get("state") == LS_CREATING:
+            record["state"] = LS_FAILED
+            record["failure"] = {"reason": why, "ts": utc_stamp()}
+            record["launch"]["token_sha256"] = None
+            logical_history(record, "failed", reason=why[:100])
+
+    _, _, _, record = logical_mutate(lsid, mutate)
+    return record
+
+
+def logical_reconcile_all(**kw):
+    return [logical_reconcile(r["logical_session_id"], **kw) for r in logical_list()]
+
+
+def logical_recover(lsid, action, by="local", liveness=None):
+    """Deliberate recovery of an ORPHANED session: reattach (if truly alive) or abandon."""
+    liveness = liveness or owner_liveness
+    if action not in ("reattach", "abandon"):
+        return False, "action must be reattach or abandon", None
+    record = logical_read(lsid)
+    verdict = liveness(record, time.time()) if record else ("unknown", "")
+
+    def mutate(rec):
+        if rec.get("state") != LS_ORPHANED:
+            raise LogicalRefusal("session is not ORPHANED")
+        if action == "abandon":
+            rec["state"] = LS_FAILED
+            rec["failure"] = {"reason": "abandoned after owner loss", "ts": utc_stamp()}
+            logical_history(rec, "abandoned", by=by)
+            return
+        if verdict[0] != "alive":
+            raise LogicalRefusal("the owner is not verifiably alive: %s" % verdict[1])
+        rec.pop("orphaned", None)
+        rec["owner_health"] = {"verdict": "alive", "failures": 0}
+        rec["state"] = _effective_active_state(rec)
+        logical_history(rec, "reattached", by=by)
+
+    ok, why, _, record = logical_mutate(lsid, mutate)
+    if ok:
+        log_event("logical_recovered", logical_session_id=lsid, action=action, by=by)
+    return ok, why, record
+
+
+def service_recover(liveness=None, sleep=time.sleep, now=None, settle=2.0):
+    """After a Terminal Handoff restart: reload, revalidate, classify. Never trust RUNNING.
+
+    Every non-terminal session is re-checked twice, a short settle apart. A
+    session whose owner cannot be verified alive is ORPHANED, not RUNNING. STOP,
+    the inbox and pending approvals are preserved untouched.
+    """
+    liveness = liveness or owner_liveness
+    summary = {}
+    for record in logical_list():
+        lsid = record["logical_session_id"]
+        state = record.get("state")
+        if state in LS_TERMINAL:
+            continue
+
+        def flag(rec, state=state):
+            _sweep_approvals(rec)
+            rec["recovery"] = {"restarted_utc": utc_stamp(), "previous_state": state}
+            if rec.get("project"):
+                resolved, _, why = project_resolve(rec["project"])
+                rec["project_available"] = bool(resolved)
+                rec["project_unavailable_reason"] = None if resolved else why
+
+        logical_mutate(lsid, flag)
+        if state == LS_CREATING:
+            summary[lsid] = (logical_reconcile(lsid, liveness=liveness, now=now) or {}).get("state")
+            continue
+        logical_reconcile(lsid, liveness=liveness, now=now, strict=True)
+        sleep(settle)
+        after = logical_reconcile(lsid, liveness=liveness, now=now, strict=True)
+        summary[lsid] = (after or {}).get("state")
+    log_event("service_recovered", sessions=len(summary))
+    return summary
+
+
+# -- Persistent security state -------------------------------------------------
+#
+# Restart must not reset an authentication lockout, the enrollment attempt
+# budget or the limits on approvals, session creation and STOP/resume. A small
+# private file under an exclusive lock is enough: no database. General request
+# rate limiting stays in memory, because losing it on restart only loosens
+# throttling of harmless reads.
+
+
+def security_state_path():
+    return th_path("remote", "security_state.json")
+
+
+class PersistentLimiter(object):
+    def __init__(self, clock=time.time):
+        self.clock = clock
+
+    def _prune(self, windows, now, horizon=3600.0):
+        for key in [k for k, v in windows.items() if not v or now - max(v) > horizon]:
+            del windows[key]
+
+    def allow(self, key, limit, window):
+        now = self.clock()
+        out = {"ok": True}
+
+        def mutate(data):
+            windows = data.setdefault("windows", {})
+            self._prune(windows, now)
+            hits = [t for t in windows.get(key, []) if now - t < window]
+            if len(hits) >= limit:
+                out["ok"] = False
+            else:
+                hits.append(now)
+            windows[key] = hits
+
+        update_json_locked(security_state_path(), mutate)
+        return out["ok"]
+
+    def record(self, key, window):
+        now = self.clock()
+
+        def mutate(data):
+            windows = data.setdefault("windows", {})
+            windows[key] = [t for t in windows.get(key, []) if now - t < window] + [now]
+
+        update_json_locked(security_state_path(), mutate)
+
+    def blocked(self, key, limit, window):
+        now = self.clock()
+        windows = (read_json(security_state_path(), {}) or {}).get("windows", {})
+        return len([t for t in windows.get(key, []) if now - t < window]) >= limit
+
+
+# -- Permission isolation for remotely launched sessions --------------------------
+#
+# `--settings` ADDS to the user's, project and local settings, so on its own it
+# cannot bound a session. A remote session therefore also runs with
+# `--setting-sources ""`, so only the Terminal Handoff profile (and managed
+# settings, which cannot be excluded) apply. That flag is in `claude --help` but
+# not in the published documentation, so remote launch fails closed unless a
+# self-test has proven the isolation on the installed Claude version.
+
+ISOLATION_PROBE_PROMPT = (
+    "Use the Bash tool to run exactly: touch %s   Then reply with one word: "
+    "DONE if it ran, DENIED if the tool call was not permitted."
+)
+
+
+def isolation_state_path():
+    return th_path("remote", "isolation.json")
+
+
+def claude_version(claude_bin, run=subprocess.run):
+    try:
+        proc = run([claude_bin, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        return proc.stdout.decode("utf-8", "replace").strip().split()[0]
+    except Exception:
+        return None
+
+
+def isolation_probe(claude_bin, run=subprocess.run, model="claude-haiku-4-5-20251001"):
+    """Prove on this machine that a project allow rule is excluded, and that the
+    Terminal Handoff settings file alone can still grant a permission."""
+    import tempfile
+
+    work = tempfile.mkdtemp(prefix="th-isolation-")
+    try:
+        os.makedirs(os.path.join(work, ".claude"))
+        rule = json.dumps({"permissions": {"allow": ["Bash(touch:*)"]}})
+        with open(os.path.join(work, ".claude", "settings.local.json"), "w") as handle:
+            handle.write(rule)
+        only = os.path.join(work, "only.json")
+        with open(only, "w") as handle:
+            handle.write(rule)
+
+        def attempt(name, extra):
+            target = os.path.join(work, "created-%s" % name)
+            argv = [claude_bin, "-p", ISOLATION_PROBE_PROMPT % target, "--model", model, "--max-turns", "3", "--no-session-persistence"] + extra
+            try:
+                run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, cwd=work)
+            except Exception:
+                return None
+            return os.path.exists(target)
+
+        blocked = attempt("iso", ["--setting-sources", ""])
+        granted = attempt("own", ["--setting-sources", "", "--settings", only])
+        return {
+            "claude_version": claude_version(claude_bin, run),
+            "broader_project_allow_blocked": blocked is False,
+            "profile_settings_effective": granted is True,
+            "verified_utc": utc_stamp(),
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def isolation_ok(claude_bin, run=subprocess.run):
+    version = claude_version(claude_bin, run)
+    result = ((read_json(isolation_state_path(), {}) or {}).get("versions") or {}).get(version or "?")
+    if not result or not result.get("broader_project_allow_blocked") or not result.get("profile_settings_effective"):
+        return False, "permission isolation has not been verified for Claude %s; run `remote verify-isolation`" % version
+    return True, None
+
+
+def cmd_verify_isolation():
+    claude_bin = find_claude_executable()
+    if not claude_bin:
+        print("claude executable not found")
+        return 3
+    result = isolation_probe(claude_bin)
+    version = result.get("claude_version") or "?"
+
+    def mutate(data):
+        data.setdefault("versions", {})[version] = result
+
+    update_json_locked(isolation_state_path(), mutate)
+    print(json.dumps(result, indent=2))
+    ok = result["broader_project_allow_blocked"] and result["profile_settings_effective"]
+    print("isolation VERIFIED" if ok else "isolation NOT verified: remote launch stays disabled")
+    return 0 if ok else 3
+
+
+def sweep_launch_artifacts(max_age=None):
+    """Delete stale plaintext launch material (scripts and token files)."""
+    max_age = LAUNCH_TOKEN_TTL * 2 if max_age is None else max_age
+    directory = th_path("prompts")
+    removed = 0
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return 0
+    for name in names:
+        if name.startswith("remote-") and (name.endswith(".tok") or name.endswith(".sh")):
+            path = os.path.join(directory, name)
+            try:
+                if time.time() - os.stat(path).st_mtime > max_age:
+                    os.unlink(path)
+                    removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+# ---------------------------------------------------------------------------
 # Automatic continuation and remote-control readiness
 # ---------------------------------------------------------------------------
 #
@@ -7933,7 +9193,7 @@ DIRECTIVE_STOP = "STOP"
 DIRECTIVE_HALT = "HALT"
 
 # Notification kinds that need a human. They follow the routing of `failed`.
-ATTENTION_KINDS = ("human_gate", "remote_degraded")
+ATTENTION_KINDS = ("human_gate", "remote_degraded", "owner_lost")
 
 DEFAULT_REMOTE_VERIFY_SECONDS = 20.0
 
@@ -8082,7 +9342,7 @@ def attention_notification_event(record, kind, headline, detail, key):
         ),
         "event_type": "terminal_handoff.%s" % kind,
         "kind": kind,
-        "title": "Terminal Handoff %s" % ("needs you" if kind == "human_gate" else "remote control degraded"),
+        "title": "Terminal Handoff %s" % {"human_gate": "needs you", "owner_lost": "session lost"}.get(kind, "remote control degraded"),
         "message": _safe_notification_text(message),
         "urgency": "critical",
         "chain_id": _safe_notification_text(record.get("chain_id"), 32),
@@ -8125,6 +9385,14 @@ def continuation_report(record, session_id):
         if adoption.get("ok") is False and report["directive"] != DIRECTIVE_STOP:
             report["directive"] = DIRECTIVE_STOP
             report["reason"] = "logical ownership was refused: %s. Do not mutate." % adoption.get("reason")
+        pending = _pending_approval(lrec)
+        if pending and report["directive"] in (DIRECTIVE_CONTINUE,):
+            report["directive"] = DIRECTIVE_HOLD
+            report["human_gate"] = dict(approval_public(pending, False), waiting_for_human=True, resume_capable=True)
+            report["reason"] = "waiting for a human decision; do not perform the gated action"
+        decided = [approval_public(a, False) for a in lrec.get("approvals") or [] if a.get("status") in (AP_APPROVED, AP_DENIED)]
+        if decided:
+            report["approval_decisions"] = decided
         halt = logical_halt_reason(lrec)
         if halt and report["directive"] != DIRECTIVE_STOP:
             report["directive"] = DIRECTIVE_HALT
@@ -8280,7 +9548,7 @@ def continuation_advance(path, session_id):
     return record
 
 
-def continuation_raise_gate(path, session_id, reason, requested_action):
+def continuation_raise_gate(path, session_id, reason, requested_action, notify=True):
     """Record a real human-authority boundary and notify once."""
     reason = _safe_notification_text(reason, 240)
     requested = _safe_notification_text(requested_action, 240)
@@ -8305,7 +9573,7 @@ def continuation_raise_gate(path, session_id, reason, requested_action):
         cont["phase"] = CONT_WAITING_FOR_HUMAN
 
     ok, why, record = continuation_mutate(path, session_id, raise_it)
-    if ok and state["first"]:
+    if ok and state["first"] and notify:
         log_event("human_gate_reached", session_id=session_id, chain_id=record.get("chain_id"), gate_id=gate_id)
         remote = ((record.get("continuation") or {}).get("remote_control") or {}).get("state")
         tail = (
@@ -8362,11 +9630,29 @@ def cmd_continuation(args):
                 break
             time.sleep(min(transfer_poll_seconds(), max(0.0, deadline - time.time())))
     elif action == "gate":
-        ok, why, record = continuation_raise_gate(path, session_id, args.reason, args.requested_action)
+        current = read_transfer(path) or {}
+        lsid = current.get("logical_session_id")
+        approval_error = None
+        if lsid and _continuation_authorised(current, session_id):
+            # Same gate, one representation: the logical approval is what a remote
+            # device sees and decides; it carries the single notification.
+            a_ok, approval_error, _ = approval_request(lsid, session_id, args.requested_action, args.reason)
+        ok, why, record = continuation_raise_gate(
+            path, session_id, args.reason, args.requested_action, notify=not (lsid and _continuation_authorised(current, session_id))
+        )
         report = continuation_report(record or read_transfer(path), session_id)
-        if not ok:
+        if approval_error:
+            report["error"] = approval_error
+        elif not ok:
             report["error"] = why
     elif action == "resume":
+        current = read_transfer(path) or {}
+        lrec = logical_read(current.get("logical_session_id")) if current.get("logical_session_id") else None
+        if lrec and _pending_approval(lrec):
+            report = continuation_report(current, session_id)
+            report["error"] = "still waiting for the human's decision; a gate cannot be resumed by the agent"
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
         ok, why, record = continuation_resume(path, session_id)
         report = continuation_report(record or read_transfer(path), session_id)
         if not ok:
@@ -8700,8 +9986,20 @@ def main(argv=None):
     )
     p.add_argument(
         "action",
-        choices=("list", "show", "stop", "pause", "resume", "post", "inbox", "ack", "note", "check"),
+        choices=(
+            "list", "show", "stop", "pause", "resume", "post", "inbox", "ack", "note", "check",
+            "wait", "gate", "consume", "decide", "recover", "reconcile", "hook-stop",
+        ),
     )
+    p.add_argument("--timeout", type=float, default=540.0)
+    p.add_argument("--requested-action", default=None)
+    p.add_argument("--approval-id", default=None)
+    p.add_argument("--decision", choices=("approve", "deny"), default=None)
+    p.add_argument("--nonce", default=None)
+    p.add_argument("--owner-epoch", type=int, default=None)
+    p.add_argument("--recover-action", choices=("reattach", "abandon"), default=None)
+    p.add_argument("--startup", action="store_true")
+    p.add_argument("--strict", action="store_true")
     p.add_argument("--logical-session", default=None)
     p.add_argument("--session-id", default=None)
     p.add_argument("--reason", default=None)
@@ -8719,10 +10017,11 @@ def main(argv=None):
     p.set_defaults(func=cmd_project)
 
     p = sub.add_parser("remote", help="Remote gateway: configure, enroll and revoke devices, serve")
-    p.add_argument("action", choices=("configure", "enroll-device", "list-devices", "revoke-device", "check", "serve"))
+    p.add_argument("action", choices=("configure", "enroll-device", "list-devices", "revoke-device", "check", "serve", "verify-isolation"))
     p.add_argument("--host", default=None)
     p.add_argument("--tailscale-user", default=None)
     p.add_argument("--port", type=int, default=None)
+    p.add_argument("--public-port", type=int, default=None, help="the HTTPS port `tailscale serve` publishes on")
     p.add_argument("--name", default=None)
     p.add_argument("--ttl-days", type=int, default=DEFAULT_DEVICE_TTL_DAYS)
     p.add_argument("--device", default=None)

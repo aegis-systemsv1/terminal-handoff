@@ -41,6 +41,10 @@ class LaunchCase(LogicalCase):
         CORE.project_set_permissions("nova", good_profile())
         CORE.project_set_remote_launch("nova", True)
         self.launched = []
+        self.script_texts = []
+        self.script_modes = []
+        self.token_files = []
+        self.isolation_check = lambda claude_bin: (True, None)
         self.behaviour = "register"
         self.bridge = True
         self.server = None
@@ -64,13 +68,19 @@ class LaunchCase(LogicalCase):
     def fake_terminal(self, manifest, script_file, title, test_mode):
         script = text_file(script_file)
         self.launched.append(script_file)
+        self.script_texts.append(script)
+        self.script_modes.append(os.stat(script_file).st_mode & 0o777)
+        self.token_files.append(re.search(r"TH_TOKEN_FILE=(\S+)", script).group(1))
         if self.behaviour == "fail":
             return {"launched": False, "error": "no terminal"}
         if self.behaviour == "register":
             lsid = re.search(r"LOGICAL_SESSION=(ls_[a-f0-9]{24})", script).group(1)
-            token = re.search(r"LAUNCH_TOKEN=(\S+)", script).group(1)
+            token = self.token_of(script)
             threading.Thread(target=self.register, args=(lsid, token), daemon=True).start()
         return {"launched": True, "test_mode": False}
+
+    def token_of(self, script):
+        return text_file(re.search(r"TH_TOKEN_FILE=(\S+)", script).group(1))
 
     def register(self, lsid, token, session_id=AGENT, workdir=None, env_token=None):
         payload = self.payload(percent=4.0, session_id=session_id, workdir=workdir or self.real_repo)
@@ -90,7 +100,8 @@ class LaunchCase(LogicalCase):
             self.server.shutdown()
             self.server.server_close()
         launcher = functools.partial(
-            CORE.remote_create_session, terminal=self.fake_terminal, wait_seconds=wait, health_wait=0.0
+            CORE.remote_create_session, terminal=self.fake_terminal, wait_seconds=wait, health_wait=0.0,
+            isolation_check=self.isolation_check,
         )
         config = {"allowed_host": HOST, "tailscale_users": [LOGIN], "port": 8787}
         self.server = CORE.make_remote_server(config, port=0, launcher=launcher, tailscale_checker=lambda h: (True, None))
@@ -126,11 +137,12 @@ class TestCreateSession(LaunchCase):
         self.assertEqual(record["repository"], self.real_repo)
         self.assertEqual(record["owner"]["agent_session_id"], AGENT)
         self.assertIsNone(record["launch"]["token_sha256"])  # single use, cleared
-        script = text_file(self.launched[0])
+        script = self.script_texts[0]
         self.assertIn("cd -- %s" % self.real_repo, script)
         self.assertIn("--remote-control", script)
         self.assertIn("--settings", script)
-        self.assertEqual(os.stat(self.launched[0]).st_mode & 0o777, 0o700)
+        self.assertIn("--setting-sources ''", script)  # user/project/local settings are excluded
+        self.assertEqual(self.script_modes[0], 0o700)
 
     def test_the_task_is_a_durable_first_instruction(self):
         status, view = self.create(task="Audit the retrieval pipeline.")
@@ -266,7 +278,7 @@ class TestNoInjection(LaunchCase):
         status, view = self.create(task=task)
         self.assertEqual(status, 201)
         lsid = view["logical_session_id"]
-        script = text_file(self.launched[0])
+        script = self.script_texts[0]
         prompt = text_file(CORE.th_path("prompts", "remote-%s.md" % lsid))
         for artefact in (script, prompt):
             self.assertNotIn("PWNED", artefact)
@@ -278,7 +290,7 @@ class TestNoInjection(LaunchCase):
 
     def test_launch_argv_is_safe_and_contains_no_bypass(self):
         self.create()
-        script = text_file(self.launched[0])
+        script = self.script_texts[0]
         for token in CORE.FORBIDDEN_LAUNCH_TOKENS:
             self.assertNotRegex(script, r"exec .*\s%s(\s|$)" % re.escape(token))
         self.assertNotIn("dangerously", script)
@@ -290,9 +302,13 @@ class TestNoInjection(LaunchCase):
         status, view = self.create()
         path = CORE.th_path("remote", "profiles", "%s.json" % view["logical_session_id"])
         settings = json_file(path)
-        self.assertEqual(list(settings), ["permissions"])
-        self.assertEqual(sorted(settings["permissions"]), ["allow", "deny"])
+        self.assertEqual(sorted(settings), ["hooks", "permissions", "statusLine"])
+        self.assertEqual(sorted(settings["permissions"]), ["allow", "deny", "disableAutoMode", "disableBypassPermissionsMode"])
+        self.assertEqual(settings["permissions"]["disableBypassPermissionsMode"], "disable")
+        self.assertEqual(settings["permissions"]["allow"], good_profile()["allow"])
         self.assertNotIn("defaultMode", json.dumps(settings))
+        self.assertIn("statusline", settings["statusLine"]["command"])
+        self.assertIn("hook-stop", json.dumps(settings["hooks"]))
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
 
@@ -302,11 +318,11 @@ class TestRegistration(LaunchCase):
         self.start_server(wait=0.0)
         status, view = self.create()
         lsid = view["logical_session_id"]
-        return lsid, text_file(self.launched[0])
+        return lsid, self.script_texts[0]
 
     def test_wrong_token_or_directory_or_replay_cannot_register(self):
         lsid, script = self.make()
-        token = re.search(r"LAUNCH_TOKEN=(\S+)", script).group(1)
+        token = self.token_of(script)
         self.register(lsid, token, env_token="wrong-token")
         self.assertIsNone(CORE.logical_read(lsid)["owner"])
         self.register(lsid, token, workdir=self.tmp)
@@ -318,14 +334,15 @@ class TestRegistration(LaunchCase):
 
     def test_expired_launch_token_is_refused(self):
         lsid, script = self.make()
-        token = re.search(r"LAUNCH_TOKEN=(\S+)", script).group(1)
+        token = self.token_of(script)
         CORE.logical_mutate(lsid, lambda r: r["launch"].update(expires_epoch=1.0))
         self.register(lsid, token)
         self.assertIsNone(CORE.logical_read(lsid)["owner"])
 
     def test_launch_token_is_stored_only_as_a_hash_and_never_logged(self):
         lsid, script = self.make()
-        token = re.search(r"LAUNCH_TOKEN=(\S+)", script).group(1)
+        token = self.token_of(script)
+        self.assertNotIn(token, script)  # the launcher holds no secret
         self.assertNotIn(token, text_file(CORE.logical_path(lsid)))
         self.assertNotIn(token, text_file(os.path.join(self.home, "logs", "terminal-handoff.log")))
         self.assertNotIn(token, text_file(CORE.th_path("prompts", "remote-%s.md" % lsid)))

@@ -461,11 +461,13 @@ class TestPermissionProfiles(LogicalCase):
         code, out, _ = run_th(["project", "permissions", "validate", "nova"], env=env)
         self.assertEqual(code, 3)
         path = os.path.join(self.tmp, "profile.json")
-        json.dump(good_profile(allow=["Bash"]), open(path, "w"))
+        with open(path, "w") as handle:
+            json.dump(good_profile(allow=["Bash"]), handle)
         code, out, _ = run_th(["project", "permissions", "edit", "nova", "--from-file", path], env=env)
         self.assertEqual(code, 3)
         self.assertIn("unrestricted", out)
-        json.dump(good_profile(), open(path, "w"))
+        with open(path, "w") as handle:
+            json.dump(good_profile(), handle)
         code, out, _ = run_th(["project", "permissions", "edit", "nova", "--from-file", path], env=env)
         self.assertEqual(code, 0, out)
         code, out, _ = run_th(["project", "permissions", "validate", "nova"], env=env)
@@ -513,6 +515,135 @@ class TestDeviceCli(LogicalCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(CORE.remote_config_problems(CORE.remote_config()), [])
         self.assertEqual(os.stat(CORE.remote_config_path()).st_mode & 0o777, 0o600)
+
+
+# The shape `tailscale serve status --json` really returns on a Mac that already publishes services.
+REAL_SERVE_STATUS = {
+    "TCP": {"443": {"HTTPS": True}, "8444": {"HTTPS": True}},
+    "Web": {
+        HOST + ":443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8443"}}},
+        HOST + ":8444": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}}},
+    },
+}
+
+
+class FakeRun(object):
+    def __init__(self, status):
+        self.status = status
+
+    def __call__(self, argv, **kw):
+        class R:
+            pass
+
+        r = R()
+        r.stdout = json.dumps(self.status).encode()
+        r.stderr = b""
+        return r
+
+
+class TestExposureSafeguards(LogicalCase):
+    def setUp(self):
+        super().setUp()
+        self._bin = CORE.tailscale_binary
+        CORE.tailscale_binary = lambda: "/usr/bin/true"
+
+    def tearDown(self):
+        CORE.tailscale_binary = self._bin
+        super().tearDown()
+
+    def test_existing_serve_mappings_are_parsed(self):
+        https_ports, targets = CORE.parse_serve_status(REAL_SERVE_STATUS)
+        self.assertEqual(https_ports, {443, 8444})
+        self.assertEqual(targets, {8443, 8787})
+        self.assertEqual(CORE.parse_serve_status(None), (set(), set()))
+        self.assertEqual(CORE.parse_serve_status({"Web": {"h": {"Handlers": {"/": {"Proxy": "https://example.org"}}}}}), (set(), set()))
+
+    def test_a_port_already_published_by_serve_is_refused(self):
+        for port in (8787, 8443):
+            ok, why, _ = CORE.check_serve_conflicts({"port": port}, run=FakeRun(REAL_SERVE_STATUS))
+            self.assertFalse(ok, port)
+            self.assertIn("already published", why)
+
+    def test_a_free_port_is_accepted_and_an_unused_https_port_is_suggested(self):
+        ok, why, suggested = CORE.check_serve_conflicts({"port": 18790}, run=FakeRun(REAL_SERVE_STATUS))
+        self.assertTrue(ok, why)
+        self.assertEqual(suggested, 8445)  # never 443 or 8444, which other services use
+        taken = {"TCP": {"443": {}, "8444": {}, "8445": {}, "8446": {}}}
+        self.assertEqual(CORE.check_serve_conflicts({"port": 18790}, run=FakeRun(taken))[2], 8447)
+
+    def test_an_unreadable_serve_configuration_fails_closed(self):
+        def boom(argv, **kw):
+            raise OSError("no tailscale")
+
+        self.assertFalse(CORE.check_serve_conflicts({"port": 18790}, run=boom)[0])
+        CORE.tailscale_binary = lambda: None
+        self.assertFalse(CORE.check_serve_conflicts({"port": 18790})[0])
+
+    def test_the_server_refuses_to_start_on_a_published_port(self):
+        config = {"allowed_host": HOST, "tailscale_users": [LOGIN], "port": 8787}
+        with self.assertRaises(ValueError) as caught:
+            CORE.make_remote_server(config, port=0, tailscale_checker=lambda h: (True, None),
+                                    serve_checker=lambda c: CORE.check_serve_conflicts(c, run=FakeRun(REAL_SERVE_STATUS)))
+        self.assertIn("already published", str(caught.exception))
+
+    def test_the_default_port_avoids_common_and_existing_ones(self):
+        self.assertNotIn(CORE.DEFAULT_GATEWAY_PORT, (8787, 8443, 8444, 8080, 3000))
+        self.assertGreaterEqual(CORE.DEFAULT_GATEWAY_PORT, 1024)
+
+    def test_public_port_is_validated_and_configurable(self):
+        base = {"allowed_host": HOST, "tailscale_users": [LOGIN], "port": 18790}
+        self.assertEqual(CORE.remote_config_problems(dict(base, public_port=8445)), [])
+        for bad in (0, 70000, "8445", True, -1):
+            self.assertTrue(CORE.remote_config_problems(dict(base, public_port=bad)), bad)
+        code, out, _ = run_th(["remote", "configure", "--host", HOST, "--tailscale-user", LOGIN, "--public-port", "8445"], env=self.env())
+        self.assertEqual(code, 0, out)
+        self.assertEqual(CORE.remote_config()["public_port"], 8445)
+        self.assertEqual(CORE.remote_config()["port"], CORE.DEFAULT_GATEWAY_PORT)
+
+
+class TestNonDefaultPublicPort(LogicalCase):
+    """A service published on its own HTTPS port sends Host and Origin with that port."""
+
+    def setUp(self):
+        super().setUp()
+        self.config = {"allowed_host": HOST, "tailscale_users": [LOGIN], "port": 18790, "public_port": 8445}
+        self.server = CORE.make_remote_server(self.config, port=0, tailscale_checker=lambda h: (True, None))
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        code, _ = CORE.device_enroll_begin("phone")
+        _, self.token = CORE.device_enroll_complete(code)
+        self.lsid = self.new_session()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        super().tearDown()
+
+    def call(self, method, path, body=None, host=HOST + ":8445", origin="https://%s:8445" % HOST):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Host": host, "Tailscale-User-Login": LOGIN, "Authorization": "Bearer " + self.token}
+        if method == "POST":
+            headers.update({"Content-Type": "application/json"})
+            if origin:
+                headers["Origin"] = origin
+        conn.request(method, path, json.dumps(body) if body is not None else None, headers)
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status
+
+    def test_host_and_origin_with_the_public_port_are_accepted(self):
+        self.assertEqual(self.call("GET", "/api/v1/sessions"), 200)
+        self.assertEqual(self.call("POST", "/api/v1/sessions/%s/pause" % self.lsid, {"request_id": "req-port-0001"}), 200)
+
+    def test_the_wrong_port_or_a_portless_origin_is_refused(self):
+        self.assertEqual(self.call("GET", "/api/v1/sessions", host=HOST + ":8444"), 403)  # another service's port
+        self.assertEqual(self.call("GET", "/api/v1/sessions", host=HOST + ":443"), 403)
+        self.assertEqual(self.call("GET", "/api/v1/sessions", host=HOST + ":abc"), 403)
+        body = {"request_id": "req-port-0002"}
+        path = "/api/v1/sessions/%s/pause" % self.lsid
+        self.assertEqual(self.call("POST", path, body, origin="https://" + HOST), 403)
+        self.assertEqual(self.call("POST", path, body, origin="https://%s:8444" % HOST), 403)
 
 
 if __name__ == "__main__":

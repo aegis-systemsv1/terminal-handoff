@@ -24,6 +24,11 @@ class LogicalCase(THTestCase):
         super().setUp()
         self._saved = {k: os.environ.get(k) for k in ("CLAUDE_TERMINAL_HANDOFF_HOME", "CLAUDE_TERMINAL_HANDOFF_TEST_MODE")}
         os.environ["CLAUDE_TERMINAL_HANDOFF_HOME"] = self.home
+        # Test mode stays on: it keeps notification workers and Terminal windows
+        # from ever starting for real. Only the real-signal tests turn it off.
+        os.environ["CLAUDE_TERMINAL_HANDOFF_TEST_MODE"] = "1"
+
+    def real_signals(self):
         os.environ.pop("CLAUDE_TERMINAL_HANDOFF_TEST_MODE", None)
 
     def tearDown(self):
@@ -300,6 +305,9 @@ class TestStop(LogicalCase):
         binding = self.binding_for(standin.pid, session_id="agent-A-session")
         binding["chain_id"], binding["generation"] = "chain1", 1
         CORE.logical_mutate(lsid, lambda r: r["owner"].update(process=binding))
+        self.assertEqual(CORE.logical_hard_stop(lsid)["outcome"], "simulated")  # test mode never signals
+        self.assertTrue(process_alive(standin.pid))
+        self.real_signals()
         result = CORE.logical_hard_stop(lsid)
         self.assertEqual(result["outcome"], "signalled")
         from _harness import wait_for_exit
