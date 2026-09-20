@@ -202,6 +202,88 @@ class TestScreens(unittest.TestCase):
         self.assertIn("Re-check", out["buttons"])
         self.assertIn("Abandon", out["buttons"])
 
+    # ---- the instruction box must survive polling (iPhone Safari copy/paste, keyboard, draft) ----
+
+    def session_routes(self, **over):
+        return {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(**over)],
+                "POST /api/v1/sessions/%s/instructions" % LSID: [202, {"message_id": "im_1", "seq": 2}]}
+
+    def newer(self, text="a brand new output line", **over):
+        return {"routes": {"GET /api/v1/sessions/" + LSID: [200, view(recent_output=[{"ts": "t", "text": text}], **over)]}}
+
+    def box(self, snap):
+        return [b for b in snap["boxes"] if b["tag"] == "textarea"]
+
+    def test_the_instruction_box_is_never_recreated_by_polling(self):
+        steps = [{"snap": "a"}, {"type": "textarea", "value": "half-typed draft"}, {"snap": "b"}, self.newer(), {"poll": True}, {"snap": "c"},
+                 self.newer("and another one"), {"poll": True}, {"poll": True}, {"snap": "d"}]
+        out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
+        first = self.box(out["a"])
+        self.assertEqual(len(first), 1)
+        for later in ("b", "c", "d"):
+            self.assertEqual(self.box(out[later]), [dict(first[0], value=self.box(out[later])[0]["value"])])  # same node
+        self.assertEqual(self.box(out["d"])[0]["value"], "half-typed draft")  # the draft never disappears
+        self.assertIn("and another one", out["d"]["text"])  # the page still refreshes around it
+
+    def test_an_empty_focused_box_is_not_replaced_either(self):
+        """The original bug: an empty box with the paste menu open was rebuilt on every poll."""
+        steps = [{"snap": "a"}, {"focus": "textarea"}, self.newer(), {"poll": True}, {"poll": True}, {"snap": "b"}]
+        out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
+        self.assertEqual(self.box(out["a"])[0]["uid"], self.box(out["b"])[0]["uid"])
+
+    def test_the_layout_is_held_still_while_the_box_has_focus_and_catches_up_on_blur(self):
+        steps = [{"focus": "textarea"}, {"type": "textarea", "value": "pasted text"}, {"snap": "a"}, self.newer("changed while typing"), {"poll": True},
+                 {"snap": "b"}, {"blur": True}, {"snap": "c"}]
+        out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
+        self.assertNotIn("changed while typing", out["b"]["text"])  # nothing shifts under the keyboard or paste menu
+        self.assertIn("changed while typing", out["c"]["text"])  # applied as soon as focus leaves
+        self.assertEqual([b["uid"] for b in self.box(out["a"])], [b["uid"] for b in self.box(out["c"])])
+        self.assertEqual(self.box(out["c"])[0]["value"], "pasted text")
+
+    def test_something_the_user_must_not_miss_is_shown_even_while_typing(self):
+        gate = {"id": "ap_" + "3" * 16, "action": "Deploy build abc123", "reason": "needed", "nonce": "n", "status": "pending", "bound_epoch": 3}
+        steps = [{"focus": "textarea"}, {"type": "textarea", "value": "my draft"}, {"snap": "a"},
+                 self.newer(state="WAITING_FOR_HUMAN", human_gate=gate), {"poll": True}, {"snap": "b"}]
+        out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
+        self.assertIn("APPROVAL REQUIRED", out["b"]["text"])
+        self.assertIn("Deploy build abc123", out["b"]["text"])
+        self.assertEqual(self.box(out["a"])[0]["uid"], self.box(out["b"])[0]["uid"])
+        self.assertEqual(self.box(out["b"])[0]["value"], "my draft")
+
+    def test_send_clears_on_success_and_keeps_the_draft_on_failure(self):
+        ok = run_ui("#/s/" + LSID, self.session_routes(), [{"type": "textarea", "value": "do the thing"}, {"click": "Send"}, {"snap": "s"}])["snaps"]
+        self.assertEqual(self.box(ok["s"])[0]["value"], "")
+        routes = self.session_routes()
+        routes["POST /api/v1/sessions/%s/instructions" % LSID] = [409, {"error": "refused", "reason": "session is STOPPED"}]
+        bad = run_ui("#/s/" + LSID, routes, [{"type": "textarea", "value": "do the thing"}, {"click": "Send"}, {"snap": "s"}])
+        self.assertEqual(self.box(bad["snaps"]["s"])[0]["value"], "do the thing")  # kept for a retry
+        self.assertIn("Refused: session is STOPPED", bad["all"])
+        gone = self.session_routes()
+        gone["POST /api/v1/sessions/%s/instructions" % LSID] = [401, {"error": "unauthorized"}]
+        auth = run_ui("#/s/" + LSID, gone, [{"type": "textarea", "value": "keep me"}, {"click": "Send"}])
+        self.assertTrue(any(c["path"].endswith("/instructions") for c in auth["calls"]))
+
+    def test_a_reason_being_typed_in_the_stop_panel_survives_polling(self):
+        routes = self.session_routes(state="STOPPED", stop={"active": True})
+        steps = [{"click": "Resume\u2026"}, {"type": "input", "value": "reviewed the diff carefully"}, {"snap": "a"}, self.newer(state="STOPPED", stop={"active": True}),
+                 {"poll": True}, {"poll": True}, {"snap": "b"}]
+        out = run_ui("#/s/" + LSID, routes, steps)["snaps"]
+        inputs = lambda snap: [b for b in snap["boxes"] if b["tag"] == "input"]
+        self.assertEqual(inputs(out["a"]), inputs(out["b"]))
+        self.assertEqual(inputs(out["b"])[0]["value"], "reviewed the diff carefully")
+
+    def test_unchanged_data_causes_no_redraw_and_the_box_has_no_ios_text_mangling(self):
+        out = run_ui("#/s/" + LSID, self.session_routes(), [{"poll": True}, {"poll": True}])
+        attrs = {a[1]: a[2] for a in out["attrs"] if a[0] == "textarea"}
+        self.assertEqual((attrs["autocapitalize"], attrs["autocorrect"], attrs["spellcheck"]), ("off", "off", "false"))
+
+    def test_the_session_page_polling_and_controls_still_work(self):
+        routes = self.session_routes()
+        routes["POST /api/v1/sessions/%s/pause" % LSID] = [200, view(state="PAUSED", paused=True)]
+        out = run_ui("#/s/" + LSID, routes, [{"poll": True}, {"click": "Pause"}])
+        self.assertTrue([c for c in out["calls"] if c["method"] == "POST" and c["path"].endswith("/pause")])
+        self.assertGreaterEqual(len([c for c in out["calls"] if c["method"] == "GET" and c["path"].endswith(LSID)]), 3)  # initial + poll + refresh
+
     def test_hostile_text_is_rendered_as_text(self):
         evil = "<img src=x onerror=alert(1)><script>alert(2)</script>"
         out = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(title=evil, recent_output=[{"ts": "t", "text": evil}])]})

@@ -5,7 +5,8 @@ const chunks = [];
 process.stdin.on('data', (c) => chunks.push(c));
 process.stdin.on('end', async () => {
   const cfg = JSON.parse(Buffer.concat(chunks).toString());
-  function N(tag) { this.tag = tag; this.children = []; this.attrs = {}; this.listeners = {}; this._text = ''; this.className = ''; this.value = ''; this.disabled = false; this.checked = false; }
+  let UID = 0;
+  function N(tag) { this.uid = ++UID; this.hidden = false; this.tag = tag; this.children = []; this.attrs = {}; this.listeners = {}; this._text = ''; this.className = ''; this.value = ''; this.disabled = false; this.checked = false; }
   N.prototype.appendChild = function (c) { this.children.push(c); if (this.tag === 'select' && c.tag === 'option' && !this.value) this.value = c.attrs.value; return c; };
   N.prototype.removeChild = function (c) { this.children = this.children.filter((x) => x !== c); };
   Object.defineProperty(N.prototype, 'firstChild', { get() { return this.children[0] || null; } });
@@ -16,11 +17,12 @@ process.stdin.on('end', async () => {
   N.prototype.querySelector = function (sel) { let hit = null; this.walk((n) => { if (!hit && n.tag === sel) hit = n; }); return hit; };
   const app = new N('main');
   const calls = [];
-  global.document = { createElement: (t) => new N(t), createTextNode: (t) => { const n = new N('#text'); n._text = t; return n; }, getElementById: () => app, hidden: false };
+  const intervals = [];
+  global.document = { activeElement: null, createElement: (t) => new N(t), createTextNode: (t) => { const n = new N('#text'); n._text = t; return n; }, getElementById: () => app, hidden: false };
   global.window = { crypto: { randomUUID: () => 'uuid-' + calls.length }, addEventListener() {} };
   global.crypto = global.window.crypto;
   global.location = { hash: cfg.hash || '' };
-  global.setInterval = () => 1; global.clearInterval = () => {};
+  global.setInterval = (fn) => { intervals.push(fn); return intervals.length; }; global.clearInterval = () => { intervals.length = 0; };
   global.fetch = (path, opts) => {
     const method = (opts && opts.method) || 'GET';
     calls.push({ method, path, body: opts && opts.body ? JSON.parse(opts.body) : null, headers: (opts && opts.headers) || {} });
@@ -30,7 +32,14 @@ process.stdin.on('end', async () => {
   new Function(cfg.js)();
   const tick = () => new Promise((r) => setTimeout(r, 20));
   await tick(); await tick();
+  const snaps = {};
+  const boxes = () => { const o = []; app.walk((n) => { if (n.tag === 'textarea' || n.tag === 'input') o.push({ tag: n.tag, uid: n.uid, value: n.value }); }); return o; };
   for (const step of cfg.steps || []) {
+    if (step.routes) { Object.assign(cfg.routes, step.routes); continue; }
+    if (step.poll) { intervals.slice().forEach((f) => f()); await tick(); await tick(); continue; }
+    if (step.focus) { let t = null; app.walk((n) => { if (n.tag === step.focus && !t) t = n; }); document.activeElement = t; continue; }
+    if (step.blur) { const t = document.activeElement; document.activeElement = null; if (t && t.listeners.blur) t.listeners.blur({}); await tick(); continue; }
+    if (step.snap) { snaps[step.snap] = { boxes: boxes(), text: app.textContent, buttons: (() => { const b = []; app.walk((n) => { if (n.tag === 'button') b.push(n.textContent); }); return b; })() }; continue; }
     if (step.type) { let t = null; app.walk((n) => { if (n.tag === step.type && !t) t = n; }); if (t) t.value = step.value; continue; }
     let b = null; app.walk((n) => { if (n.tag === 'button' && n.textContent === step.click && !b) b = n; });
     if (b && b.listeners.click) b.listeners.click({});
@@ -38,5 +47,5 @@ process.stdin.on('end', async () => {
   }
   const texts = []; const attrs = []; const inputs = []; const buttons = [];
   app.walk((n) => { if (n.tag === '#text' || (n._text && n.tag !== 'main')) texts.push(n._text); Object.keys(n.attrs).forEach((k) => attrs.push([n.tag, k, n.attrs[k]])); if (['input', 'textarea', 'select'].includes(n.tag)) inputs.push(n.tag); if (n.tag === 'button') buttons.push(n.textContent); });
-  process.stdout.write(JSON.stringify({ texts, calls, attrs, inputs, buttons, all: app.textContent }));
+  process.stdout.write(JSON.stringify({ snaps, texts, calls, attrs, inputs, buttons, all: app.textContent }));
 });

@@ -7638,36 +7638,51 @@ UI_APP_JS = r"""
   }
 
   // ---- one session ----------------------------------------------------------
+  // The instruction box is created ONCE and never rebuilt: only the parts around it are
+  // redrawn by polling, so focus, cursor, selection, the iOS paste menu and the draft survive.
   function renderSession(id) {
     stop(); clear();
-    var box = el('div');
+    var head = el('div'), tail = el('div'), composer = el('div');
     var flash = el('p', { 'class': 'note', text: '' });
+    var text = el('textarea', { placeholder: 'Tell Claude…', 'aria-label': 'Instruction', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
+    var sending = false, view = null, pending = null, panel = null, lastKey = null, lastImportant = null;
+    composer.hidden = true;
+    var sendBtn = el('button', { text: 'Send', onclick: send });
+    composer.appendChild(text); composer.appendChild(sendBtn);
     app.appendChild(el('a', { 'class': 'back', href: '#/', text: '‹ Sessions' }));
-    app.appendChild(box);
-    var view = null;
-    var panel = null; // 'stop' | 'clear' | null
+    app.appendChild(flash); app.appendChild(head); app.appendChild(composer); app.appendChild(tail);
 
     function post(path, body, ok) {
       return api('POST', path, Object.assign({ request_id: rid() }, body)).then(function (r) {
-        if (r.status === 401) return boot();
+        if (r.status === 401) { boot(); return null; }
         var reason = r.data && (r.data.reason || r.data.error);
         flash.textContent = (r.status >= 200 && r.status < 300) ? (ok || 'Done.') : ('Refused: ' + reason);
-        panel = null; load();
+        load();
         return r;
       });
     }
+    function send() {
+      var v = text.value;
+      if (!v.trim() || sending) return;
+      sending = true; sendBtn.disabled = true;
+      post('/api/v1/sessions/' + id + '/instructions', { text: v }, 'Sent. It is queued for Claude.').then(function (r) {
+        sending = false; sendBtn.disabled = false;
+        // Clear only on success, and only if the draft is still what was sent: a failure keeps it for a retry.
+        if (r && r.status >= 200 && r.status < 300 && text.value === v) text.value = '';
+      }, function () { sending = false; sendBtn.disabled = false; flash.textContent = 'Not sent. Your text is kept.'; });
+    }
+    function control(path, body, ok) { panel = null; return post(path, body, ok).then(function (r) { drawTail(true); return r; }); }
     function decide(gate, decision) {
       return post('/api/v1/sessions/' + id + '/approvals/' + gate.id + '/' + decision,
         { nonce: gate.nonce, owner_epoch: view.owner && view.owner.epoch }, decision === 'approve' ? 'Approved.' : 'Denied.');
     }
-    function draw() {
+    function drawHead() {
       var s = view;
-      while (box.firstChild) box.removeChild(box.firstChild);
-      box.appendChild(el('div', { 'class': 'row' }, [el('h2', { text: s.project || 'Session' }), stateEl(s.state)]));
-      box.appendChild(flash);
+      while (head.firstChild) head.removeChild(head.firstChild);
+      head.appendChild(el('div', { 'class': 'row' }, [el('h2', { text: s.project || 'Session' }), stateEl(s.state)]));
       if (s.human_gate) {
         var g = s.human_gate;
-        box.appendChild(el('div', { 'class': 'card gate' }, [
+        head.appendChild(el('div', { 'class': 'card gate' }, [
           el('strong', { text: 'APPROVAL REQUIRED' }),
           el('div', { 'class': 'muted', text: 'Project: ' + (s.project || '') }),
           el('div', { 'class': 'muted', text: 'Requested action:' }),
@@ -7680,17 +7695,17 @@ UI_APP_JS = r"""
             el('button', { 'class': 'ok', text: 'APPROVE', onclick: function () { decide(g, 'approve'); } })])]));
       }
       if (s.state === 'ORPHANED') {
-        box.appendChild(el('div', { 'class': 'card' }, [
+        head.appendChild(el('div', { 'class': 'card' }, [
           el('strong', { 'class': 'err', text: 'Claude stopped responding.' }),
           el('div', { 'class': 'muted', text: (s.orphaned && s.orphaned.reason) || '' }),
           el('div', { 'class': 'muted', text: 'It will not be replaced automatically.' }),
           el('div', { 'class': 'grid2' }, [
-            el('button', { 'class': 'secondary', text: 'Re-check', onclick: function () { post('/api/v1/sessions/' + id + '/recover', { action: 'reattach' }, 'Re-attached.'); } }),
-            el('button', { 'class': 'danger', text: 'Abandon', onclick: function () { post('/api/v1/sessions/' + id + '/recover', { action: 'abandon' }, 'Abandoned.'); } })])]));
+            el('button', { 'class': 'secondary', text: 'Re-check', onclick: function () { control('/api/v1/sessions/' + id + '/recover', { action: 'reattach' }, 'Re-attached.'); } }),
+            el('button', { 'class': 'danger', text: 'Abandon', onclick: function () { control('/api/v1/sessions/' + id + '/recover', { action: 'abandon' }, 'Abandoned.'); } })])]));
       }
-      var poll_age = s.agent_poll_age_seconds;
-      var wake = poll_age === null || poll_age === undefined ? 'Claude has not checked in yet' : (poll_age < 45 ? 'Claude is listening' : 'Claude is busy or away; it will see new instructions at its next check');
-      box.appendChild(el('div', { 'class': 'card' }, [
+      var age = s.agent_poll_age_seconds;
+      var wake = age === null || age === undefined ? 'Claude has not checked in yet' : (age < 45 ? 'Claude is listening' : 'Claude is busy or away; it will see new instructions at its next check');
+      head.appendChild(el('div', { 'class': 'card' }, [
         el('div', { 'class': 'muted', text: 'Current task' }), el('div', { text: s.title || '(none)' }),
         el('div', { 'class': 'muted', text: 'Branch: ' + (s.branch || 'n/a') }),
         el('div', { 'class': 'muted', text: 'Owner generation: ' + (s.owner ? s.owner.generation : 'none') + ' · ID ' + short(s.logical_session_id) }),
@@ -7700,52 +7715,59 @@ UI_APP_JS = r"""
         el('div', { 'class': 'muted', text: 'Instructions pending: ' + (s.inbox ? s.inbox.pending : 0) }),
         s.project_available === false ? el('div', { 'class': 'err', text: 'This project is no longer available on the Mac.' }) : null]));
       var out = (s.recent_output || []).map(function (o) { return o.text; }).join('\n');
-      box.appendChild(el('h2', { text: 'Recent output' }));
-      box.appendChild(el('div', { 'class': 'card out mono', text: out || '(nothing yet)' }));
-
-      var ended = s.state === 'FAILED' || s.state === 'COMPLETED';
-      if (!ended) {
-        var text = el('textarea', { placeholder: 'Tell Claude…', 'aria-label': 'Instruction' });
-        box.appendChild(text);
-        box.appendChild(el('button', { text: 'Send', onclick: function () {
-          if (!text.value.trim()) return;
-          post('/api/v1/sessions/' + id + '/instructions', { text: text.value }, 'Sent. It is queued for Claude.').then(function () { text.value = ''; });
-        } }));
-        var stopped = s.state === 'STOPPED';
-        box.appendChild(el('div', { 'class': 'grid3' }, [
-          el('button', { 'class': 'secondary', text: 'Pause', onclick: function () { post('/api/v1/sessions/' + id + '/pause', {}, 'Paused.'); } }),
-          el('button', { 'class': 'secondary', text: stopped ? 'Resume…' : 'Resume', onclick: function () {
-            if (stopped) { panel = 'clear'; draw(); } else post('/api/v1/sessions/' + id + '/resume', {}, 'Resumed.'); } }),
-          el('button', { 'class': 'danger', text: 'STOP', onclick: function () { panel = 'stop'; draw(); } })]));
-        if (panel === 'stop') {
-          var hard = el('input', { type: 'checkbox', id: 'hard' });
-          box.appendChild(el('div', { 'class': 'card' }, [
-            el('strong', { text: 'Stop this session?' }),
-            el('div', { 'class': 'muted', text: 'Claude will do no further autonomous work until you deliberately clear the STOP.' }),
-            el('label', {}, [hard, ' Also end the Claude process']),
-            el('div', { 'class': 'grid2' }, [
-              el('button', { 'class': 'secondary', text: 'Cancel', onclick: function () { panel = null; draw(); } }),
-              el('button', { 'class': 'danger', text: 'Confirm STOP', onclick: function () { post('/api/v1/sessions/' + id + '/stop', { reason: 'Stopped from phone', hard: !!hard.checked }, 'STOPPED.'); } })])]));
-        }
-        if (panel === 'clear') {
-          var why = el('input', { type: 'text', placeholder: 'Why is it safe to resume?', 'aria-label': 'Reason' });
-          box.appendChild(el('div', { 'class': 'card' }, [
-            el('strong', { text: 'Clear the STOP and resume?' }), why,
-            el('div', { 'class': 'grid2' }, [
-              el('button', { 'class': 'secondary', text: 'Cancel', onclick: function () { panel = null; draw(); } }),
-              el('button', { text: 'Clear STOP', onclick: function () {
-                if (!why.value.trim()) { flash.textContent = 'Give a reason.'; return; }
-                post('/api/v1/sessions/' + id + '/resume', { clear_stop: true, reason: why.value }, 'STOP cleared.'); } })])]));
-        }
+      head.appendChild(el('h2', { text: 'Recent output' }));
+      head.appendChild(el('div', { 'class': 'card out mono', text: out || '(nothing yet)' }));
+    }
+    function drawTail(force) {
+      if (!view || (panel && !force)) return; // never rebuild a panel the user is filling in
+      while (tail.firstChild) tail.removeChild(tail.firstChild);
+      var ended = view.state === 'FAILED' || view.state === 'COMPLETED';
+      composer.hidden = ended;
+      if (ended) return;
+      var stopped = view.state === 'STOPPED';
+      tail.appendChild(el('div', { 'class': 'grid3' }, [
+        el('button', { 'class': 'secondary', text: 'Pause', onclick: function () { control('/api/v1/sessions/' + id + '/pause', {}, 'Paused.'); } }),
+        el('button', { 'class': 'secondary', text: stopped ? 'Resume…' : 'Resume', onclick: function () {
+          if (stopped) { panel = 'clear'; drawTail(true); } else control('/api/v1/sessions/' + id + '/resume', {}, 'Resumed.'); } }),
+        el('button', { 'class': 'danger', text: 'STOP', onclick: function () { panel = 'stop'; drawTail(true); } })]));
+      if (panel === 'stop') {
+        var hard = el('input', { type: 'checkbox', id: 'hard' });
+        tail.appendChild(el('div', { 'class': 'card' }, [
+          el('strong', { text: 'Stop this session?' }),
+          el('div', { 'class': 'muted', text: 'Claude will do no further autonomous work until you deliberately clear the STOP.' }),
+          el('label', {}, [hard, ' Also end the Claude process']),
+          el('div', { 'class': 'grid2' }, [
+            el('button', { 'class': 'secondary', text: 'Cancel', onclick: function () { panel = null; drawTail(true); } }),
+            el('button', { 'class': 'danger', text: 'Confirm STOP', onclick: function () { control('/api/v1/sessions/' + id + '/stop', { reason: 'Stopped from phone', hard: !!hard.checked }, 'STOPPED.'); } })])]));
+      }
+      if (panel === 'clear') {
+        var why = el('input', { type: 'text', placeholder: 'Why is it safe to resume?', 'aria-label': 'Reason' });
+        tail.appendChild(el('div', { 'class': 'card' }, [
+          el('strong', { text: 'Clear the STOP and resume?' }), why,
+          el('div', { 'class': 'grid2' }, [
+            el('button', { 'class': 'secondary', text: 'Cancel', onclick: function () { panel = null; drawTail(true); } }),
+            el('button', { text: 'Clear STOP', onclick: function () {
+              if (!why.value.trim()) { flash.textContent = 'Give a reason.'; return; }
+              control('/api/v1/sessions/' + id + '/resume', { clear_stop: true, reason: why.value }, 'STOP cleared.'); } })])]));
       }
     }
+    // Redraw only what changed, and while the instruction box has focus hold back everything
+    // except a change the user must not miss (state, approval, STOP, orphaned): the layout must
+    // not shift under an open keyboard or paste menu.
+    function applyView() {
+      var key = JSON.stringify(view);
+      if (key === lastKey) return;
+      var important = JSON.stringify([view.state, view.human_gate && view.human_gate.id, view.stop, view.orphaned]);
+      if (document.activeElement === text && important === lastImportant && lastKey !== null) { pending = true; return; }
+      lastKey = key; lastImportant = important; pending = false;
+      drawHead(); drawTail(false);
+    }
+    text.addEventListener('blur', function () { if (pending) applyView(); });
     function load() {
       api('GET', '/api/v1/sessions/' + id).then(function (r) {
         if (r.status === 401) return boot();
-        if (r.status !== 200) { clear(); app.appendChild(el('p', { 'class': 'err', text: 'Session not found.' })); return; }
-        var typing = box.querySelector && box.querySelector('textarea');
-        if (typing && typing.value) { view = r.data; return; } // never redraw over text being typed
-        view = r.data; draw();
+        if (r.status !== 200) { head.textContent = 'Session not found.'; return; }
+        view = r.data; applyView();
       });
     }
     load(); poll(load, 3000);
