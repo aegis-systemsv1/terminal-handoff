@@ -573,6 +573,17 @@ class TestExposureSafeguards(LogicalCase):
         taken = {"TCP": {"443": {}, "8444": {}, "8445": {}, "8446": {}}}
         self.assertEqual(CORE.check_serve_conflicts({"port": 18790}, run=FakeRun(taken))[2], 8447)
 
+    def test_its_own_mapping_on_its_public_port_does_not_block_a_restart(self):
+        own = {"TCP": {"443": {}, "8444": {}, "8445": {}},
+               "Web": dict(REAL_SERVE_STATUS["Web"], **{HOST + ":8445": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:18790"}}}})}
+        ok, why, suggested = CORE.check_serve_conflicts({"port": 18790, "public_port": 8445}, run=FakeRun(own))
+        self.assertTrue(ok, why)
+        self.assertIsNone(suggested)
+        # the same mapping seen by a gateway that is NOT configured for that public port is a conflict
+        self.assertFalse(CORE.check_serve_conflicts({"port": 18790, "public_port": 443}, run=FakeRun(own))[0])
+        self.assertFalse(CORE.check_serve_conflicts({"port": 18790, "public_port": 8446}, run=FakeRun(own))[0])
+        self.assertEqual(CORE.serve_mappings(own)[8445], {18790})
+
     def test_an_unreadable_serve_configuration_fails_closed(self):
         def boom(argv, **kw):
             raise OSError("no tailscale")

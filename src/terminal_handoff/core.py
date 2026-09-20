@@ -7309,6 +7309,20 @@ def parse_serve_status(status):
     return https_ports, targets
 
 
+def serve_mappings(status):
+    """`{public_https_port: {local_ports}}` from `tailscale serve status --json`."""
+    mappings = {}
+    for key, cfg in ((status or {}).get("Web") or {}).items() if isinstance(status, dict) else []:
+        public = str(key).rsplit(":", 1)[-1]
+        if not public.isdigit():
+            continue
+        for handler in ((cfg or {}).get("Handlers") or {}).values():
+            match = re.search(r"(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)", str((handler or {}).get("Proxy") or ""))
+            if match:
+                mappings.setdefault(int(public), set()).add(int(match.group(1)))
+    return mappings
+
+
 def check_serve_conflicts(config, run=subprocess.run):
     """Refuse to run on a local port that an existing `tailscale serve` mapping already
     publishes: starting there would expose the gateway without anyone choosing to.
@@ -7323,9 +7337,15 @@ def check_serve_conflicts(config, run=subprocess.run):
         status = json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
     except Exception as exc:
         return False, "could not read the existing Tailscale serve configuration: %s" % str(exc)[:100], None
-    https_ports, targets = parse_serve_status(status)
-    if config.get("port") in targets:
-        return False, "local port %s is already published by an existing `tailscale serve` mapping; choose another port" % config.get("port"), None
+    https_ports, _ = parse_serve_status(status)
+    public = int(config.get("public_port", 443))
+    for https_port, locals_ in serve_mappings(status).items():
+        # A mapping on the gateway's OWN configured public port is the one deliberately
+        # made for it; any other mapping onto its local port would expose it by accident.
+        if config.get("port") in locals_ and https_port != public:
+            return False, "local port %s is already published by an existing `tailscale serve` mapping; choose another port" % config.get("port"), None
+    if public in https_ports and config.get("port") in serve_mappings(status).get(public, set()):
+        return True, None, None  # already published on its own port; nothing to suggest
     candidate = 8445
     while candidate in https_ports:
         candidate += 1
