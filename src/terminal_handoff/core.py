@@ -2110,9 +2110,10 @@ def decide(payload, validate_files=True, now=None, record=True):
 
     # Gate 3: one trigger per session (atomic marker keyed by session_id).
     if os.path.exists(th_path("triggered", facts.session_id)):
-        result["state"] = "handed_off"
-        result["reason"] = "this session has already handed off"
-        return result
+        if not (record and recover_stale_trigger_claim(facts.session_id, now)):
+            result["state"] = "handed_off"
+            result["reason"] = "this session has already handed off"
+            return result
 
     # Gate 4: optional generation ceiling.
     chain_id, generation, parent_manifest, parent_session = chain_identity(
@@ -3381,6 +3382,74 @@ def claim_trigger(session_id):
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
+
+
+STALE_CLAIM_SECONDS = 45.0
+STALE_CLAIM_HARD_SECONDS = 300.0
+MAX_STALE_RECLAIMS = 3
+
+
+def trigger_claim_progress(session_id):
+    """True if a launch for this session got as far as leaving any durable trace."""
+    return any(
+        os.path.exists(path)
+        for path in (
+            transfer_path(session_id),
+            manifest_path(session_id),
+            th_path("launching", "%s.launch.sh" % session_id),
+            th_path("completed", "%s.launch.json" % session_id),
+            th_path("failed", "%s.json" % session_id),
+        )
+    )
+
+
+def recover_stale_trigger_claim(session_id, now=None):
+    """Release an automatic claim whose status-line process died before launching.
+
+    The claim is taken before the launcher is spawned. If that process is cancelled or
+    killed in between, nothing would ever launch and the session could never trigger
+    again. A claim is orphaned only if it is old, its claimant is gone (or it is very old),
+    and no launch left any trace. Bounded, and never applied to manual claims.
+    """
+    now = time.time() if now is None else now
+    path = th_path("triggered", session_id)
+    claim = read_json(path)
+    if not isinstance(claim, dict) or claim.get("mode") != "automatic":
+        return False
+    age = now - float(claim.get("claimed_epoch") or now)
+    if age < STALE_CLAIM_SECONDS:
+        return False
+    if _pid_alive(claim.get("pid")) and age < STALE_CLAIM_HARD_SECONDS:
+        return False
+    if trigger_claim_progress(session_id):
+        return False
+    ensure_dirs()
+    lock_fd = os.open(trigger_lock_path(session_id), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if read_json(path) != claim or trigger_claim_progress(session_id):
+            return False  # somebody else moved first
+        counter = {"n": 0}
+
+        def bump(data):
+            counter["n"] = int(data.get("n", 0)) + 1
+            data["n"] = counter["n"]
+
+        update_json_locked(th_path("state", "reclaims-%s.json" % session_id), bump)
+        if counter["n"] > MAX_STALE_RECLAIMS:
+            return False
+        os.unlink(path)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    log_event(
+        "stale_trigger_claim_released",
+        session_id=session_id,
+        claim_age_seconds=round(age, 1),
+        claimant_pid=claim.get("pid"),
+        attempt=counter["n"],
+    )
+    return True
 
 
 def archive_failed_handoff(session_id, reason=None):
@@ -5067,15 +5136,16 @@ def cmd_statusline(args):
                     )
         if decision.get("trigger"):
             session_id = decision.get("session_id")
+            # The Claude Code session process is an ancestor of this status-line process
+            # and of nothing else Terminal Handoff can see later, so it is bound here and
+            # only here. It is bound BEFORE the claim so that the window between taking the
+            # one-shot claim and spawning the launcher is a single spawn, not process inspection.
+            binding, bind_reason = None, "parent shutdown disabled by configuration"
+            if session_id and stop_parent_enabled():
+                binding, bind_reason = bind_parent_claude_process(
+                    session_id, _dget(payload, "workspace", "current_dir")
+                )
             if session_id and claim_trigger(session_id):
-                # The Claude Code session process is an ancestor of this
-                # status-line process and of nothing else Terminal Handoff can
-                # see later, so it is bound here and only here.
-                binding, bind_reason = None, "parent shutdown disabled by configuration"
-                if stop_parent_enabled():
-                    binding, bind_reason = bind_parent_claude_process(
-                        session_id, _dget(payload, "workspace", "current_dir")
-                    )
                 log_event(
                     "trigger_claimed",
                     session_id=session_id,

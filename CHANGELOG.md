@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional session names, set at creation and changed from the session page (display metadata only).
 - The instruction box is stable under polling and around iOS focus changes.
 
+### Fixed
+
+- An automatic trigger whose status-line process died after claiming but before launching stranded the session ("already handed off", never launched). The claim is now recoverable and the parent is bound before it is taken.
+
 ### Changed
 
 - The single graceful-stop signalling call moved into `send_graceful_stop()`;

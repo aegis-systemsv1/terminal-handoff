@@ -408,3 +408,14 @@ sequenceDiagram
 See [REMOTE_CONTROL.md](REMOTE_CONTROL.md) for the gateway, approvals, STOP,
 recovery and threat model, and
 [decisions/0004-remote-session-control.md](decisions/0004-remote-session-control.md).
+
+## Orphaned trigger claims
+
+The automatic trigger takes a one-shot claim (`triggered/<session>`) and then spawns the launcher.
+If the status-line process dies in between (for example it is cancelled while the agent is busy),
+the claim used to strand the session: it reported "already handed off" and never launched. The
+parent is now bound *before* the claim, shrinking that window to a single spawn, and an
+**orphaned** automatic claim is released so the next status-line run retries: it must be at least
+45 s old, its claimant process gone (or over 5 minutes old), and no launch may have left any trace
+(manifest, transfer, launch script, completed or failed record). Recovery is bounded to three
+attempts, never touches manual claims, and is skipped by `evaluate --no-record`.
