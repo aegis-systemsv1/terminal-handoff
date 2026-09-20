@@ -1,6 +1,5 @@
 """The mobile interface: what the gateway serves, and what the page does."""
 
-import http.client
 import json
 import os
 import re
@@ -12,7 +11,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _harness import CORE  # noqa: E402
-from test_remote_api import HOST, LOGIN, RemoteCase  # noqa: E402
+from test_remote_api import RemoteCase  # noqa: E402
 
 HARNESS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "harness.js")
 NODE = shutil.which("node")
@@ -284,7 +283,9 @@ class TestScreens(unittest.TestCase):
         steps = [{"click": "Resume\u2026"}, {"type": "input", "value": "reviewed the diff carefully"}, {"snap": "a"}, self.newer(state="STOPPED", stop={"active": True}),
                  {"poll": True}, {"poll": True}, {"snap": "b"}]
         out = run_ui("#/s/" + LSID, routes, steps)["snaps"]
-        inputs = lambda snap: [b for b in snap["boxes"] if b["tag"] == "input"]
+        def inputs(snap):
+            return [b for b in snap["boxes"] if b["tag"] == "input"]
+
         self.assertEqual(inputs(out["a"]), inputs(out["b"]))
         self.assertEqual(inputs(out["b"])[0]["value"], "reviewed the diff carefully")
 

@@ -12,10 +12,10 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _harness import CORE, json_file, process_alive, run_th, text_file, wait_for_exit  # noqa: E402
-from test_continuation import ContinuationCase, SUCCESSOR  # noqa: E402
+from _harness import CORE, json_file, run_th, text_file, wait_for_exit  # noqa: E402
+from test_continuation import ContinuationCase  # noqa: E402
 from test_logical import LogicalCase  # noqa: E402
-from test_remote_api import HOST, LOGIN, ORIGIN, RemoteCase  # noqa: E402
+from test_remote_api import RemoteCase  # noqa: E402
 
 OWNER = "agent-A-session"
 NOSLEEP = lambda seconds: None  # noqa: E731
@@ -233,7 +233,7 @@ class TestApprovalOverHttp(RemoteCase):
 
     def test_replay_and_duplicate_approval_over_http(self):
         body = {"nonce": self.approval["nonce"], "owner_epoch": self.epoch, "request_id": "req-ap-fixed001"}
-        first = self.act("approve", body)
+        self.act("approve", body)
         again = self.act("approve", body)
         self.assertTrue(again[1].get("replayed"))
         other = self.act("approve", dict(body, request_id="req-ap-fixed002"))
@@ -593,7 +593,7 @@ class TestServiceRestartRecovery(LogicalCase):
         os.makedirs(repo)
         CORE.project_add("nova", repo)
         lsid = self.new_session()
-        approval = approve_ready(self, lsid)
+        approve_ready(self, lsid)
         CORE.logical_mutate(lsid, lambda r: r["approvals"][0].update(expires_epoch=1.0))
         CORE.projects_update(lambda p: p.pop("nova"))
         CORE.service_recover(liveness=self.alive, sleep=NOSLEEP)

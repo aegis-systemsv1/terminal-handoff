@@ -4,14 +4,12 @@ persistent, without ever touching identity, ownership or state."""
 import copy
 import json
 import os
-import re
 import sys
-import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _harness import CORE, json_file, text_file  # noqa: E402
+from _harness import CORE, text_file  # noqa: E402
 from test_remote_api import HOST, LOGIN  # noqa: E402
 from test_remote_launch import AGENT, LaunchCase  # noqa: E402
 
@@ -91,7 +89,7 @@ class TestRename(NameCase):
         entry = [h for h in CORE.logical_read(lsid)["history"] if h["event"] == "renamed"][-1]
         self.assertEqual((entry["old_name"], entry["new_name"]), ("First", "Second"))
         self.assertTrue(entry["by"].startswith("device:"))
-        log = [json.loads(l) for l in text_file(os.path.join(self.home, "logs", "terminal-handoff.log")).splitlines() if '"logical_renamed"' in l]
+        log = [json.loads(line) for line in text_file(os.path.join(self.home, "logs", "terminal-handoff.log")).splitlines() if '"logical_renamed"' in line]
         self.assertEqual((log[-1]["old_name"], log[-1]["new_name"], log[-1]["logical_session_id"]), ("First", "Second", lsid))
 
     def test_blank_rename_clears_the_custom_name(self):
@@ -160,8 +158,10 @@ class TestPersistence(NameCase):
 
     def test_the_name_survives_a_handoff_and_further_successors(self):
         lsid, _ = self.running("Nova Voice Fix")
-        transfer = lambda parent, successor, gen: {"state": "TRANSFER_COMPLETE", "parent_session_id": parent, "successor": {"session_id": successor},
-                                                    "successor_generation": gen, "chain_id": "chain1"}
+        def transfer(parent, successor, gen):
+            return {"state": "TRANSFER_COMPLETE", "parent_session_id": parent, "successor": {"session_id": successor},
+                    "successor_generation": gen, "chain_id": "chain1"}
+
         before = CORE.logical_read(lsid)
         ok, why, _ = CORE.logical_adopt_successor(lsid, transfer(AGENT, "agent-B-session", 2))
         self.assertTrue(ok, why)

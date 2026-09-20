@@ -18,7 +18,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _harness import CORE, REAL_MODEL_ID, json_file, process_alive, run_th, wait_for, wait_for_exit  # noqa: E402
+from _harness import CORE, json_file, run_th, wait_for, wait_for_exit  # noqa: E402
 from test_remote_launch import AGENT, LaunchCase  # noqa: E402
 from test_transfer import TransferTestCase  # noqa: E402
 
@@ -69,7 +69,8 @@ class TestFullLifecycle(LaunchCase):
         woke = {}
         waiter = threading.Thread(target=lambda: woke.update(CORE.logical_wait(lsid, AGENT, 15, sleep=NOSLEEP)))
         self.assertEqual(self.act(lsid, "instructions", {"text": "Start with the tests."})[0], 202)
-        waiter.start(); waiter.join(20)
+        waiter.start()
+        waiter.join(20)
         self.assertEqual(woke["directive"], "INSTRUCTIONS")
         self.assertEqual([m["text"] for m in woke["messages"]], ["Audit the retrieval pipeline. Do not deploy.", "Start with the tests."])
         for message in woke["messages"]:

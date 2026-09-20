@@ -7,13 +7,12 @@ and restarts, and can be touched only by the current fenced owner.
 
 import json
 import os
-import re
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _harness import CORE, TH_SCRIPT, THTestCase, json_file, process_alive, run_th  # noqa: E402
+from _harness import CORE, TH_SCRIPT, THTestCase, process_alive, run_th  # noqa: E402
 from test_continuation import ContinuationCase, OTHER, SUCCESSOR  # noqa: E402
 
 TOKEN = "launch-token-for-tests"
