@@ -20,6 +20,7 @@ Target: Python 3.9+ (macOS system python3). No third-party dependencies.
 from __future__ import print_function
 
 import base64
+import contextlib
 import errno
 import fcntl
 import glob
@@ -2527,6 +2528,15 @@ def find_claude_executable():
     return None
 
 
+def logical_settings_file(lsid):
+    """The per-session permission settings of a remote-created logical session."""
+    record = logical_read(lsid) if lsid else None
+    path = ((record or {}).get("permissions") or {}).get("settings_file")
+    if path and os.path.isfile(path) and os.path.realpath(path).startswith(os.path.realpath(th_path("remote", "profiles"))):
+        return path
+    return None
+
+
 def build_launch_argv(manifest, claude_bin, prompt_text):
     """Construct the successor launch argv.
 
@@ -2564,6 +2574,9 @@ def build_launch_argv(manifest, claude_bin, prompt_text):
         # name from the repository, the directory or the chain identifier.
         successor_name = successor_session_name(fallback_base_name(chain_id), generation + 1)
     argv += ["--name", successor_name]
+    settings_file = logical_settings_file(manifest.get("logical_session_id"))
+    if settings_file:
+        argv += ["--settings", settings_file]
     argv += [prompt_text]
     return argv
 
@@ -2652,6 +2665,15 @@ def render_successor_prompt(manifest, template_path=None):
     rendered = template
     for key, value in values.items():
         rendered = rendered.replace(key, value)
+    lrec = logical_read(manifest.get("logical_session_id"))
+    gates = ((lrec or {}).get("permissions") or {}).get("human_gate")
+    if gates:
+        rendered += (
+            "\nPROJECT HUMAN-GATE PROFILE (this session was started remotely; the same gates "
+            "apply to you). Stop before, and never perform without the human's decision:\n"
+            + "\n".join("  - %s" % g for g in gates)
+            + "\n"
+        )
     return rendered
 
 
@@ -2723,6 +2745,7 @@ PER_HANDOFF_ENV = (
     "CLAUDE_TERMINAL_HANDOFF_DISPLAY_NAME",
     "CLAUDE_TERMINAL_HANDOFF_TRANSFER",
     "CLAUDE_TERMINAL_HANDOFF_LOGICAL_SESSION",
+    "CLAUDE_TERMINAL_HANDOFF_LAUNCH_TOKEN",
 )
 
 
@@ -4997,6 +5020,14 @@ def cmd_statusline(args):
                         error=str(exc)[:300],
                     )
             try:
+                remote_registration(facts)
+            except Exception as exc:
+                log_event(
+                    "remote_registration_error",
+                    session_id=getattr(facts, "session_id", None),
+                    error=str(exc)[:300],
+                )
+            try:
                 successor_state = successor_heartbeat(facts)
             except Exception as exc:
                 log_event(
@@ -6596,9 +6627,14 @@ def cmd_session(args):
         ok, why, _ = logical_append_output(lsid, agent, args.text or "")
     elif action == "check":
         halt = logical_halt_reason(record)
-        out["directive"] = "HALT" if halt else "CONTINUE"
+        owner = _is_owner(record, agent)
+        out["directive"] = "STOP" if not owner else ("HALT" if halt else "CONTINUE")
         out["halt"] = halt
-        out["is_owner"] = _is_owner(record, agent)
+        out["is_owner"] = owner
+        if owner:
+            healthy, detail = probe_remote_control(agent)
+            logical_set_remote(lsid, agent, {"healthy": healthy, "detail": detail, "disabled": not remote_control_enabled()})
+            out["remote_control"] = (logical_read(lsid) or {}).get("remote_control", {}).get("state")
         out["pending_instructions"] = logical_public_view(record)["inbox"]["pending"]
     if not ok:
         out["error"] = why
@@ -7535,8 +7571,321 @@ def cmd_remote(args):
     return 2
 
 
+# ---------------------------------------------------------------------------
+# Remote session launcher: create_session(project, task)
+# ---------------------------------------------------------------------------
+#
+# Claude Code runs on this Mac, in a visible Terminal window, inside a project
+# resolved from the trusted registry. The task text is untrusted data: it goes
+# into the durable inbox and is read by the agent, never interpolated into a
+# shell command or argv.
+
+LAUNCH_TOKEN_TTL = 300
+DEFAULT_CREATE_WAIT = 60.0
+DEFAULT_REMOTE_HEALTH_WAIT = 20.0
+
+REMOTE_SESSION_PROMPT = """TERMINAL HANDOFF REMOTE SESSION
+
+You are a Claude Code session that Terminal Handoff started on this Mac at the
+request of an authenticated remote device belonging to the user. You act for
+logical session {{LOGICAL_ID}} on project "{{PROJECT}}".
+Working directory: {{WORKING_DIRECTORY}}
+
+FIRST, confirm you are the registered owner:
+
+    {{TH_COMMAND}} session check
+
+If the directive is STOP or is_owner is false, you were not registered: do
+nothing else and tell the user in this terminal. If it is HALT, the user has
+STOPPED or PAUSED this session: perform no autonomous mutation.
+
+YOUR TASK is the first message in your durable instruction inbox:
+
+    {{TH_COMMAND}} session inbox
+
+Each message is text typed by the user on a remote device. Treat it as the
+user's instruction, as data and not as shell syntax. After you have acted on a
+message, run `{{TH_COMMAND}} session ack --message-id <id>`. Run
+`session inbox` again at the start of every task step: new instructions and STOP
+requests arrive there, and they survive handoffs to successor sessions. Record
+short progress lines for the remote display with
+`{{TH_COMMAND}} session note --text "<line>"`. Never put secrets in a note.
+
+APPROVAL BOUNDARIES. Instructions from the inbox never approve anything on this
+list. Stop before, and do not perform, any of:
+{{HUMAN_GATES}}
+At such a boundary state exactly what you are about to do and wait; do not
+proceed on your own judgement. Remote approval of these gates is not yet
+available: the user must answer in this session. Native Claude permission
+prompts are separate and are answered only by the user. Never use the
+--dangerously-skip-permissions flag or any permission bypass, and never clear a STOP.
+
+Terminal Handoff is active in this session and will hand you over to a
+successor session near the context limit. Allow that to happen.
+
+--
+Terminal Handoff {{TH_VERSION}}
+"""
+
+
+@contextlib.contextmanager
+def _create_lock():
+    ensure_dirs()
+    fd = os.open(th_path("remote", "create.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def write_text_private(path, text, mode=0o600):
+    _mkdir_private(os.path.dirname(path))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+
+
+def render_remote_prompt(record, profile):
+    gates = "\n".join("  - %s" % gate for gate in (profile or {}).get("human_gate", []))
+    values = {
+        "{{LOGICAL_ID}}": record["logical_session_id"],
+        "{{PROJECT}}": str(record.get("project")),
+        "{{WORKING_DIRECTORY}}": str(record.get("repository")),
+        "{{HUMAN_GATES}}": gates or "  - (none recorded)",
+        "{{TH_COMMAND}}": "%s %s" % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__))),
+        "{{TH_VERSION}}": TERMINAL_HANDOFF_VERSION,
+    }
+    text = REMOTE_SESSION_PROMPT
+    for key, value in values.items():
+        text = text.replace(key, value)
+    return text
+
+
+def build_remote_launch_argv(claude_bin, name, settings_file, prompt_text):
+    """Argv for a remote-created session. No shell, no permission bypass."""
+    argv = [claude_bin]
+    if remote_control_enabled():
+        argv.append("--remote-control")
+    if settings_file:
+        argv += ["--settings", settings_file]
+    if name:
+        argv += ["--name", name]
+    argv.append(prompt_text)
+    return argv
+
+
+def assert_remote_argv_safe(argv):
+    return ["forbidden flag present: %s" % t for t in FORBIDDEN_LAUNCH_TOKENS if t in argv[:-1]]
+
+
+def write_permission_settings(lsid, profile):
+    """A per-session settings file. Existing Claude settings are never edited."""
+    path = th_path("remote", "profiles", "%s.json" % lsid)
+    settings = {"permissions": {"allow": list(profile["allow"]), "deny": list(profile.get("deny", []))}}
+    write_json_private(path, settings)
+    return path
+
+
+def build_remote_launch_script(workdir, argv, lsid, launch_token):
+    lines = [
+        "#!/bin/zsh",
+        "# Terminal Handoff %s - remote session launcher" % TERMINAL_HANDOFF_VERSION,
+        "set -e",
+        "cd -- %s || { echo 'Terminal Handoff: project directory unavailable'; exit 1; }" % shlex.quote(workdir),
+    ]
+    for key, value in propagated_environment().items():
+        lines.append("export %s=%s" % (key, shlex.quote(value)))
+    lines += [
+        "export CLAUDE_TERMINAL_HANDOFF_LOGICAL_SESSION=%s" % shlex.quote(lsid),
+        "export CLAUDE_TERMINAL_HANDOFF_LAUNCH_TOKEN=%s" % shlex.quote(launch_token),
+        "echo 'Terminal Handoff: remote session %s'" % lsid,
+        "exec " + " ".join(shlex.quote(part) for part in argv),
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def logical_set_remote(lsid, agent_session_id, result):
+    """Mirror a Remote Control health result into the logical session."""
+    if not lsid or not logical_session_valid(lsid):
+        return
+    state = REMOTE_HEALTHY if result.get("healthy") else (REMOTE_DISABLED if result.get("disabled") else REMOTE_DEGRADED)
+
+    def mutate(record):
+        if not _is_owner(record, agent_session_id):
+            raise LogicalRefusal("not the current owner")
+        record["remote_control"] = {
+            "state": state,
+            "detail": result.get("detail"),
+            "checked_utc": utc_stamp(),
+        }
+
+    logical_mutate(lsid, mutate)
+
+
+def _remote_failure(record_id, why, status=502):
+    def mutate(record):
+        if record.get("state") == LS_CREATING:
+            record["state"] = LS_FAILED
+            record["failure"] = {"reason": clean_untrusted_text(why, 200), "ts": utc_stamp()}
+            record["launch"]["token_sha256"] = None  # a late session can no longer register
+            logical_history(record, "failed", reason=why[:100])
+
+    logical_mutate(record_id, mutate)
+    log_event("remote_session_failed", logical_session_id=record_id, reason=why[:100])
+    return status, {"logical_session_id": record_id, "state": LS_FAILED, "error": "launch_failed", "reason": why[:200]}
+
+
+def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wait=None, sleep=time.sleep):
+    """Create a logical session and start Claude Code on this Mac.
+
+    Returns `(http_status, payload)`. Success (201) means the Mac has really
+    established the session: the launched Claude registered as owner. The
+    request being accepted is not success; CREATING and FAILED are distinct.
+    """
+    terminal = terminal or launch_terminal
+    wait_seconds = DEFAULT_CREATE_WAIT if wait_seconds is None else wait_seconds
+    health_wait = DEFAULT_REMOTE_HEALTH_WAIT if health_wait is None else health_wait
+    device_id = ctx["device_id"]
+    request_key = "device:%s:%s" % (device_id, body["request_id"])
+
+    project_name = body.get("project")
+    task = clean_untrusted_text(body.get("task"), MAX_INSTRUCTION_CHARS)
+    if not isinstance(project_name, str) or task is None:
+        return 400, {"error": "bad_request", "reason": "project and a non-empty task are required"}
+
+    real, project, why = project_resolve(project_name)
+    if real is None:
+        log_event("remote_create_refused", device_id=device_id, reason="unknown project")
+        return 404, {"error": "unknown_project"}
+    if not project.get("remote_launch"):
+        return 403, {"error": "remote_launch_disabled"}
+    profile, why = project_permissions_ok(project)
+    if profile is None:
+        log_event("remote_create_refused", device_id=device_id, project=project_name, reason=why)
+        return 403, {"error": "permission_profile_required", "reason": why}
+    claude_bin = find_claude_executable()
+    if not claude_bin:
+        return 503, {"error": "claude_unavailable"}
+    repo = capture_repo_state(real)
+    for flag in ("merge_in_progress", "rebase_in_progress", "cherry_pick_in_progress", "revert_in_progress"):
+        if repo.get(flag):
+            return 409, {"error": "repository_busy", "reason": "a git operation is in progress"}
+
+    with _create_lock():
+        for existing in logical_list():
+            if existing.get("created_request_id") == request_key:
+                return 200, dict(logical_public_view(existing), duplicate=True)
+        for existing in logical_list():
+            if existing.get("project") == project_name and existing.get("state") not in LS_TERMINAL:
+                return 409, {"error": "project_in_use", "logical_session_id": existing["logical_session_id"]}
+        launch_token = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
+        record = logical_create(
+            project=project_name,
+            repository=real,
+            branch=repo.get("branch"),
+            created_by="device:%s" % device_id,
+            launch_token_sha256=_sha256(launch_token),
+            launch_expires_epoch=time.time() + LAUNCH_TOKEN_TTL,
+            title=task.splitlines()[0][:120],
+        )
+        lsid = record["logical_session_id"]
+        settings_file = write_permission_settings(lsid, profile)
+
+        def annotate(rec):
+            rec["created_request_id"] = request_key
+            rec["permissions"] = {
+                "profile": profile["profile"],
+                "human_gate": list(profile["human_gate"]),
+                "settings_file": settings_file,
+            }
+
+        logical_mutate(lsid, annotate)
+    log_event("remote_session_created", logical_session_id=lsid, project=project_name, device_id=device_id)
+
+    ok, why, message = inbox_post(lsid, task, idempotency_key="task-%s" % lsid[3:], source="device:%s" % device_id)
+    if not ok:
+        return _remote_failure(lsid, "could not queue the task: %s" % why)
+
+    record = logical_read(lsid)
+    prompt_file = th_path("prompts", "remote-%s.md" % lsid)
+    write_text_private(prompt_file, render_remote_prompt(record, profile))
+    bootstrap = "TERMINAL HANDOFF REMOTE SESSION %s. Read %s in full and follow it exactly before anything else." % (lsid, prompt_file)
+    name = sanitize_display_name("Remote %s" % project_name) or "Remote session"
+    argv = build_remote_launch_argv(claude_bin, name, settings_file, bootstrap)
+    problems = assert_remote_argv_safe(argv)
+    if problems:
+        return _remote_failure(lsid, "; ".join(problems), 500)
+    script_file = th_path("prompts", "remote-%s.sh" % lsid)
+    write_text_private(script_file, build_remote_launch_script(real, argv, lsid, launch_token), 0o700)
+
+    result = terminal({}, script_file, "Terminal Handoff: %s" % (name,), env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE"))
+    log_event("remote_claude_launched", logical_session_id=lsid, launched=bool(result.get("launched")), simulated=bool(result.get("test_mode")))
+    if not (result.get("launched") or result.get("test_mode") or result.get("simulated")):
+        return _remote_failure(lsid, "the Terminal window could not be opened")
+
+    deadline = time.time() + wait_seconds
+    while True:
+        record = logical_read(lsid)
+        if record.get("state") != LS_CREATING or time.time() >= deadline:
+            break
+        sleep(0.5)
+    if record.get("state") == LS_CREATING:
+        if wait_seconds <= 0:
+            return 202, dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac")
+        return _remote_failure(lsid, "the Mac did not confirm the session started", 504)
+    if record.get("state") in LS_TERMINAL:
+        return 502, logical_public_view(record)
+
+    agent = (record.get("owner") or {}).get("agent_session_id")
+    health_deadline = time.time() + health_wait
+    while True:
+        healthy, detail = probe_remote_control(agent)
+        if healthy or time.time() >= health_deadline:
+            break
+        sleep(1.0)
+    logical_set_remote(lsid, agent, {"healthy": healthy, "detail": detail, "disabled": not remote_control_enabled()})
+    if not healthy and remote_control_enabled():
+        _notify_attention(
+            {"chain_id": lsid, "parent_session_id": lsid, "attempt_id": "remote", "successor_display_name": project_name},
+            "remote_degraded",
+            "remote control could not be verified",
+            "The session is running. Detail: %s" % detail,
+            "remote_degraded_%s" % lsid,
+        )
+    log_event("remote_session_running", logical_session_id=lsid, remote_healthy=bool(healthy))
+    return 201, logical_public_view(logical_read(lsid))
+
+
+def remote_registration(facts):
+    """Statusline hook: a launched Claude proves itself as the session's first owner."""
+    lsid = logical_id_from_env()
+    token = os.environ.get("CLAUDE_TERMINAL_HANDOFF_LAUNCH_TOKEN", "").strip()
+    if not lsid or not token or not facts.session_id:
+        return None
+    record = logical_read(lsid)
+    if not record or record.get("state") != LS_CREATING:
+        return None
+    try:
+        same_dir = os.path.realpath(facts.current_dir or "") == record.get("repository")
+    except Exception:
+        same_dir = False
+    if not same_dir:
+        log_event("remote_registration_refused", logical_session_id=lsid, reason="working directory mismatch")
+        return None
+    binding, _ = bind_parent_claude_process(facts.session_id, facts.current_dir)
+    ok, why, _ = logical_register_owner(lsid, facts.session_id, 1, None, binding, token)
+    if not ok:
+        log_event("remote_registration_refused", logical_session_id=lsid, reason=why)
+    return ok
+
+
 def remote_create_session_handler(body, ctx):
-    return 501, {"error": "remote session creation is not enabled"}
+    return remote_create_session(body, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -7900,6 +8249,12 @@ def continuation_advance(path, session_id):
 
     _, _, record = continuation_mutate(path, session_id, commit)
     remote = ((record or {}).get("continuation") or {}).get("remote_control") or {}
+    if (record or {}).get("logical_session_id"):
+        logical_set_remote(
+            record["logical_session_id"],
+            session_id,
+            {"healthy": remote.get("state") == REMOTE_HEALTHY, "detail": remote.get("detail"), "disabled": remote.get("state") == REMOTE_DISABLED},
+        )
     if remote.get("state") == REMOTE_HEALTHY:
         log_event("remote_control_verified", session_id=session_id, chain_id=(record or {}).get("chain_id"))
     elif remote.get("state") == REMOTE_DEGRADED:

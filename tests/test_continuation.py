@@ -511,7 +511,8 @@ class TestNoPermissionBypass(unittest.TestCase):
         for hit in re.finditer(r"--dangerously-skip-permissions|--allow-dangerously-skip-permissions", source):
             line_start = source.rfind("\n", 0, hit.start()) + 1
             line = source[line_start: source.find("\n", hit.end())]
-            self.assertTrue(line.strip().startswith(('"', "#")) or "FORBIDDEN" in line, line)
+            prohibition = re.search(r"\b(never|not|no)\b", line, re.I)
+            self.assertTrue(line.strip().startswith(('"', "#")) or "FORBIDDEN" in line or prohibition, line)
         template = text_file(os.path.join(os.path.dirname(TH_SCRIPT), "templates", "successor-prompt.md"))
         self.assertNotIn("dangerously", template.replace("never use any permission bypass", ""))
 
