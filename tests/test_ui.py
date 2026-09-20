@@ -1,0 +1,397 @@
+"""The mobile interface: what the gateway serves, and what the page does."""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _harness import CORE  # noqa: E402
+from test_remote_api import RemoteCase  # noqa: E402
+
+HARNESS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "harness.js")
+NODE = shutil.which("node")
+LSID = "ls_" + "a" * 24
+
+
+def view(**over):
+    base = {
+        "logical_session_id": LSID, "project": "Nova", "state": "RUNNING", "branch": "main", "title": "Audit retrieval latency",
+        "created_utc": "2026-01-01T00:00:00Z", "owner": {"generation": 3, "epoch": 3}, "stop": {"active": False}, "paused": False,
+        "remote_control": {"state": "healthy"}, "inbox": {"pending": 1, "delivered": 0, "acked": 2},
+        "recent_output": [{"ts": "t", "text": "reading tests"}], "human_gate": None, "approvals": [], "agent_poll_age_seconds": 4.0,
+        "project_available": True, "orphaned": None,
+    }
+    base.update(over)
+    return base
+
+
+def run_ui(hash_, routes, steps=None):
+    payload = {"js": CORE.UI_APP_JS, "hash": hash_, "routes": routes, "steps": steps or []}
+    proc = subprocess.run([NODE, HARNESS], input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    assert proc.returncode == 0, proc.stderr.decode()
+    return json.loads(proc.stdout.decode())
+
+
+ME = ("GET /api/v1/me", [200, {"device": "phone", "csrf": "csrf-token-1"}])
+
+
+class TestServedAssets(RemoteCase):
+    def test_pages_are_served_with_a_strict_csp_and_no_inline_script(self):
+        status, html, resp = self.call("GET", "/")
+        self.assertEqual(status, 200)
+        csp = resp.getheader("Content-Security-Policy")
+        for directive in ("default-src 'none'", "script-src 'self'", "style-src 'self'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'"):
+            self.assertIn(directive, csp)
+        self.assertNotIn("unsafe-inline", csp)
+        self.assertNotIn("unsafe-eval", csp)
+        self.assertEqual(resp.getheader("Cache-Control"), "no-store")
+        self.assertEqual(resp.getheader("X-Frame-Options"), "DENY")
+        self.assertIn('src="/app.js"', html)
+        self.assertNotRegex(html, r"<script(?![^>]*\bsrc=)[^>]*>")  # no inline script
+        self.assertNotIn("onclick=", html)
+        self.assertNotIn(" style=", html)
+        self.assertIn('name="viewport"', html)
+        for path, kind in (("/app.js", "javascript"), ("/app.css", "css")):
+            status, body, resp = self.call("GET", path)
+            self.assertEqual(status, 200)
+            self.assertIn(kind, resp.getheader("Content-Type"))
+
+    def test_the_page_still_needs_the_private_network_identity(self):
+        for path in ("/", "/app.js", "/app.css"):
+            self.assertEqual(self.call("GET", path, login=None)[0], 403, path)
+            self.assertEqual(self.call("GET", path, login="mallory@example.com")[0], 403, path)
+            self.assertEqual(self.call("GET", path, host="evil.example.com")[0], 403, path)
+
+    def test_the_page_contains_no_secret_or_path(self):
+        _, html, _ = self.call("GET", "/")
+        _, js, _ = self.call("GET", "/app.js")
+        joined = json.dumps(html) + json.dumps(js)
+        for forbidden in (self.home, "thd_", "/Us" + "ers/", "thc_"):
+            self.assertNotIn(forbidden, joined)
+
+    def test_the_api_is_still_authenticated(self):
+        self.call("GET", "/")
+        self.assertEqual(self.call("GET", "/api/v1/sessions")[0], 401)
+
+
+class TestStaticRules(unittest.TestCase):
+    def test_the_script_never_writes_html_or_stores_credentials(self):
+        js = CORE.UI_APP_JS
+        for forbidden in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "localStorage", "sessionStorage", "document.cookie", "console.", "XMLHttpRequest", "window.open", "postMessage"):
+            self.assertNotIn(forbidden, js, forbidden)
+        self.assertIn("textContent", js)
+        self.assertNotRegex(js, r"setAttribute\(\s*['\"]style")
+        self.assertNotRegex(js, r"['\"]on[a-z]+['\"]\s*:\s*['\"]")  # no string event handlers
+
+    def test_nothing_in_the_page_can_interfere_with_native_ios_paste(self):
+        code = "\n".join(line.split("//")[0] for line in CORE.UI_APP_JS.splitlines())  # ignore comments
+        for forbidden in ("paste", "clipboard", "beforeinput", "preventDefault", "stopPropagation", ".focus(", "setSelectionRange", ".select(",
+                          "execCommand", "selectionStart", "selectionEnd", "contenteditable", "touchstart", "touchend", "pointerdown", "keydown", "keyup",
+                          "addEventListener('input'", "oninput", "onpaste", "onbeforeinput"):
+            self.assertNotIn(forbidden, code, forbidden)
+        # the only listeners on the instruction box merely record a timestamp
+        self.assertEqual(sorted(re.findall(r"text\.addEventListener\('([a-z]+)'", code)), ["blur", "focus"])
+        for body in re.findall(r"text\.addEventListener\('[a-z]+', function \(\) \{([^}]*)\}", code):
+            self.assertEqual(body.strip(), "lastFocusEvent = Date.now();")
+        # the box's value is written in exactly one place: clearing it after a successful Send
+        self.assertEqual(re.findall(r"\btext\.value\s*=[^=]", code), ["text.value = "])
+        self.assertEqual(re.findall(r"\btext\.value\s*=\s*''", code), ["text.value = ''"])  # and it is only ever set to empty
+
+    def test_the_only_network_calls_are_same_origin_api_paths(self):
+        for path in re.findall(r"api\('(?:GET|POST)',\s*'([^']+)'", CORE.UI_APP_JS):
+            self.assertTrue(path.startswith("/api/v1/"), path)
+        self.assertNotIn("http://", CORE.UI_APP_JS)
+        self.assertNotIn("https://", CORE.UI_APP_JS)
+
+    def test_no_control_takes_a_path_command_or_pid(self):
+        js = CORE.UI_APP_JS
+        for word in ("cwd", "'path'", "'command'", "'pid'", "shell", "argv"):
+            self.assertNotIn(word, js, word)
+
+    def test_syntax_is_valid(self):
+        if not NODE:
+            self.skipTest("node is not installed")
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(CORE.UI_APP_JS)
+        try:
+            proc = subprocess.run([NODE, "--check", handle.name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        finally:
+            os.unlink(handle.name)
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class TestScreens(unittest.TestCase):
+    def test_an_unenrolled_device_is_shown_the_enrollment_screen(self):
+        out = run_ui("", {"GET /api/v1/me": [401, {"error": "unauthorized"}]})
+        self.assertIn("Enroll this device", out["all"])
+        self.assertIn("Enroll this device", out["buttons"])
+        self.assertEqual(out["inputs"], ["input"])
+
+    def test_enrollment_posts_only_the_code(self):
+        routes = {"GET /api/v1/me": [401, {}], "POST /api/v1/enroll": [200, {"csrf": "c"}]}
+        out = run_ui("", routes, [{"type": "input", "value": "thc_abc"}, {"click": "Enroll this device"}])
+        post = [c for c in out["calls"] if c["method"] == "POST"][0]
+        self.assertEqual(post["body"], {"code": "thc_abc"})
+
+    def test_the_session_list(self):
+        sessions = [view(), view(logical_session_id="ls_" + "b" * 24, project="Vertex", state="WAITING_FOR_HUMAN", remote_control={"state": "degraded"})]
+        out = run_ui("#/", {ME[0]: ME[1], "GET /api/v1/sessions": [200, {"sessions": sessions}]})
+        text = out["all"]
+        for expected in ("Active sessions", "Nova", "RUNNING", "Vertex", "WAITING FOR HUMAN", "Approval required", "Remote Control: Healthy", "Remote Control: Degraded"):
+            self.assertIn(expected, text)
+        self.assertIn("+ New Session", out["buttons"])
+
+    def test_session_view_shows_everything_needed(self):
+        out = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view()]})
+        text = out["all"]
+        for expected in ("Nova", "RUNNING", "Audit retrieval latency", "Branch: main", "Owner generation: 3", "Remote Control: Healthy", "Instructions pending: 1", "reading tests", "Claude is listening"):
+            self.assertIn(expected, text)
+        for button in ("Send", "Pause", "Resume", "STOP"):
+            self.assertIn(button, out["buttons"])
+        self.assertIn(["textarea", "placeholder", "Tell Claude…"], out["attrs"])
+
+    def test_the_approval_card_shows_the_exact_action_and_binds_the_decision(self):
+        gate = {"id": "ap_" + "1" * 16, "action": "Restart the Nova production service after deploying commit abc123.", "reason": "The updated service cannot take effect until restarted.", "nonce": "N0NCE", "status": "pending", "bound_epoch": 3}
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(state="WAITING_FOR_HUMAN", human_gate=gate)],
+                  "POST /api/v1/sessions/%s/approvals/%s/approve" % (LSID, gate["id"]): [200, view()]}
+        out = run_ui("#/s/" + LSID, routes, [{"click": "APPROVE"}])
+        text = out["all"]
+        for expected in ("APPROVAL REQUIRED", "Project: Nova", "Requested action:", gate["action"], "Reason:", gate["reason"], "not a Claude permission prompt"):
+            self.assertIn(expected, text)
+        self.assertIn("DENY", out["buttons"])
+        self.assertIn("APPROVE", out["buttons"])
+        post = [c for c in out["calls"] if c["method"] == "POST"][0]
+        self.assertTrue(post["path"].endswith("/approvals/%s/approve" % gate["id"]))
+        self.assertEqual(sorted(post["body"]), ["nonce", "owner_epoch", "request_id"])
+        self.assertEqual((post["body"]["nonce"], post["body"]["owner_epoch"]), ("N0NCE", 3))
+        self.assertEqual(post["headers"]["X-CSRF-Token"], "csrf-token-1")
+
+    def test_a_stale_approval_is_reported_not_hidden(self):
+        gate = {"id": "ap_" + "2" * 16, "action": "Deploy", "reason": "r", "nonce": "n", "status": "pending", "bound_epoch": 3}
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(state="WAITING_FOR_HUMAN", human_gate=gate)],
+                  "POST /api/v1/sessions/%s/approvals/%s/deny" % (LSID, gate["id"]): [409, {"error": "refused", "reason": "stale: ownership changed"}]}
+        out = run_ui("#/s/" + LSID, routes, [{"click": "DENY"}])
+        self.assertIn("Refused: stale: ownership changed", out["all"])
+
+    def test_stop_needs_a_deliberate_confirmation(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view()], "POST /api/v1/sessions/%s/stop" % LSID: [200, view(state="STOPPED")]}
+        out = run_ui("#/s/" + LSID, routes, [{"click": "STOP"}])
+        self.assertIn("Confirm STOP", out["buttons"])
+        self.assertEqual([c for c in out["calls"] if c["method"] == "POST"], [])  # one tap does nothing
+        out = run_ui("#/s/" + LSID, routes, [{"click": "STOP"}, {"click": "Confirm STOP"}])
+        post = [c for c in out["calls"] if c["method"] == "POST"][0]
+        self.assertTrue(post["path"].endswith("/stop"))
+        self.assertEqual(post["body"]["hard"], False)
+
+    def test_clearing_a_stop_needs_a_reason(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(state="STOPPED", stop={"active": True})],
+                  "POST /api/v1/sessions/%s/resume" % LSID: [200, view()]}
+        out = run_ui("#/s/" + LSID, routes, [{"click": "Resume…"}, {"click": "Clear STOP"}])
+        self.assertEqual([c for c in out["calls"] if c["method"] == "POST"], [])
+        self.assertIn("Give a reason.", out["all"])
+        out = run_ui("#/s/" + LSID, routes, [{"click": "Resume…"}, {"type": "input", "value": "reviewed the diff"}, {"click": "Clear STOP"}])
+        post = [c for c in out["calls"] if c["method"] == "POST"][0]
+        self.assertEqual((post["body"]["clear_stop"], post["body"]["reason"]), (True, "reviewed the diff"))
+
+    def test_sending_an_instruction(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view()], "POST /api/v1/sessions/%s/instructions" % LSID: [202, {"message_id": "im_1", "seq": 2}]}
+        out = run_ui("#/s/" + LSID, routes, [{"type": "textarea", "value": "also check the tests"}, {"click": "Send"}])
+        post = [c for c in out["calls"] if c["method"] == "POST"][0]
+        self.assertEqual(post["body"]["text"], "also check the tests")
+        self.assertRegex(post["body"]["request_id"], r"^[A-Za-z0-9._:-]{8,80}$")
+
+    def test_orphaned_sessions_offer_deliberate_recovery_only(self):
+        out = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(state="ORPHANED", orphaned={"reason": "the bound Claude process has exited"})]})
+        self.assertIn("Claude stopped responding.", out["all"])
+        self.assertIn("It will not be replaced automatically.", out["all"])
+        self.assertIn("Re-check", out["buttons"])
+        self.assertIn("Abandon", out["buttons"])
+
+    # ---- the instruction box must survive polling (iPhone Safari copy/paste, keyboard, draft) ----
+
+    def session_routes(self, **over):
+        return {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(**over)],
+                "POST /api/v1/sessions/%s/instructions" % LSID: [202, {"message_id": "im_1", "seq": 2}]}
+
+    def newer(self, text="a brand new output line", **over):
+        return {"routes": {"GET /api/v1/sessions/" + LSID: [200, view(recent_output=[{"ts": "t", "text": text}], **over)]}}
+
+    def box(self, snap):
+        return [b for b in snap["boxes"] if b["tag"] == "textarea"]
+
+    def test_the_instruction_box_is_never_recreated_by_polling(self):
+        steps = [{"snap": "a"}, {"type": "textarea", "value": "half-typed draft"}, {"snap": "b"}, self.newer(), {"poll": True}, {"snap": "c"},
+                 self.newer("and another one"), {"poll": True}, {"poll": True}, {"snap": "d"}]  # never focused: refreshes freely
+        out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
+        first = self.box(out["a"])
+        self.assertEqual(len(first), 1)
+        for later in ("b", "c", "d"):
+            self.assertEqual(self.box(out[later]), [dict(first[0], value=self.box(out[later])[0]["value"])])  # same node
+        self.assertEqual(self.box(out["d"])[0]["value"], "half-typed draft")  # the draft never disappears
+        self.assertIn("and another one", out["d"]["text"])  # the page still refreshes around it
+
+    def test_an_empty_focused_box_is_not_replaced_either(self):
+        """The original bug: an empty box with the paste menu open was rebuilt on every poll."""
+        steps = [{"snap": "a"}, {"focus": "textarea"}, self.newer(), {"poll": True}, {"poll": True}, {"snap": "b"}]
+        out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
+        self.assertEqual(self.box(out["a"])[0]["uid"], self.box(out["b"])[0]["uid"])
+
+    def test_the_layout_is_held_still_while_focused_and_for_a_quiet_period_after(self):
+        """iOS can blur the box while its own paste dialog is up: nothing may shift around it then."""
+        steps = [{"focus": "textarea"}, {"type": "textarea", "value": "pasted text"}, {"snap": "a"}, self.newer("changed while typing"), {"poll": True},
+                 {"snap": "b"}, {"blur": True}, {"poll": True}, {"snap": "c"}, {"advance": 9000}, {"poll": True}, {"snap": "d"}]
+        out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
+        self.assertNotIn("changed while typing", out["b"]["text"])  # focused: nothing shifts
+        self.assertNotIn("changed while typing", out["c"]["text"])  # just blurred (the paste dialog case): still held
+        self.assertIn("changed while typing", out["d"]["text"])  # applied by a later poll once quiet
+        self.assertEqual([b["uid"] for b in self.box(out["a"])], [b["uid"] for b in self.box(out["d"])])
+        self.assertEqual(self.box(out["d"])[0]["value"], "pasted text")
+
+    def test_something_the_user_must_not_miss_is_shown_even_while_typing(self):
+        gate = {"id": "ap_" + "3" * 16, "action": "Deploy build abc123", "reason": "needed", "nonce": "n", "status": "pending", "bound_epoch": 3}
+        steps = [{"focus": "textarea"}, {"type": "textarea", "value": "my draft"}, {"snap": "a"},
+                 self.newer(state="WAITING_FOR_HUMAN", human_gate=gate), {"poll": True}, {"snap": "b"}]
+        out = run_ui("#/s/" + LSID, self.session_routes(), steps)["snaps"]
+        self.assertIn("APPROVAL REQUIRED", out["b"]["text"])
+        self.assertIn("Deploy build abc123", out["b"]["text"])
+        self.assertEqual(self.box(out["a"])[0]["uid"], self.box(out["b"])[0]["uid"])
+        self.assertEqual(self.box(out["b"])[0]["value"], "my draft")
+
+    def test_send_clears_on_success_and_keeps_the_draft_on_failure(self):
+        ok = run_ui("#/s/" + LSID, self.session_routes(), [{"type": "textarea", "value": "do the thing"}, {"click": "Send"}, {"snap": "s"}])["snaps"]
+        self.assertEqual(self.box(ok["s"])[0]["value"], "")
+        routes = self.session_routes()
+        routes["POST /api/v1/sessions/%s/instructions" % LSID] = [409, {"error": "refused", "reason": "session is STOPPED"}]
+        bad = run_ui("#/s/" + LSID, routes, [{"type": "textarea", "value": "do the thing"}, {"click": "Send"}, {"snap": "s"}])
+        self.assertEqual(self.box(bad["snaps"]["s"])[0]["value"], "do the thing")  # kept for a retry
+        self.assertIn("Refused: session is STOPPED", bad["all"])
+        gone = self.session_routes()
+        gone["POST /api/v1/sessions/%s/instructions" % LSID] = [401, {"error": "unauthorized"}]
+        auth = run_ui("#/s/" + LSID, gone, [{"type": "textarea", "value": "keep me"}, {"click": "Send"}])
+        self.assertTrue(any(c["path"].endswith("/instructions") for c in auth["calls"]))
+
+    def test_a_reason_being_typed_in_the_stop_panel_survives_polling(self):
+        routes = self.session_routes(state="STOPPED", stop={"active": True})
+        steps = [{"click": "Resume\u2026"}, {"type": "input", "value": "reviewed the diff carefully"}, {"snap": "a"}, self.newer(state="STOPPED", stop={"active": True}),
+                 {"poll": True}, {"poll": True}, {"snap": "b"}]
+        out = run_ui("#/s/" + LSID, routes, steps)["snaps"]
+        def inputs(snap):
+            return [b for b in snap["boxes"] if b["tag"] == "input"]
+
+        self.assertEqual(inputs(out["a"]), inputs(out["b"]))
+        self.assertEqual(inputs(out["b"])[0]["value"], "reviewed the diff carefully")
+
+    def test_unchanged_data_causes_no_redraw_and_the_box_has_no_ios_text_mangling(self):
+        out = run_ui("#/s/" + LSID, self.session_routes(), [{"poll": True}, {"poll": True}])
+        attrs = {a[1]: a[2] for a in out["attrs"] if a[0] == "textarea"}
+        self.assertEqual((attrs["autocapitalize"], attrs["autocorrect"], attrs["spellcheck"]), ("off", "off", "false"))
+
+    def test_the_session_page_polling_and_controls_still_work(self):
+        routes = self.session_routes()
+        routes["POST /api/v1/sessions/%s/pause" % LSID] = [200, view(state="PAUSED", paused=True)]
+        out = run_ui("#/s/" + LSID, routes, [{"poll": True}, {"click": "Pause"}])
+        self.assertTrue([c for c in out["calls"] if c["method"] == "POST" and c["path"].endswith("/pause")])
+        self.assertGreaterEqual(len([c for c in out["calls"] if c["method"] == "GET" and c["path"].endswith(LSID)]), 3)  # initial + poll + refresh
+
+    def test_hostile_text_is_rendered_as_text(self):
+        evil = "<img src=x onerror=alert(1)><script>alert(2)</script>"
+        out = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(title=evil, recent_output=[{"ts": "t", "text": evil}])]})
+        self.assertIn(evil, out["all"])  # present verbatim as a text node
+        self.assertEqual([a for a in out["attrs"] if a[1].startswith("on")], [])
+
+    def test_new_session_offers_only_registry_projects_and_no_path_field(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/projects": [200, {"projects": ["nova", "vertex"]}],
+                  "POST /api/v1/sessions": [201, view()]}
+        out = run_ui("#/new", routes, [{"type": "textarea", "value": "Audit first. Do not deploy."}, {"click": "Start Session"}])
+        self.assertEqual(sorted(set(out["inputs"])), ["input", "select", "textarea"])
+        labels = [a[2] for a in out["attrs"] if a[1] == "aria-label"]
+        self.assertEqual(sorted(labels), ["Project", "Session name", "Task"])  # the one text input is the display name, never a path or command
+        self.assertIn("nova", out["texts"])
+        post = [c for c in out["calls"] if c["method"] == "POST"][0]
+        self.assertEqual(sorted(post["body"]), ["project", "request_id", "task"])
+        self.assertEqual(post["body"]["project"], "nova")
+
+    def test_new_session_sends_a_name_only_when_one_is_given(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/projects": [200, {"projects": ["nova"]}], "POST /api/v1/sessions": [201, view()]}
+        blank = run_ui("#/new", routes, [{"type": "textarea", "value": "task"}, {"click": "Start Session"}])
+        self.assertNotIn("name", [c for c in blank["calls"] if c["method"] == "POST"][0]["body"])
+        named = run_ui("#/new", routes, [{"type": "input", "value": "  Nova Voice Fix "}, {"type": "textarea", "value": "task"}, {"click": "Start Session"}])
+        self.assertEqual([c for c in named["calls"] if c["method"] == "POST"][0]["body"]["name"], "Nova Voice Fix")
+        self.assertIn(["input", "maxlength", "60"], named["attrs"])
+
+    def test_names_show_in_the_list_and_on_the_session_page(self):
+        s = view(name="Nova Voice Fix")
+        lst = run_ui("#/", {ME[0]: ME[1], "GET /api/v1/sessions": [200, {"sessions": [s, view(logical_session_id="ls_" + "b" * 24)]}]})
+        self.assertIn("Nova Voice Fix", lst["all"])
+        self.assertIn("Project: Nova", lst["all"])
+        page = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, s]})
+        self.assertIn("Nova Voice Fix", page["all"])
+        self.assertIn("Rename", page["buttons"])
+        plain = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view()]})
+        self.assertIn("Nova", plain["all"])  # no custom name: the default label
+
+    def test_renaming_from_the_phone(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(name="Remote scratch")],
+                  "POST /api/v1/sessions/%s/rename" % LSID: [200, view(name="Nova Voice Fix")]}
+        out = run_ui("#/s/" + LSID, routes, [{"click": "Rename"}, {"snap": "open"}, {"type": "input", "value": "Nova Voice Fix"}, {"click": "Save name"}])
+        self.assertIn("Rename this session", out["snaps"]["open"]["text"])
+        self.assertEqual([b["value"] for b in out["snaps"]["open"]["boxes"] if b["tag"] == "input"], ["Remote scratch"])  # prefilled
+        post = [c for c in out["calls"] if c["method"] == "POST"][0]
+        self.assertTrue(post["path"].endswith("/rename"))
+        self.assertEqual(sorted(post["body"]), ["name", "request_id"])
+        self.assertEqual(post["body"]["name"], "Nova Voice Fix")
+
+    def test_the_rename_box_survives_polling_and_never_touches_the_instruction_box(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view()]}
+        steps = [{"type": "textarea", "value": "half-typed instruction"}, {"click": "Rename"}, {"type": "input", "value": "New nam"}, {"snap": "a"},
+                 self.newer("output moved on"), {"poll": True}, {"poll": True}, {"snap": "b"}]
+        out = run_ui("#/s/" + LSID, routes, steps)["snaps"]
+        self.assertEqual(out["a"]["boxes"], out["b"]["boxes"])  # both boxes: same nodes, same text
+        self.assertEqual(sorted(b["value"] for b in out["b"]["boxes"]), ["New nam", "half-typed instruction"])
+
+    def test_the_rename_panel_opens_at_the_top_where_the_button_is(self):
+        """A phone user pressed Rename and saw nothing: the panel had opened below the fold."""
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(name="Remote scratch")]}
+        out = run_ui("#/s/" + LSID, routes, [{"click": "Rename"}, {"snap": "open"}])["snaps"]["open"]["text"]
+        self.assertIn("Rename this session", out)
+        self.assertLess(out.index("Rename this session"), out.index("Current task"))  # above the details
+        self.assertLess(out.index("Rename this session"), out.index("Recent output"))
+        self.assertLess(out.index("Rename this session"), out.index("Instructions pending"))
+
+    def test_saving_or_cancelling_closes_the_panel_and_a_refused_name_keeps_it_open(self):
+        base = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(name="Old")]}
+        ok = dict(base, **{"POST /api/v1/sessions/%s/rename" % LSID: [200, view(name="New")]})
+        saved = run_ui("#/s/" + LSID, ok, [{"click": "Rename"}, {"type": "input", "value": "New"}, {"click": "Save name"}, {"snap": "s"}])["snaps"]["s"]
+        self.assertNotIn("Rename this session", saved["text"])
+        self.assertIn("Renamed.", saved["text"])
+        cancelled = run_ui("#/s/" + LSID, ok, [{"click": "Rename"}, {"click": "Cancel"}, {"snap": "c"}])
+        self.assertNotIn("Rename this session", cancelled["snaps"]["c"]["text"])
+        self.assertEqual([c for c in cancelled["calls"] if c["method"] == "POST"], [])
+        bad = dict(base, **{"POST /api/v1/sessions/%s/rename" % LSID: [400, {"error": "bad_request", "reason": "that name looks like an identifier or path"}]})
+        refused = run_ui("#/s/" + LSID, bad, [{"click": "Rename"}, {"type": "input", "value": "../x"}, {"click": "Save name"}, {"snap": "r"}])["snaps"]["r"]
+        self.assertIn("Refused: that name looks like an identifier or path", refused["text"])
+        self.assertIn("Rename this session", refused["text"])  # still open so the name can be corrected
+
+    def test_a_hostile_name_is_only_ever_text(self):
+        evil = "<img src=x onerror=alert(1)>"
+        out = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(name=evil)]})
+        self.assertIn(evil, out["all"])
+        self.assertEqual([a for a in out["attrs"] if a[1].startswith("on")], [])
+
+    def test_a_failed_start_is_reported_plainly(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/projects": [200, {"projects": ["nova"]}],
+                  "POST /api/v1/sessions": [503, {"error": "isolation_unverified", "reason": "permission isolation has not been verified"}]}
+        out = run_ui("#/new", routes, [{"type": "textarea", "value": "task"}, {"click": "Start Session"}])
+        self.assertIn("Not started: permission isolation has not been verified", out["all"])
+
+
+if __name__ == "__main__":
+    unittest.main()

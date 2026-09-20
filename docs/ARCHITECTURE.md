@@ -374,3 +374,48 @@ So the split is deliberately a **naming layer**, not a rewrite:
 - If a later release genuinely needs the physical split, the facades are already the seams to split along, and their public names will not change.
 
 This is recorded here rather than left implicit, because a reader who opens `detector.py` and finds only imports deserves to know it was a choice.
+
+## Automatic continuation and logical sessions
+
+The transfer state machine above is unchanged and remains the only authority
+for ownership. Two layers sit on top of it:
+
+* **Continuation** (`continuation` command): after `TRANSFER_COMPLETE` the
+  verified successor - and only it - verifies Remote Control, records phases
+  (`SUCCESSOR_OWNER`, `REMOTE_CONTROL_VERIFYING`, `RUNNING`, `DEGRADED_REMOTE`,
+  `WAITING_FOR_HUMAN`) and receives a machine-readable directive
+  (`WAIT`, `CONTINUE`, `HOLD_FOR_HUMAN`, `HALT`, `STOP`).
+* **Logical sessions**: a registry object with a fencing `owner_epoch`. A
+  transfer is adopted only if its parent is the registered owner, so a forged or
+  replayed link cannot move ownership.
+
+```mermaid
+sequenceDiagram
+    participant A as Claude A (owner, epoch 1)
+    participant TH as Terminal Handoff
+    participant B as Claude B
+    participant L as Logical session
+    A->>TH: threshold reached
+    TH->>B: launch successor (read-only until owner)
+    B->>TH: heartbeats verify model, effort, cwd, chain
+    TH->>A: one graceful stop (identity re-proved)
+    TH->>TH: TRANSFER_COMPLETE
+    B->>L: adopt (parent == registered owner) -> epoch 2
+    L-->>B: inbox, pending approval, STOP state carried over
+    B->>B: Remote Control verified, continue the task
+```
+
+See [REMOTE_CONTROL.md](REMOTE_CONTROL.md) for the gateway, approvals, STOP,
+recovery and threat model, and
+[decisions/0004-remote-session-control.md](decisions/0004-remote-session-control.md).
+
+## Orphaned trigger claims
+
+The automatic trigger takes a one-shot claim (`triggered/<session>`) and then spawns the launcher.
+If the status-line process dies in between (for example it is cancelled while the agent is busy),
+the claim used to strand the session: it reported "already handed off" and never launched. The
+parent is now bound *before* the claim, shrinking that window to a single spawn, and an
+**orphaned** automatic claim is released so the next status-line run retries: it must be at least
+45 s old, its claimant process gone (or over 5 minutes old), and no launch may have left any trace
+(manifest, transfer, launch script, completed or failed record). Recovery is bounded to three
+attempts, never touches manual claims, and is skipped by `evaluate --no-record`.

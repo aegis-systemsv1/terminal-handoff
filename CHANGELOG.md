@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-20
+
+This is the milestone that turns Terminal Handoff from basic session transfer into persistent remote Claude Code session control: a logical session that outlives individual Claude processes, hands off automatically, and can be started and steered from an enrolled iPhone over Tailscale while Claude keeps running on the Mac. Physical iPhone acceptance completed 2026-09-20 (see docs/ACCEPTANCE.md).
+
+### Added
+
+- **Automatic continuation.** After `TRANSFER_COMPLETE` the successor verifies
+  Remote Control and continues the unfinished, already-authorised work instead
+  of waiting. New `continuation` command (`wait`, `gate`, `resume`, `status`,
+  `remote-check`); machine-readable human gates; lifecycle phases recorded on
+  the transfer. Continuation is never automatic approval.
+- **Remote Control.** Successors are launched with `--remote-control`; health
+  is verified from Claude's live session record and mirrored to the logical
+  session. Failure records `DEGRADED_REMOTE`, alerts once and keeps working.
+- **Logical sessions.** A durable registry object above disposable Claude
+  sessions: fenced owner epoch, STOP/pause that survive handoffs and restarts,
+  a durable ordered instruction inbox, approvals, owner health.
+- **Remote gateway and mobile UI** (`remote` command): loopback-only HTTP
+  gateway behind Tailscale, per-device revocable expiring tokens, CSRF/Origin/
+  Host checks, persistent lockouts, a mobile web interface with no inline
+  script. See [docs/REMOTE_CONTROL.md](docs/REMOTE_CONTROL.md).
+- **Project registry and permission profiles** (`project` command), fail-closed
+  validation, per-session `--settings` with `--setting-sources ""`, and
+  `remote verify-isolation`.
+- **Remote session creation** started from a phone and run on the Mac.
+- **Terminal Handoff approvals** bound to session, request, exact action,
+  owner epoch, nonce and expiry; one-shot; distinct from Claude permission
+  prompts.
+- **Dead-owner detection, ORPHANED state and service-restart recovery.**
+- New notification kinds: `human_gate`, `remote_degraded`, `owner_lost`.
+
+### Added (mobile)
+
+- Optional session names, set at creation and changed from the session page (display metadata only).
+- The instruction box is stable under polling and around iOS focus changes.
+
+### Fixed
+
+- An automatic trigger whose status-line process died after claiming but before launching stranded the session ("already handed off", never launched). The claim is now recoverable and the parent is bound before it is taken.
+
+### Changed
+
+- The single graceful-stop signalling call moved into `send_graceful_stop()`;
+  the parent stop and the logical `--hard` backstop both use it.
+
 ### Fixed
 
 - A successor launched after a launch-time parent-bind failure (an unbindable

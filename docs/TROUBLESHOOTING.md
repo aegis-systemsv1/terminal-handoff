@@ -291,3 +291,7 @@ export CLAUDE_TERMINAL_HANDOFF_DISABLED=1
 in any shell before starting `claude`, or uninstall entirely — see
 [UNINSTALLATION.md](UNINSTALLATION.md). Uninstalling never touches your
 transcripts or repositories.
+
+## Remote control
+
+See the table in [REMOTE_CONTROL.md](REMOTE_CONTROL.md#troubleshooting).

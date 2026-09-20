@@ -177,3 +177,12 @@ To disable all delivery without deleting history, edit
 `~/.claude/terminal-handoff/notifications.json` and set `"enabled": false`, or
 set `CLAUDE_TERMINAL_HANDOFF_DISABLE_NOTIFICATIONS=1` before starting Claude
 Code.
+
+## Human-gate, degraded-remote and lost-session alerts
+
+Three further event kinds use the same outbox and are routed like `failed`
+(they need a person): `human_gate` (an approval is needed, with the exact
+action), `remote_degraded` (Remote Control could not be verified; the session
+keeps running) and `owner_lost` (a session's owner stopped responding and is
+`ORPHANED`). Each is sent once per open request, and a notification failure
+never blocks or rolls back a state change.

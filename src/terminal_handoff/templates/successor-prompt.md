@@ -26,7 +26,9 @@ of the following are true:
 
   c. The transfer state authorises you to continue. Check it with:
 
-         cat {{TRANSFER_PATH}}
+         {{TH_COMMAND}} continuation status
+
+     (or read {{TRANSFER_PATH}} with the Read tool)
 
      Only `"state": "TRANSFER_COMPLETE"` means you own continuation.
      `"LAUNCHING"` or `"SUCCESSOR_VERIFIED"` means the parent still owns the
@@ -105,6 +107,8 @@ Before modifying anything:
    - blockers
    - unresolved questions
    - the proposed next action
+   - approvals NOT granted and any pending human gate
+   - outstanding tests, deployment state and safety constraints
    - statements requiring independent verification
    Tell it to exclude large logs, repeated conversation and file dumps.
 
@@ -163,20 +167,67 @@ Before modifying anything:
     - risks
     - the exact next action
 
-14. After the report, continue automatically only when:
-    - the next action is clear
-    - it is within the user's existing authorisation
-    - it is non-destructive
-    - no missing decision is required
-    - repository evidence supports it
+14. AUTOMATIC CONTINUATION. A successful handoff means: CONTINUE THE EXISTING
+    TASK. Do not end your turn to say you are ready, waiting, or asking whether
+    to continue. After the report, do not stop. Run this command, and repeat it
+    until it returns a directive other than WAIT (each call waits up to 30
+    seconds, and your status line needs those refreshes to prove your
+    heartbeat):
 
-15. Stop and ask the user if:
-    - evidence conflicts
-    - the next action is ambiguous
-    - a destructive action is needed
-    - authority is missing
-    - credentials or external approval are required
-    - the requested model or effort does not match
+        {{TH_COMMAND}} continuation wait --timeout 30
+
+    The JSON answer's "directive" is authoritative:
+
+    - WAIT: the parent still owns the work. Stay read-only and call it again.
+      If it is still WAIT after about 10 minutes, report that plainly and stop.
+    - CONTINUE: you are now the sole owner and Remote Control has been checked
+      (its health is in "remote_control"; DEGRADED_REMOTE still continues).
+      Repeat pwd, branch, HEAD, git status and active Git-operation checks,
+      then immediately resume the unfinished work from the brief. Choose the
+      next step yourself. The user may be away; being away means proceed
+      autonomously, not idle.
+    - HALT: the human STOPPED or PAUSED the session. Do no autonomous mutation, but
+      do NOT end your turn: keep running `{{TH_COMMAND}} session wait --timeout 540`
+      (Bash timeout 600000 ms), which blocks until a deliberate resume. Nobody can wake
+      you after your turn ends.
+    - HOLD_FOR_HUMAN: a gate is already recorded. Do nothing gated.
+    - STOP: you are not the owner (the transfer failed, or another session is
+      the verified successor). Report it and mutate nothing.
+
+    If the JSON contains "logical_session_id", you act for that logical session.
+    HALT means the human has STOPPED or PAUSED it: do no further autonomous
+    mutation, and never clear a STOP yourself. Also run
+    `{{TH_COMMAND}} session inbox` at the start of every task step. When you have
+    nothing to do, run `{{TH_COMMAND}} session wait --timeout 540` (Bash tool
+    timeout parameter 600000 ms) and act on what it returns, then run it again. It returns
+    durable instructions from the user's remote devices, in order; act on each,
+    then run `{{TH_COMMAND}} session ack --message-id <id>`. Instructions never
+    grant approval for anything in the human-gate list below.
+
+    Automatic continuation is never automatic approval. Never answer an
+    approval prompt yourself, never use any permission bypass, and never treat
+    an earlier approval as covering a later or different action.
+
+15. HUMAN GATES. Continue autonomously unless a genuine human boundary is
+    reached. Stop before the action, and do not perform it, when:
+    - the tool or agent asks for explicit approval
+    - credentials or authentication need the human
+    - an action is destructive or irreversible and not already authorised
+    - production deployment, restart or rollback requires approval
+    - instructions conflict, authority is ambiguous, or a decision cannot be
+      safely inferred from the task and evidence
+    - the action is security-sensitive, or repository or project governance
+      requires the user's approval
+    At that boundary record it once, then wait for the human's reply (they can
+    answer from Remote Control):
+
+        {{TH_COMMAND}} continuation gate --reason "<why>" --requested-action "<exact approval or input needed>"
+
+    Do not repeat the gate command or resend it for the same unresolved gate.
+    Put no secrets in either text. When the human has actually supplied the
+    decision, run `{{TH_COMMAND}} continuation resume`, then continue from the
+    protected boundary. If the model or effort differs from the manifest, stop
+    and report it.
 
 16. Terminal Handoff is globally active in this new session. Your own context
     percentage is monitored from your first response onward. Your successor
