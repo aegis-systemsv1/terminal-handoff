@@ -354,7 +354,30 @@ class TestScreens(unittest.TestCase):
                  self.newer("output moved on"), {"poll": True}, {"poll": True}, {"snap": "b"}]
         out = run_ui("#/s/" + LSID, routes, steps)["snaps"]
         self.assertEqual(out["a"]["boxes"], out["b"]["boxes"])  # both boxes: same nodes, same text
-        self.assertEqual([b["value"] for b in out["b"]["boxes"]], ["half-typed instruction", "New nam"])
+        self.assertEqual(sorted(b["value"] for b in out["b"]["boxes"]), ["New nam", "half-typed instruction"])
+
+    def test_the_rename_panel_opens_at_the_top_where_the_button_is(self):
+        """A phone user pressed Rename and saw nothing: the panel had opened below the fold."""
+        routes = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(name="Remote scratch")]}
+        out = run_ui("#/s/" + LSID, routes, [{"click": "Rename"}, {"snap": "open"}])["snaps"]["open"]["text"]
+        self.assertIn("Rename this session", out)
+        self.assertLess(out.index("Rename this session"), out.index("Current task"))  # above the details
+        self.assertLess(out.index("Rename this session"), out.index("Recent output"))
+        self.assertLess(out.index("Rename this session"), out.index("Instructions pending"))
+
+    def test_saving_or_cancelling_closes_the_panel_and_a_refused_name_keeps_it_open(self):
+        base = {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(name="Old")]}
+        ok = dict(base, **{"POST /api/v1/sessions/%s/rename" % LSID: [200, view(name="New")]})
+        saved = run_ui("#/s/" + LSID, ok, [{"click": "Rename"}, {"type": "input", "value": "New"}, {"click": "Save name"}, {"snap": "s"}])["snaps"]["s"]
+        self.assertNotIn("Rename this session", saved["text"])
+        self.assertIn("Renamed.", saved["text"])
+        cancelled = run_ui("#/s/" + LSID, ok, [{"click": "Rename"}, {"click": "Cancel"}, {"snap": "c"}])
+        self.assertNotIn("Rename this session", cancelled["snaps"]["c"]["text"])
+        self.assertEqual([c for c in cancelled["calls"] if c["method"] == "POST"], [])
+        bad = dict(base, **{"POST /api/v1/sessions/%s/rename" % LSID: [400, {"error": "bad_request", "reason": "that name looks like an identifier or path"}]})
+        refused = run_ui("#/s/" + LSID, bad, [{"click": "Rename"}, {"type": "input", "value": "../x"}, {"click": "Save name"}, {"snap": "r"}])["snaps"]["r"]
+        self.assertIn("Refused: that name looks like an identifier or path", refused["text"])
+        self.assertIn("Rename this session", refused["text"])  # still open so the name can be corrected
 
     def test_a_hostile_name_is_only_ever_text(self):
         evil = "<img src=x onerror=alert(1)>"

@@ -7695,7 +7695,7 @@ UI_APP_JS = r"""
   // redrawn by polling, so focus, cursor, selection, the iOS paste menu and the draft survive.
   function renderSession(id) {
     stop(); clear();
-    var head = el('div'), tail = el('div'), composer = el('div');
+    var head = el('div'), tail = el('div'), composer = el('div'), renameBox = el('div');
     var flash = el('p', { 'class': 'note', text: '' });
     var text = el('textarea', { placeholder: 'Tell Claude…', 'aria-label': 'Instruction', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
     var sending = false, view = null, panel = null, lastKey = null, lastImportant = null, lastFocusEvent = 0;
@@ -7704,7 +7704,7 @@ UI_APP_JS = r"""
     var sendBtn = el('button', { text: 'Send', onclick: send });
     composer.appendChild(text); composer.appendChild(sendBtn);
     app.appendChild(el('a', { 'class': 'back', href: '#/', text: '‹ Sessions' }));
-    app.appendChild(flash); app.appendChild(head); app.appendChild(composer); app.appendChild(tail);
+    app.appendChild(flash); app.appendChild(renameBox); app.appendChild(head); app.appendChild(composer); app.appendChild(tail);
 
     function post(path, body, ok) {
       return api('POST', path, Object.assign({ request_id: rid() }, body)).then(function (r) {
@@ -7725,6 +7725,27 @@ UI_APP_JS = r"""
         if (r && r.status >= 200 && r.status < 300 && text.value === v) text.value = '';
       }, function () { sending = false; sendBtn.disabled = false; flash.textContent = 'Not sent. Your text is kept.'; });
     }
+    // The rename panel sits at the TOP, directly under the title, in its own container that polling
+    // never rebuilds. (It must be visible where the Rename button is, not below the controls.)
+    function closeRename() { while (renameBox.firstChild) renameBox.removeChild(renameBox.firstChild); }
+    function openRename() {
+      closeRename();
+      var nm = el('input', { type: 'text', maxlength: '60', placeholder: 'Session name', 'aria-label': 'Session name', autocomplete: 'off' });
+      nm.value = (view && view.name) || '';
+      renameBox.appendChild(el('div', { 'class': 'card' }, [
+        el('strong', { text: 'Rename this session' }),
+        el('div', { 'class': 'muted', text: 'A label for you only. Nothing about the session changes. Leave blank to use the default.' }), nm,
+        el('div', { 'class': 'grid2' }, [
+          el('button', { 'class': 'secondary', text: 'Cancel', onclick: closeRename }),
+          el('button', { text: 'Save name', onclick: function () {
+            api('POST', '/api/v1/sessions/' + id + '/rename', { name: nm.value, request_id: rid() }).then(function (r) {
+              if (r.status === 401) return boot();
+              if (r.status >= 200 && r.status < 300) { closeRename(); flash.textContent = 'Renamed.'; load(); }
+              else flash.textContent = 'Refused: ' + ((r.data && (r.data.reason || r.data.error)) || ('error ' + r.status));
+            });
+          } })])]));
+      if (renameBox.scrollIntoView) renameBox.scrollIntoView({ block: 'nearest' });
+    }
     function control(path, body, ok) { panel = null; return post(path, body, ok).then(function (r) { drawTail(true); return r; }); }
     function decide(gate, decision) {
       return post('/api/v1/sessions/' + id + '/approvals/' + gate.id + '/' + decision,
@@ -7734,7 +7755,7 @@ UI_APP_JS = r"""
       var s = view;
       while (head.firstChild) head.removeChild(head.firstChild);
       head.appendChild(el('div', { 'class': 'row' }, [el('h2', { text: s.name || s.project || 'Session' }), stateEl(s.state)]));
-      head.appendChild(el('button', { 'class': 'secondary', text: 'Rename', onclick: function () { panel = 'rename'; drawTail(true); } }));
+      head.appendChild(el('button', { 'class': 'secondary', text: 'Rename', onclick: openRename }));
       if (s.human_gate) {
         var g = s.human_gate;
         head.appendChild(el('div', { 'class': 'card gate' }, [
@@ -7778,16 +7799,6 @@ UI_APP_JS = r"""
       while (tail.firstChild) tail.removeChild(tail.firstChild);
       var ended = view.state === 'FAILED' || view.state === 'COMPLETED';
       composer.hidden = ended;
-      if (panel === 'rename') {
-        var nm = el('input', { type: 'text', maxlength: '60', placeholder: 'Session name', 'aria-label': 'Session name', autocomplete: 'off' });
-        nm.value = view.name || '';
-        tail.appendChild(el('div', { 'class': 'card' }, [
-          el('strong', { text: 'Rename this session' }),
-          el('div', { 'class': 'muted', text: 'A label for you only. Nothing about the session changes. Leave blank to use the default.' }), nm,
-          el('div', { 'class': 'grid2' }, [
-            el('button', { 'class': 'secondary', text: 'Cancel', onclick: function () { panel = null; drawTail(true); } }),
-            el('button', { text: 'Save name', onclick: function () { control('/api/v1/sessions/' + id + '/rename', { name: nm.value }, 'Renamed.'); } })])]));
-      }
       if (ended) return;
       var stopped = view.state === 'STOPPED';
       tail.appendChild(el('div', { 'class': 'grid3' }, [
