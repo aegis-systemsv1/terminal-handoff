@@ -8043,6 +8043,8 @@ def cmd_remote(args):
             config["port"] = args.port
         if args.public_port:
             config["public_port"] = args.public_port
+        if args.permission_mode:
+            config["permission_mode"] = args.permission_mode
         write_json_private(remote_config_path(), config)
         problems = remote_config_problems(config)
         print(json.dumps(config, indent=2))
@@ -8268,6 +8270,34 @@ def agent_read_allow_rules(repository=None):
     return rules
 
 
+# The user's own choice of Claude permission mode is preserved, never chosen or
+# overridden by Terminal Handoff. It is never passed on argv (`--permission-mode` stays
+# forbidden), only written as `permissions.defaultMode` in the per-session settings.
+# `bypassPermissions` and `dontAsk` are never carried, whatever the source says.
+CARRIED_PERMISSION_MODES = ("auto", "default", "acceptEdits", "plan")
+
+
+def claude_config_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR", "").strip() or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def _user_claude_settings():
+    try:
+        data = read_json(os.path.join(claude_config_dir(), "settings.json"), {}) or {}
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def selected_permission_mode():
+    """The mode to carry: the gateway's configured `permission_mode`, else the user's own default."""
+    configured = remote_config().get("permission_mode")
+    if configured in CARRIED_PERMISSION_MODES:
+        return configured
+    user_mode = (_user_claude_settings().get("permissions") or {}).get("defaultMode")
+    return user_mode if user_mode in CARRIED_PERMISSION_MODES else None
+
+
 def write_permission_settings(lsid, profile, repository=None):
     """The whole settings a remote session runs with (user/project/local are excluded).
 
@@ -8282,11 +8312,21 @@ def write_permission_settings(lsid, profile, repository=None):
             "allow": list(profile["allow"]) + agent_cli_allow_rules() + agent_read_allow_rules(repository),
             "deny": list(profile.get("deny", [])),
             "disableBypassPermissionsMode": "disable",
-            "disableAutoMode": "disable",
         },
         "statusLine": {"type": "command", "command": remote_statusline_command(), "refreshInterval": 5},
         "hooks": {"Stop": [{"hooks": [{"type": "command", "command": hook, "timeout": 10}]}]},
     }
+    mode = selected_permission_mode()
+    if mode:
+        settings["permissions"]["defaultMode"] = mode
+        if mode == "auto":
+            # Auto mode is the user's choice: carry their own classifier context too,
+            # since the user settings that normally hold it are not loaded here.
+            user_auto = _user_claude_settings().get("autoMode")
+            if isinstance(user_auto, dict):
+                settings["autoMode"] = user_auto
+    else:
+        settings["permissions"]["disableAutoMode"] = "disable"  # no mode chosen: never turn auto mode on implicitly
     write_json_private(path, settings)
     return path
 
@@ -10089,6 +10129,8 @@ def main(argv=None):
     p.add_argument("--tailscale-user", default=None)
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--public-port", type=int, default=None, help="the HTTPS port `tailscale serve` publishes on")
+    p.add_argument("--permission-mode", choices=CARRIED_PERMISSION_MODES, default=None,
+                   help="the Claude permission mode remote sessions and successors keep (never bypass)")
     p.add_argument("--name", default=None)
     p.add_argument("--ttl-days", type=int, default=DEFAULT_DEVICE_TTL_DAYS)
     p.add_argument("--device", default=None)

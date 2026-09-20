@@ -190,3 +190,8 @@ webhook secret itself. Full channel, retry, presence and SMS setup is in
 Gateway settings live in `remote/config.json`, projects in `remote/projects.json`,
 devices in `remote/devices.json`; all are mode 0600. See
 [REMOTE_CONTROL.md](REMOTE_CONTROL.md).
+
+Gateway `remote/config.json` also accepts `permission_mode` (`auto`, `default`,
+`acceptEdits`, `plan`), set with `remote configure --permission-mode`. It is the Claude
+mode remote sessions and their successors keep; Terminal Handoff never sets any other
+and never passes a mode on the command line.

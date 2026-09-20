@@ -40,6 +40,9 @@ class LaunchCase(LogicalCase):
         CORE.project_add("nova", self.repo)
         CORE.project_set_permissions("nova", good_profile())
         CORE.project_set_remote_launch("nova", True)
+        self._config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(self.tmp, "claude-config")  # never read the real user's settings
+        os.makedirs(os.environ["CLAUDE_CONFIG_DIR"])
         self.launched = []
         self.script_texts = []
         self.script_modes = []
@@ -56,6 +59,10 @@ class LaunchCase(LogicalCase):
         if self.server:
             self.server.shutdown()
             self.server.server_close()
+        if self._config_dir is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self._config_dir
         for key, saved in (("CLAUDE_TERMINAL_HANDOFF_CLAUDE_SESSIONS_DIR", self._sessions_env),
                            ("CLAUDE_TERMINAL_HANDOFF_CLAUDE_BIN", self._bin_env)):
             if saved is None:
@@ -303,7 +310,7 @@ class TestNoInjection(LaunchCase):
         path = CORE.th_path("remote", "profiles", "%s.json" % view["logical_session_id"])
         settings = json_file(path)
         self.assertEqual(sorted(settings), ["hooks", "permissions", "statusLine"])
-        self.assertEqual(sorted(settings["permissions"]), ["allow", "deny", "disableAutoMode", "disableBypassPermissionsMode"])
+        self.assertEqual(sorted(settings["permissions"]), ["allow", "deny", "disableAutoMode", "disableBypassPermissionsMode"])  # no mode chosen
         self.assertEqual(settings["permissions"]["disableBypassPermissionsMode"], "disable")
         allow = settings["permissions"]["allow"]
         self.assertEqual(allow[: len(good_profile()["allow"])], good_profile()["allow"])
@@ -317,6 +324,61 @@ class TestNoInjection(LaunchCase):
         self.assertIn("statusline", settings["statusLine"]["command"])
         self.assertIn("hook-stop", json.dumps(settings["hooks"]))
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+
+class TestPermissionModePreserved(LaunchCase):
+    """Terminal Handoff carries the user's chosen Claude mode; it never picks or overrides one."""
+
+    def settings(self):
+        path = CORE.write_permission_settings("ls_" + "c" * 24, good_profile(), repository=self.real_repo)
+        return json_file(path)
+
+    def test_no_mode_chosen_means_none_is_set_and_auto_is_not_enabled_implicitly(self):
+        s = self.settings()
+        self.assertNotIn("defaultMode", s["permissions"])
+        self.assertEqual(s["permissions"]["disableAutoMode"], "disable")
+
+    def test_a_configured_auto_mode_is_carried_with_the_users_auto_context(self):
+        CORE.write_json_private(CORE.remote_config_path(), {"permission_mode": "auto"})
+        with open(os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "settings.json"), "w") as handle:
+            json.dump({"autoMode": {"environment": ["trusted: scratch"], "soft_deny": ["curl"]}}, handle)
+        s = self.settings()
+        self.assertEqual(s["permissions"]["defaultMode"], "auto")
+        self.assertNotIn("disableAutoMode", s["permissions"])  # would contradict the user's own choice
+        self.assertEqual(s["autoMode"], {"environment": ["trusted: scratch"], "soft_deny": ["curl"]})
+        self.assertEqual(s["permissions"]["disableBypassPermissionsMode"], "disable")  # bypass is never a carried mode
+
+    def test_the_users_own_default_mode_is_followed_when_none_is_configured(self):
+        with open(os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "settings.json"), "w") as handle:
+            json.dump({"permissions": {"defaultMode": "acceptEdits"}}, handle)
+        self.assertEqual(self.settings()["permissions"]["defaultMode"], "acceptEdits")
+
+    def test_bypass_and_unknown_modes_are_never_carried(self):
+        for bad in ("bypassPermissions", "dontAsk", "yolo", "", None):
+            CORE.write_json_private(CORE.remote_config_path(), {"permission_mode": bad})
+            with open(os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "settings.json"), "w") as handle:
+                json.dump({"permissions": {"defaultMode": bad}}, handle)
+            self.assertNotIn("defaultMode", self.settings()["permissions"], bad)
+        code, out, _ = run_th(["remote", "configure", "--permission-mode", "bypassPermissions"], env=self.env())
+        self.assertNotEqual(code, 0)  # argparse refuses it
+
+    def test_terminal_handoff_never_passes_a_mode_on_argv(self):
+        argv = CORE.build_remote_launch_argv("/bin/claude", "n", "/s.json", "p")
+        self.assertNotIn("--permission-mode", argv)
+        self.assertIn("--permission-mode", CORE.FORBIDDEN_LAUNCH_TOKENS)
+        self.assertIn("--dangerously-skip-permissions", CORE.FORBIDDEN_LAUNCH_TOKENS)
+
+    def test_successors_inherit_the_same_settings_file_and_so_the_same_mode(self):
+        CORE.write_json_private(CORE.remote_config_path(), {"permission_mode": "auto"})
+        path = CORE.write_permission_settings("ls_" + "d" * 24, good_profile(), repository=self.real_repo)
+        CORE.logical_create(project="nova")
+        lsid = CORE.logical_list()[0]["logical_session_id"]
+        CORE.logical_mutate(lsid, lambda r: r.update(permissions={"settings_file": path}))
+        manifest = {"model": {"id": "claude-opus-5"}, "effort": {"level": "high", "available": True}, "chain_id": "abcdef012345",
+                    "generation": 1, "display": {"successor_display_name": "S 2"}, "logical_session_id": lsid, "outgoing": {"session_id": "p"}}
+        argv = CORE.build_launch_argv(manifest, "/bin/claude", "PROMPT")
+        self.assertEqual(json_file(argv[argv.index("--settings") + 1])["permissions"]["defaultMode"], "auto")
+        self.assertNotIn("--permission-mode", argv)
 
 
 class TestAgentReadRules(LaunchCase):

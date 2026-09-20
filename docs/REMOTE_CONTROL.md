@@ -296,6 +296,39 @@ CLIs and similar; and any profile that drops a mandatory human gate. A hash of
 the validated profile is stored; changing it disables remote launch until you
 re-enable it, and tampering fails closed.
 
+### Your Claude permission mode is preserved
+
+Terminal Handoff never chooses or overrides your permission mode.
+
+* It never passes `--permission-mode` or `--dangerously-skip-permissions`
+  (both stay on the forbidden list).
+* `remote configure --permission-mode auto` records the mode you want remote
+  sessions and their successors to keep (`auto`, `default`, `acceptEdits` or
+  `plan`). If you set none, your own `permissions.defaultMode` is followed. It is
+  written as `permissions.defaultMode` in the per-session settings file, which
+  successors inherit, so the mode survives every handoff. `bypassPermissions` and
+  `dontAsk` are never carried.
+* For `auto`, your own `autoMode` block (classifier environment and `soft_deny`
+  rules) is copied into the session file, because the user settings that hold it
+  are not loaded in an isolated session. If you chose no mode, Auto Mode is
+  explicitly *not* enabled implicitly.
+* Ordinary local handoffs launch an unisolated successor, so your own settings,
+  including Auto Mode, apply exactly as they do for any session you start.
+* **Terminal Handoff STOP and `WAITING_FOR_HUMAN` still take precedence** over any
+  mode, because they are cooperative gates the agent stops at, not permission rules.
+
+Consequence to understand: in Auto Mode Claude's classifier, not the allow list,
+decides most prompts, so a permission profile is a narrower *default* rather than a
+hard boundary. Terminal Handoff's own gates, STOP and the project registry remain in
+force.
+
+**"Accept edits on" in a status bar is Claude's own behaviour, not Terminal
+Handoff.** Terminal Handoff has no code path that sets a mode other than writing
+your chosen `defaultMode`, and a test asserts it never passes a mode on argv.
+Claude lets the mode be cycled at runtime (Shift+Tab) and by clients attached
+through Remote Control; one launched session showed "accept edits on" although it
+started in the default mode, and no Terminal Handoff action changed it.
+
 ### Why `--settings` alone is not a boundary
 
 `--settings <file>` **adds** to your user, project and local settings; lists such
@@ -309,8 +342,9 @@ effective. So a remote session is launched with
 so that **only** the profile applies (managed/organisation settings cannot be
 excluded and still apply). Because your other settings are then not loaded, the
 per-session file also carries the Terminal Handoff status line and the `Stop`
-hook, and sets `permissions.disableBypassPermissionsMode` and
-`disableAutoMode` to `"disable"`. Your own settings files are never edited.
+hook, and sets `permissions.disableBypassPermissionsMode` to `"disable"`. Your own
+settings files are never edited. Your chosen permission mode is carried across
+(see below).
 Successor sessions in the chain inherit the same file.
 
 `--setting-sources` appears in `claude --help` but not in the published
