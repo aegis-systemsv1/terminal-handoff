@@ -262,3 +262,18 @@ disk; an older runtime ignores the fields it does not know.
 ## Uninstall
 
 See [UNINSTALLATION.md](UNINSTALLATION.md).
+
+## Using Grok (optional)
+
+Grok support ships in the same single installed runtime; nothing extra is installed. To use it:
+
+1. Install the Grok CLI and sign in on the Mac (`grok login`). Terminal Handoff finds `grok` on `PATH`,
+   `~/.grok/bin/grok` or `~/.local/bin/grok`.
+2. Make sure `~/.grok/config.toml` does not select always-approve (see [Configuration](CONFIGURATION.md#grok)).
+3. Enable it per project, after the project is registered with a valid profile and remote launch is on:
+   `th project enable-grok <name>`.
+4. `th status` shows a `grok` block: executable, version, whether a login exists, and whether a session would
+   start in ask mode.
+
+The gateway must be restarted after an upgrade for the phone to offer the Agent selector; existing Claude
+sessions keep running because Claude sessions do not depend on the gateway process.

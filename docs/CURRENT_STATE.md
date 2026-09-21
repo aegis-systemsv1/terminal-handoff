@@ -1,7 +1,8 @@
 # Current state
 
-**Version 1.4.0.** Persistent remote Claude Code session control, accepted on a physical iPhone on
-2026-09-20. This is a snapshot for people picking the project up; the authoritative description is the
+**Version 1.5.0.** Persistent remote session control for Claude Code (accepted on a physical iPhone on
+2026-09-20/21) and, new in 1.5.0, Grok (implemented and tested against a mocked ACP agent; **physical iPhone
+acceptance pending**). This is a snapshot for people picking the project up; the authoritative description is the
 [README](../README.md) and [REMOTE_CONTROL.md](REMOTE_CONTROL.md).
 
 ## Capability
@@ -13,6 +14,10 @@
   STOP, resume, approve, recover.
 - Owner-death detection (`ORPHANED`), service-restart recovery, orphaned trigger-claim recovery.
 - Claude Remote Control health reporting; your chosen Claude mode carried across handoffs.
+- **Grok** as a second agent (`agent_type = grok`): a detached ACP bridge is the sole writer; the exact Grok
+  session id is stored and reloaded on reconnect; STOP uses `session/cancel`; Grok permission requests are
+  Terminal Handoff approvals; ask mode by default (refuses to start if Grok is configured always-approve);
+  no automatic A to B handoff for Grok. Per-project opt-in.
 
 ## Production defaults
 

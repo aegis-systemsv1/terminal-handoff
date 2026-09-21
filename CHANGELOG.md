@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-21
+
+Grok is now a second supported agent. Claude Code behaviour is unchanged.
+
+### Added
+
+- **Grok as an agent**, driven over the Agent Client Protocol (`grok agent stdio`) by a detached Terminal
+  Handoff *bridge* that acts as the ACP client and the session's sole writer. A logical session records
+  `agent_type` (`claude` | `grok`); sessions without one are Claude Code. The agent is fixed at creation.
+- **New Session > Agent** (Claude Code by default). Session cards and pages name the agent.
+- Exact Grok session id stored on the logical session; reconnect uses `session/load` on that id and never
+  starts a new conversation.
+- STOP for Grok: `session/cancel`, then the Grok process is ended if it does not stop; queued
+  instructions are not delivered while stopped, and resume restores delivery.
+- Grok permission requests become Terminal Handoff approvals (phone approve/deny answers through ACP,
+  `allow_once` only).
+- Transcript mapping for Grok: replies, tool-call status, lifecycle events. Reasoning is never shown.
+- Per-project opt-in (`th project enable-grok` / `disable-grok`); `/api/v1/projects` also returns the
+  agents each project allows.
+- `th status` gains a `grok` health block (executable, version, credential presence, permission posture,
+  ACP state per session). Credentials are never read.
+- `th session recover --recover-action reattach` (and the phone's Re-check) starts a new bridge for an
+  orphaned Grok session.
+
+### Security
+
+- Grok is never started with `--always-approve` by default. Terminal Handoff refuses to start Grok while
+  `~/.grok/config.toml` selects always-approve, unless `grok_permission_mode` is set to `always-approve`
+  in `remote/config.json`, deliberately.
+- Grok only starts in a registered, enabled project resolved to its pinned realpath; no path is accepted
+  from the phone.
+
+### Not changed
+
+- Claude Code launch, permissions (including Auto Mode), handoff, ownership, STOP, approvals, transcript
+  and archive semantics. Grok has **no** automatic A to B handoff: it uses Grok's own persisted session.
+
 ## [1.4.2] - 2026-09-21
 
 ### Fixed

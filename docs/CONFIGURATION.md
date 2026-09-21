@@ -195,3 +195,18 @@ Gateway `remote/config.json` also accepts `permission_mode` (`auto`, `default`,
 `acceptEdits`, `plan`), set with `remote configure --permission-mode`. It is the Claude
 mode remote sessions and their successors keep; Terminal Handoff never sets any other
 and never passes a mode on the command line.
+
+## Grok
+
+| Setting | Where | Meaning |
+|---|---|---|
+| `th project enable-grok <name>` / `disable-grok` | project registry | Whether Grok may be launched in that project (Claude is always allowed). Off by default. |
+| `grok_permission_mode` | `~/.claude/terminal-handoff/remote/config.json` | `ask` (default) or `always-approve`. **Only set `always-approve` deliberately.** When `ask`, Terminal Handoff refuses to start Grok while `~/.grok/config.toml` selects always-approve. When `always-approve`, `--always-approve` is passed and recorded in the audit log. |
+| `grok_sandbox` | `remote/config.json` | Optional Grok OS sandbox profile passed to the Grok process as `GROK_SANDBOX`: `workspace` (writes only to the project, `~/.grok` and temp), `read-only` or `strict`. **Off by default**; anything else is ignored. Recommended for `scratch`-style use once you have tried it, but not validated against a live Grok turn in 1.5.0. |
+| `CLAUDE_TERMINAL_HANDOFF_GROK_BIN` | environment | Override the Grok executable (default: `grok` on `PATH`, then `~/.grok/bin/grok`, then `~/.local/bin/grok`). |
+| `CLAUDE_TERMINAL_HANDOFF_GROK_STOP_GRACE` | environment | Seconds to wait after `session/cancel` before ending the Grok process (default 10). |
+| `GROK_HOME` | environment | Grok's own home, honoured when checking for a login and reading its permission posture. |
+
+Grok uses your existing local login (`grok login`). To have Terminal Handoff start Grok in ask mode, set
+`[ui] permission_mode = "ask"` (or remove the always-approve setting) in `~/.grok/config.toml`; the file is
+never edited by Terminal Handoff.

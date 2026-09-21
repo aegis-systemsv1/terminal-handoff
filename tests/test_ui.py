@@ -339,11 +339,49 @@ class TestScreens(unittest.TestCase):
         out = run_ui("#/new", routes, [{"type": "textarea", "value": "Audit first. Do not deploy."}, {"click": "Start Session"}])
         self.assertEqual(sorted(set(out["inputs"])), ["input", "select", "textarea"])
         labels = [a[2] for a in out["attrs"] if a[1] == "aria-label"]
-        self.assertEqual(sorted(labels), ["Project", "Session name", "Task"])  # the one text input is the display name, never a path or command
+        self.assertEqual(sorted(labels), ["Agent", "Project", "Session name", "Task"])  # Agent is a fixed choice; the one text input is the display name, never a path or command
         self.assertIn("nova", out["texts"])
         post = [c for c in out["calls"] if c["method"] == "POST"][0]
         self.assertEqual(sorted(post["body"]), ["project", "request_id", "task"])
         self.assertEqual(post["body"]["project"], "nova")
+
+    def test_new_session_defaults_to_claude_and_sends_grok_only_when_chosen(self):
+        routes = {ME[0]: ME[1], "GET /api/v1/projects": [200, {"projects": ["scratch"], "agents": {"scratch": ["claude", "grok"]}}],
+                  "POST /api/v1/sessions": [201, view()]}
+        default = run_ui("#/new", routes, [{"type": "textarea", "value": "task"}, {"click": "Start Session"}])
+        self.assertIn("Claude Code", default["texts"])
+        self.assertIn("Grok", default["texts"])
+        self.assertNotIn("agent", [c for c in default["calls"] if c["method"] == "POST"][0]["body"])  # exactly the v1.4.2 request
+        grok = run_ui("#/new", routes, [{"aria": "Agent", "value": "grok"}, {"type": "textarea", "value": "task"},
+                                        {"input": None} if False else {"type": "input", "value": "Grok iPhone Test"}, {"click": "Start Session"}])
+        body = [c for c in grok["calls"] if c["method"] == "POST"][0]["body"]
+        self.assertEqual((body["agent"], body["project"], body["name"]), ("grok", "scratch", "Grok iPhone Test"))
+        self.assertEqual(sorted(body), ["agent", "name", "project", "request_id", "task"])
+
+    def test_a_grok_session_is_labelled_and_a_claude_session_reads_as_before(self):
+        grok = view(agent_type="grok", grok={"session_bound": True, "acp": "running", "automatic_handoff": False}, remote_control={"state": "unknown"})
+        claude = view(logical_session_id="ls_" + "b" * 24)
+        lst = run_ui("#/", {ME[0]: ME[1], "GET /api/v1/sessions": [200, {"sessions": [grok, claude]}]})
+        self.assertIn("Project: Nova \u00b7 Grok", lst["all"])
+        self.assertIn("Project: Nova \u00b7 Claude Code", lst["all"])
+        self.assertEqual(lst["all"].count("Remote Control:"), 1)  # the Claude card only: Grok has no Remote Control
+        page = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, grok]})
+        self.assertIn("Agent: Grok", page["all"])
+        self.assertIn("no automatic handoff", page["all"])
+        self.assertNotIn("Remote Control:", page["all"])
+        self.assertIn(["textarea", "placeholder", "Tell Grok\u2026"], page["attrs"])
+        old = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view()]})  # no agent_type at all: a v1.4.2 payload
+        self.assertIn(["textarea", "placeholder", "Tell Claude\u2026"], old["attrs"])
+        self.assertIn("Claude is listening", old["all"])
+        self.assertIn("Remote Control: Healthy", old["all"])
+
+    def test_a_grok_approval_and_orphan_screens_name_grok(self):
+        gate = {"id": "ap_" + "a" * 16, "nonce": "n", "action": "Grok: Write probe.txt", "reason": "Grok is asking to run a edit action."}
+        page = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(agent_type="grok", human_gate=gate, state="WAITING_FOR_HUMAN")]})
+        self.assertIn("Approving allows this one Grok action only.", page["all"])
+        self.assertNotIn("not a Claude permission prompt", page["all"])
+        orphan = run_ui("#/s/" + LSID, {ME[0]: ME[1], "GET /api/v1/sessions/" + LSID: [200, view(agent_type="grok", state="ORPHANED", orphaned={"reason": "gone"})]})
+        self.assertIn("Grok stopped responding.", orphan["all"])
 
     def test_new_session_sends_a_name_only_when_one_is_given(self):
         routes = {ME[0]: ME[1], "GET /api/v1/projects": [200, {"projects": ["nova"]}], "POST /api/v1/sessions": [201, view()]}

@@ -548,3 +548,44 @@ one graceful signal is the only process control, transcripts are never read
 into a main context, and no secret is written to a log. Automatic continuation
 never implies approval, and a Terminal Handoff approval never answers a Claude
 native permission prompt.
+
+## Grok
+
+Adding Grok adds one more agent behind the same control plane; it adds no listener and no new remote
+capability.
+
+* **No new attack surface.** Grok is reached only through the existing loopback gateway and tailnet-only
+  publication. The bridge speaks JSON-RPC over a pipe to a child process; nothing listens.
+* **Registered projects only.** A phone names a project, never a path. The bridge re-resolves the project
+  to its pinned realpath and refuses to start if it no longer matches the record. Grok is additionally
+  **opt-in per project** (`th project enable-grok`).
+* **Ask mode by default, fail closed.** Terminal Handoff never passes `--always-approve` (or `--yolo`) unless
+  you set `grok_permission_mode` to `always-approve` in `remote/config.json`. Grok's own configuration
+  (`~/.grok/config.toml`) can make *every* session always-approve, and Grok's environment overlay cannot
+  override the `ui` table for ACP sessions. Because Terminal Handoff cannot verify enforcement from outside
+  Grok, it **refuses to start** Grok while that file selects always-approve (or `yolo`), and says why.
+  It also sets `GROK_DEFAULT_PERMISSION_MODE=ask` (undocumented; best effort) and `yoloMode:false` on
+  `session/new`. Treat those two as belt and braces, not as the control.
+* **Optional OS sandbox.** `grok_sandbox` in `remote/config.json` (`workspace`, `read-only`, `strict`) turns on Grok's own Seatbelt sandbox for the Grok process. It is off by default and is not a substitute for ask mode. Grok's sandbox does not restrict child-process network access on macOS.
+* **Other Grok permission inputs remain in force.** Grok reads Claude-style permission rules
+  (for example `~/.claude/settings.local.json` and a project's `.claude/settings.json`) and remembers
+  per-project "always allow" grants. Terminal Handoff does not change them; review them.
+* **Approvals.** A Grok permission request becomes a Terminal Handoff approval bound to the session, the exact
+  action text and the owner epoch, with the same nonce, expiry and stale-epoch rules. Only `allow_once` is
+  ever selected; `allow_always` never is. STOP, an ownership change, denial or expiry all answer `reject`
+  or `cancelled`. The request's raw input (file contents, commands) is never stored or shown, only its title.
+* **Reasoning is not exposed.** ACP `agent_thought_chunk` and plan updates are counted and dropped. Tool
+  *titles* and completion status are shown; tool inputs and outputs are not. Transcript lines pass through
+  the same secret redaction as Claude's.
+* **Credentials.** Terminal Handoff checks only that `~/.grok/auth.json` exists. It never opens, copies or
+  logs it, and never puts it in Terminal Handoff state or the phone. The bridge removes its own launch
+  secret from Grok's environment.
+* **Sole writer.** One bridge owns a session, fenced by the owner epoch. A second bridge cannot take a
+  live session, a Grok session id is bound once and never rebound, and Claude and Grok cannot both own one
+  logical session (ownership registers once, from CREATING).
+* **No implicit new conversation.** Reconnect loads the stored session id or fails; it never picks "the most
+  recent" Grok session and never starts a fresh one.
+* **Archive is logical.** Archiving a Grok session removes it from Terminal Handoff's lists only. Grok's
+  own history under `~/.grok` is never touched.
+* **Audit.** Agent selected, bridge and process launch, session binding, load, instruction delivery (id and
+  length, not content), STOP cancel, approval request and outcome, process exit, and archive are logged.

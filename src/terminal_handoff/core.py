@@ -29,6 +29,7 @@ import hmac
 import http.server
 import json
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -44,7 +45,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.4.2"
+TERMINAL_HANDOFF_VERSION = "1.5.0"
 MANIFEST_SCHEMA_VERSION = 2
 NOTIFICATION_SCHEMA_VERSION = 1
 
@@ -6047,6 +6048,7 @@ def cmd_status(args):
             ),
             "native_messaging": coordination["native_messaging"],
         },
+        "grok": grok_health(),
     }
     print(json.dumps(info, indent=2, default=str))
     return 0
@@ -6128,6 +6130,18 @@ MAX_OUTPUT_LINES = 2000
 MAX_OUTPUT_LINE_CHARS = 600
 MAX_TRANSCRIPT_PAGE = 200
 ARCHIVABLE_STATES = (LS_COMPLETED, LS_FAILED, LS_ORPHANED)
+
+# The agent that owns a logical session. Fixed when the session is created; a record with no
+# agent_type is a pre-1.5 session and is Claude Code.
+AGENT_CLAUDE = "claude"
+AGENT_GROK = "grok"
+AGENT_TYPES = (AGENT_CLAUDE, AGENT_GROK)
+AGENT_LABELS = {AGENT_CLAUDE: "Claude Code", AGENT_GROK: "Grok"}
+
+
+def agent_type_of(record):
+    kind = (record or {}).get("agent_type")
+    return kind if kind in AGENT_TYPES else AGENT_CLAUDE
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
@@ -6276,6 +6290,11 @@ TRANSCRIPT_EVENTS = {
     "failed": "FAILED",
     "archived": "Archived",
     "restored": "Restored from archive",
+    "grok_session_bound": "Grok session started",
+    "grok_session_loaded": "Reconnected to the same Grok session",
+    "grok_process_exited": "Grok process exited; reconnecting",
+    "grok_cancel_sent": "Interrupting Grok (STOP)",
+    "grok_load_failed": "Could not reload the Grok session",
 }
 
 
@@ -6371,6 +6390,7 @@ def logical_create(
     launch_expires_epoch=None,
     permissions_snapshot=None,
     title=None,
+    agent_type=AGENT_CLAUDE,
 ):
     ensure_dirs()
     lsid = "ls_" + uuid.uuid4().hex[:24]
@@ -6378,6 +6398,7 @@ def logical_create(
     record = {
         "schema_version": LOGICAL_SCHEMA_VERSION,
         "logical_session_id": lsid,
+        "agent_type": agent_type if agent_type in AGENT_TYPES else AGENT_CLAUDE,
         "project": project,
         "repository": repository,
         "branch": branch,
@@ -6596,12 +6617,15 @@ def logical_hard_stop(lsid):
     owner = (record or {}).get("owner") or {}
     binding = owner.get("process")
     result = {"attempted_utc": utc_stamp(), "outcome": None}
-    ok, reason = verify_parent_binding(
-        binding,
-        chain_id=owner.get("chain_id"),
-        generation=owner.get("generation"),
-        session_id=owner.get("agent_session_id"),
-    )
+    if agent_type_of(record) == AGENT_GROK:
+        ok, reason = verify_grok_bridge_binding(binding, lsid)
+    else:
+        ok, reason = verify_parent_binding(
+            binding,
+            chain_id=owner.get("chain_id"),
+            generation=owner.get("generation"),
+            session_id=owner.get("agent_session_id"),
+        )
     if not ok:
         result["outcome"] = "not_signalled"
         result["reason"] = reason
@@ -6809,6 +6833,8 @@ def logical_public_view(record):
     inbox = (record.get("inbox") or {}).get("messages") or []
     return {
         "logical_session_id": record.get("logical_session_id"),
+        "agent_type": agent_type_of(record),
+        "grok": grok_public_state(record) if agent_type_of(record) == AGENT_GROK else None,
         "project": record.get("project"),
         "branch": record.get("branch"),
         "title": record.get("title"),
@@ -6924,7 +6950,10 @@ def cmd_session(args):
     elif action == "decide":
         ok, why, approval = approval_decide(lsid, args.approval_id, args.decision, args.nonce, args.owner_epoch, "local")
     elif action == "recover":
-        ok, why, _ = logical_recover(lsid, args.recover_action, by="local")
+        if args.recover_action == "reattach" and agent_type_of(record) == AGENT_GROK:
+            ok, why, _ = grok_reattach(lsid, by="local")
+        else:
+            ok, why, _ = logical_recover(lsid, args.recover_action, by="local")
     elif action == "rename":
         ok, why, _ = logical_rename(lsid, args.text, by="local")
     elif action == "check":
@@ -7215,6 +7244,7 @@ def cmd_project(args):
                     "path": project.get("path"),
                     "enabled": project.get("enabled"),
                     "remote_launch": project.get("remote_launch"),
+                    "agents": project_agents(project),
                     "permissions": "valid" if not why else why,
                 }
             )
@@ -7225,6 +7255,13 @@ def cmd_project(args):
             print("usage: project add NAME ABSOLUTE_PATH")
             return 2
         ok, why = project_add(rest[0], rest[1])
+        print("ok" if ok else "refused: %s" % why)
+        return 0 if ok else 3
+    if action in ("enable-grok", "disable-grok"):
+        if len(rest) != 1:
+            print("usage: project %s NAME" % action)
+            return 2
+        ok, why = project_set_agent(rest[0], AGENT_GROK, action == "enable-grok")
         print("ok" if ok else "refused: %s" % why)
         return 0 if ok else 3
     if action in ("remove", "enable-remote", "disable-remote"):
@@ -7638,7 +7675,7 @@ ALLOWED_BODY_KEYS = {
     "pause": {"request_id"},
     "resume": {"request_id", "reason", "clear_stop"},
     "stop": {"request_id", "reason", "hard"},
-    "create": {"project", "task", "name", "request_id"},
+    "create": {"project", "task", "name", "request_id", "agent"},
     "rename": {"name", "request_id"},
     "approve": {"nonce", "owner_epoch", "request_id"},
     "deny": {"nonce", "owner_epoch", "request_id"},
@@ -7838,13 +7875,16 @@ UI_APP_JS = r"""
   // ---- session list -------------------------------------------------------
   var ACTIVE_STATES = { CREATING: 1, RUNNING: 1, WAITING_FOR_HUMAN: 1, PAUSED: 1, RECOVERING: 1 };
   var ARCHIVABLE = { COMPLETED: 1, FAILED: 1, ORPHANED: 1 };
+  function isGrok(s) { return !!s && s.agent_type === 'grok'; }
+  function who(s) { return isGrok(s) ? 'Grok' : 'Claude'; }
+  function agentLabel(s) { return isGrok(s) ? 'Grok' : 'Claude Code'; }
   function renderList() {
     stop();
     var box = el('div'), confirming = null, flash = el('p', { 'class': 'note', text: '' });
     function subtitle(s) {
       if (s.state === 'WAITING_FOR_HUMAN') return 'Approval required';
       if (s.state === 'STOPPED') return 'STOPPED by you';
-      if (s.state === 'ORPHANED') return 'Claude stopped responding';
+      if (s.state === 'ORPHANED') return who(s) + ' stopped responding';
       if (s.archived) return 'Archived ' + ago(s.archived.utc) + ' ago';
       if (ARCHIVABLE[s.state]) return label(s.state) + ' ' + ago(s.updated_utc || s.created_utc) + ' ago';
       return 'Working for ' + ago(s.created_utc);
@@ -7861,9 +7901,9 @@ UI_APP_JS = r"""
       var kids = [
         el('a', { 'class': 'cardlink', href: '#/s/' + s.logical_session_id }, [
           el('div', { 'class': 'row' }, [el('strong', { text: s.name || s.project || 'session' }), stateEl(s.archived ? 'ARCHIVED' : s.state)]),
-          el('div', { 'class': 'muted', text: 'Project: ' + (s.project || 'n/a') }),
+          el('div', { 'class': 'muted', text: 'Project: ' + (s.project || 'n/a') + ' · ' + agentLabel(s) }),
           el('div', { 'class': 'muted', text: subtitle(s) }),
-          s.archived ? null : el('div', { 'class': 'muted', text: 'Remote Control: ' + remoteLabel(s.remote_control) })])];
+          (s.archived || isGrok(s)) ? null : el('div', { 'class': 'muted', text: 'Remote Control: ' + remoteLabel(s.remote_control) })])];
       if (s.archived) {
         kids.push(el('button', { 'class': 'secondary', text: 'Restore', onclick: function () { act(s, 'restore', 'Restored.'); } }));
       } else if (ARCHIVABLE[s.state]) {
@@ -7912,13 +7952,24 @@ UI_APP_JS = r"""
     stop(); clear();
     formRequestId = rid();
     var select = el('select', { 'aria-label': 'Project' });
+    var optClaude = el('option', { value: 'claude', text: 'Claude Code' }), optGrok = el('option', { value: 'grok', text: 'Grok' });
+    var agentSel = el('select', { 'aria-label': 'Agent' }, [optClaude, optGrok]);
+    var agentsByProject = {};
+    function syncAgents() {
+      var allowed = agentsByProject[select.value] || ['claude'];
+      optGrok.disabled = allowed.indexOf('grok') < 0;
+      if (optGrok.disabled && agentSel.value === 'grok') agentSel.value = 'claude';
+    }
+    select.addEventListener('change', syncAgents);
     var nameBox = el('input', { type: 'text', maxlength: '60', placeholder: 'Session name (optional)', 'aria-label': 'Session name', autocomplete: 'off' });
     var task = el('textarea', { placeholder: 'What should Claude do? (dictation works here)', 'aria-label': 'Task' });
+    agentSel.addEventListener('change', function () { task.setAttribute('placeholder', 'What should ' + (agentSel.value === 'grok' ? 'Grok' : 'Claude') + ' do? (dictation works here)'); });
     var msg = el('p', { 'class': 'err', text: '' });
     var go = el('button', { text: 'Start Session', onclick: function () {
       if (!select.value || !task.value.trim()) { msg.textContent = 'Choose a project and describe the task.'; return; }
       go.disabled = true; msg.textContent = ''; msg.className = 'note'; msg.textContent = 'Starting on your Mac…';
       var body = { project: select.value, task: task.value, request_id: formRequestId };
+      if (agentSel.value === 'grok') body.agent = 'grok';
       if (nameBox.value.trim()) body.name = nameBox.value.trim();
       api('POST', '/api/v1/sessions', body).then(function (r) {
         var d = r.data || {};
@@ -7927,11 +7978,13 @@ UI_APP_JS = r"""
       });
     } });
     app.appendChild(el('a', { 'class': 'back', href: '#/', text: '‹ Sessions' }));
-    app.appendChild(el('div', { 'class': 'card' }, [el('h2', { text: 'New Session' }), el('label', { text: 'Project' }), select, el('label', { text: 'Name' }), nameBox, el('label', { text: 'Task' }), task, go, msg]));
+    app.appendChild(el('div', { 'class': 'card' }, [el('h2', { text: 'New Session' }), el('label', { text: 'Project' }), select, el('label', { text: 'Agent' }), agentSel, el('label', { text: 'Name' }), nameBox, el('label', { text: 'Task' }), task, go, msg]));
     api('GET', '/api/v1/projects').then(function (r) {
       var names = (r.data && r.data.projects) || [];
       if (!names.length) { msg.textContent = 'No project is enabled for remote launch.'; go.disabled = true; }
+      agentsByProject = (r.data && r.data.agents) || {};
       names.forEach(function (n) { select.appendChild(el('option', { value: n, text: n })); });
+      syncAgents();
     });
   }
 
@@ -8065,6 +8118,7 @@ UI_APP_JS = r"""
     }
     function drawHead() {
       var s = view;
+      text.setAttribute('placeholder', 'Tell ' + who(s) + '…');
       while (head.firstChild) head.removeChild(head.firstChild);
       head.appendChild(el('div', { 'class': 'row' }, [el('h2', { text: s.name || s.project || 'Session' }), stateEl(s.state)]));
       head.appendChild(el('button', { 'class': 'secondary', text: 'Rename', onclick: openRename }));
@@ -8077,14 +8131,14 @@ UI_APP_JS = r"""
           el('div', { 'class': 'action', text: g.action }),
           el('div', { 'class': 'muted', text: 'Reason:' }),
           el('div', { text: g.reason }),
-          el('div', { 'class': 'muted', text: 'This answers a Terminal Handoff gate, not a Claude permission prompt.' }),
+          el('div', { 'class': 'muted', text: isGrok(s) ? 'Approving allows this one Grok action only.' : 'This answers a Terminal Handoff gate, not a Claude permission prompt.' }),
           el('div', { 'class': 'grid2' }, [
             el('button', { 'class': 'danger', text: 'DENY', onclick: function () { decide(g, 'deny'); } }),
             el('button', { 'class': 'ok', text: 'APPROVE', onclick: function () { decide(g, 'approve'); } })])]));
       }
       if (s.state === 'ORPHANED') {
         head.appendChild(el('div', { 'class': 'card' }, [
-          el('strong', { 'class': 'err', text: 'Claude stopped responding.' }),
+          el('strong', { 'class': 'err', text: who(s) + ' stopped responding.' }),
           el('div', { 'class': 'muted', text: (s.orphaned && s.orphaned.reason) || '' }),
           el('div', { 'class': 'muted', text: 'It will not be replaced automatically.' }),
           el('div', { 'class': 'grid2' }, [
@@ -8092,13 +8146,15 @@ UI_APP_JS = r"""
             el('button', { 'class': 'danger', text: 'Abandon', onclick: function () { control('/api/v1/sessions/' + id + '/recover', { action: 'abandon' }, 'Abandoned.'); } })])]));
       }
       var age = s.agent_poll_age_seconds;
-      var wake = age === null || age === undefined ? 'Claude has not checked in yet' : (age < 45 ? 'Claude is listening' : 'Claude is busy or away; it will see new instructions at its next check');
+      var wake = isGrok(s) ? ('Grok process: ' + ((s.grok && s.grok.acp) || 'unknown') + ' · uses Grok\u2019s own session history; no automatic handoff')
+        : (age === null || age === undefined ? 'Claude has not checked in yet' : (age < 45 ? 'Claude is listening' : 'Claude is busy or away; it will see new instructions at its next check'));
       head.appendChild(el('div', { 'class': 'card' }, [
         el('div', { 'class': 'muted', text: 'Current task' }), el('div', { text: s.title || '(none)' }),
         el('div', { 'class': 'muted', text: 'Branch: ' + (s.branch || 'n/a') }),
         el('div', { 'class': 'muted', text: 'Owner generation: ' + (s.owner ? s.owner.generation : 'none') + ' · ID ' + short(s.logical_session_id) }),
         el('div', { 'class': 'muted', text: 'Elapsed: ' + ago(s.created_utc) }),
-        el('div', { 'class': 'muted', text: 'Remote Control: ' + remoteLabel(s.remote_control) }),
+        el('div', { 'class': 'muted', text: 'Agent: ' + agentLabel(s) }),
+        isGrok(s) ? null : el('div', { 'class': 'muted', text: 'Remote Control: ' + remoteLabel(s.remote_control) }),
         el('div', { 'class': 'muted', text: wake }),
         el('div', { 'class': 'muted', text: 'Instructions pending: ' + (s.inbox ? s.inbox.pending : 0) }),
         s.project_available === false ? el('div', { 'class': 'err', text: 'This project is no longer available on the Mac.' }) : null]));
@@ -8302,8 +8358,8 @@ def make_remote_handler(gateway):
             if path == "/api/v1/me":
                 self._send(200, {"device": ctx["device"]["name"], "csrf": csrf_token_for(ctx["device_id"], ctx["device"])})
             elif path == "/api/v1/projects":
-                names = [n for n, p in sorted(projects_load().items()) if p.get("enabled") and p.get("remote_launch")]
-                self._send(200, {"projects": names})
+                launchable = [(n, p) for n, p in sorted(projects_load().items()) if p.get("enabled") and p.get("remote_launch")]
+                self._send(200, {"projects": [n for n, _ in launchable], "agents": {n: project_agents(p) for n, p in launchable}})
             elif path == "/api/v1/sessions":
                 self._send(200, {"sessions": [logical_public_view(r) for r in logical_list()]})
             else:
@@ -8410,7 +8466,10 @@ def make_remote_handler(gateway):
                     return 400, {"error": "bad_request", "reason": why}
                 return 200, logical_public_view(logical_read(lsid))
             if action == "recover":
-                ok, why, _ = logical_recover(lsid, body.get("action"), by=by)
+                if body.get("action") == "reattach" and agent_type_of(logical_read(lsid)) == AGENT_GROK:
+                    ok, why, _ = grok_reattach(lsid, by=by)
+                else:
+                    ok, why, _ = logical_recover(lsid, body.get("action"), by=by)
                 if not ok:
                     return 409, {"error": "refused", "reason": why}
                 return 200, logical_public_view(logical_read(lsid))
@@ -8842,7 +8901,7 @@ def _remove_launch_material(lsid):
 
 
 def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wait=None, sleep=time.sleep,
-                          isolation_check=None):
+                          isolation_check=None, grok_preflight=None, grok_launcher=None):
     """Create a logical session and start Claude Code on this Mac.
 
     Returns `(http_status, payload)`. Success (201) means the Mac has really
@@ -8879,6 +8938,14 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     if profile is None:
         log_event("remote_create_refused", device_id=device_id, project=project_name, reason=why)
         return 403, {"error": "permission_profile_required", "reason": why}
+    agent = body.get("agent", AGENT_CLAUDE)
+    if not isinstance(agent, str) or agent not in AGENT_TYPES:
+        return 400, {"error": "bad_request", "reason": "agent must be one of: %s" % ", ".join(AGENT_TYPES)}
+    if agent == AGENT_GROK:
+        return remote_create_grok_session(
+            body, ctx, project_name, real, project, profile, task, custom_name, request_key,
+            wait_seconds=wait_seconds, sleep=sleep, preflight=grok_preflight, launcher=grok_launcher,
+        )
     claude_bin = find_claude_executable()
     if not claude_bin:
         return 503, {"error": "claude_unavailable"}
@@ -9005,6 +9072,1024 @@ def remote_registration(facts):
     if not ok:
         log_event("remote_registration_refused", logical_session_id=lsid, reason=why)
     return ok
+
+
+# ---------------------------------------------------------------------------
+# Grok agent adapter (Agent Client Protocol over `grok agent stdio`)
+# ---------------------------------------------------------------------------
+#
+# A Grok logical session is owned by a *bridge*: a detached Terminal Handoff process that is the
+# ACP client, owns the `grok agent stdio` child, and is the one verified writer for the session.
+# It reuses the logical-session machinery unchanged (launch token, owner epoch fencing, durable
+# inbox, STOP, approvals, transcript). Differences from Claude are deliberate:
+#   * delivery is push: the bridge sends each inbox message as `session/prompt`;
+#   * STOP interrupts with `session/cancel` (and ends the child if it does not stop);
+#   * a Grok permission request becomes a Terminal Handoff approval, answered through ACP;
+#   * there is no automatic A -> B context handoff: Grok uses its own persisted session.
+# Credentials are never read or copied: the child uses the user's existing Grok login.
+
+GROK_ACP_TIMEOUT = 60.0
+GROK_NEW_SESSION_TIMEOUT = 120.0
+GROK_TICK_SECONDS = 0.5
+GROK_IDLE_SECONDS = 1.0
+GROK_HEARTBEAT_SECONDS = 30.0
+GROK_STOP_GRACE_SECONDS = 10.0
+GROK_MAX_MALFORMED = 25
+GROK_MAX_RESTARTS = 3
+GROK_TOOL_TITLE_MAX = 160
+GROK_FLUSH_LINES = 8
+GROK_FLUSH_SECONDS = 1.0
+GROK_QUIET_FLUSH_SECONDS = 2.0  # a partial line is shown once the stream has paused this long
+GROK_NOT_AUTHENTICATED = "Grok CLI is not authenticated on this Mac."
+GROK_NOT_INSTALLED = "Grok CLI is not installed on this Mac."
+GROK_BYPASS_MODES = ("always-approve", "always_approve", "bypasspermissions", "bypass", "yolo")
+
+
+class GrokError(Exception):
+    def __init__(self, code, message="", rpc_code=None):
+        Exception.__init__(self, message or code)
+        self.code = code
+        self.message = message or code
+        self.rpc_code = rpc_code
+
+
+class GrokBridgeExit(Exception):
+    """Ends the bridge loop on purpose (terminated, ownership lost, session ended)."""
+
+    def __init__(self, reason, code=0):
+        Exception.__init__(self, reason)
+        self.reason = reason
+        self.code = code
+
+
+def _read_text(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def grok_home():
+    return os.environ.get("GROK_HOME") or os.path.expanduser("~/.grok")
+
+
+def find_grok_executable():
+    override = os.environ.get("CLAUDE_TERMINAL_HANDOFF_GROK_BIN")
+    candidates = [override] if override else []
+    candidates += [shutil.which("grok"), os.path.expanduser("~/.grok/bin/grok"), os.path.expanduser("~/.local/bin/grok")]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def grok_version(grok_bin):
+    try:
+        out = subprocess.run([grok_bin, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, universal_newlines=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = (out.stdout or "").strip().splitlines()
+    return line[0][:80] if line else None
+
+
+def grok_credentials_present():
+    """Whether Grok has a login on this Mac. Existence only: the file is never opened."""
+    return os.path.isfile(os.path.join(grok_home(), "auth.json"))
+
+
+def grok_config_permission_posture():
+    """`(posture, detail)` from the user's Grok config: `bypass`, `auto` or `ask`.
+
+    Grok's own config can make every session always-approve, and the environment cannot override
+    that for ACP sessions. Terminal Handoff reads the two relevant keys (never credentials).
+    """
+    path = os.path.join(grok_home(), "config.toml")
+    try:
+        text = _read_text(path)
+    except (OSError, IOError):
+        return "ask", "no Grok config file"
+    section = None
+    mode = None
+    yolo = False
+    for raw in (text or "").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line.strip("[] ").strip()
+            continue
+        if section == "ui" and "=" in line:
+            key, value = [part.strip() for part in line.split("=", 1)]
+            value = value.strip("\"' ").lower()
+            if key in ("permission_mode", "approval_mode"):
+                mode = value
+            elif key == "yolo":
+                yolo = value == "true"
+    if yolo or (mode or "") in GROK_BYPASS_MODES:
+        return "bypass", "~/.grok/config.toml sets ui.%s" % ("yolo" if yolo else "permission_mode")
+    if mode == "auto":
+        return "auto", "ui.permission_mode is auto"
+    return "ask", "ask mode"
+
+
+def grok_permission_mode():
+    """Terminal Handoff's own setting for Grok: `ask` (default) or an explicit `always-approve`.
+
+    Only `remote/config.json` can select always-approve, and only deliberately.
+    """
+    config = read_json(th_path("remote", "config.json"), {}) or {}
+    return "always-approve" if config.get("grok_permission_mode") == "always-approve" else "ask"
+
+
+def grok_sandbox_profile():
+    """Optional Grok OS sandbox profile from `remote/config.json` (`grok_sandbox`); off unless chosen."""
+    config = read_json(th_path("remote", "config.json"), {}) or {}
+    value = config.get("grok_sandbox")
+    return value if value in ("workspace", "read-only", "strict") else None
+
+
+def grok_preflight(grok_bin):
+    """`(ok, error_code, reason)`: can a Grok session be started here, safely, right now?"""
+    if not grok_credentials_present():
+        return False, "grok_not_authenticated", GROK_NOT_AUTHENTICATED
+    if grok_permission_mode() == "ask":
+        posture, detail = grok_config_permission_posture()
+        if posture == "bypass":
+            return (
+                False,
+                "grok_permission_unsafe",
+                "Grok is set to always-approve (%s). Terminal Handoff will not start Grok that way by default; "
+                "change that setting, or select always-approve deliberately for Terminal Handoff." % detail,
+            )
+    return True, None, None
+
+
+def project_agents(project):
+    """The agents a project may be launched with. Claude is always allowed; Grok is opt-in."""
+    agents = [a for a in ((project or {}).get("agents") or []) if a in AGENT_TYPES]
+    return sorted(set(agents) | {AGENT_CLAUDE})
+
+
+def project_set_agent(name, agent, enabled):
+    outcome = {}
+    if agent not in AGENT_TYPES or agent == AGENT_CLAUDE:
+        return False, "only grok can be enabled or disabled per project"
+
+    def mutate(projects):
+        project = projects.get(name)
+        if not project:
+            outcome["error"] = "unknown project"
+            return
+        agents = set(project_agents(project))
+        agents.add(agent) if enabled else agents.discard(agent)
+        project["agents"] = sorted(agents)
+
+    projects_update(mutate)
+    if outcome.get("error"):
+        return False, outcome["error"]
+    log_event("project_agent", project=name, agent=agent, enabled=bool(enabled))
+    return True, None
+
+
+def grok_public_state(record):
+    """What the phone may know about a Grok session's plumbing. No ids, paths or pids."""
+    health = record.get("grok_acp") or {}
+    return {
+        "session_bound": bool(record.get("grok_session_id")),
+        "acp": health.get("state") or "unknown",
+        "checked_utc": health.get("utc"),
+        "automatic_handoff": False,
+    }
+
+
+def grok_bridge_binding(session_id):
+    identity = process_identity(os.getpid()) or {}
+    return {
+        "kind": "grok-bridge",
+        "pid": os.getpid(),
+        "ppid": identity.get("ppid"),
+        "uid": os.getuid(),
+        "start": identity.get("start"),
+        "tty": identity.get("tty"),
+        "command": (identity.get("command") or "")[:200],
+        "session_id": session_id,
+        "bound_utc": utc_stamp(),
+    }
+
+
+def verify_grok_bridge_binding(binding, lsid):
+    """`(ok, reason)`: re-prove that the recorded bridge is still the same live process."""
+    if not isinstance(binding, dict) or binding.get("kind") != "grok-bridge":
+        return False, "no Grok bridge binding was recorded"
+    try:
+        pid = int(binding.get("pid"))
+    except (TypeError, ValueError):
+        return False, "binding has no usable pid"
+    if pid <= 1 or pid == os.getpid():
+        return False, "refusing to signal pid %d" % pid
+    identity = process_identity(pid)
+    if identity is None:
+        return False, "bound Grok bridge %d is no longer running" % pid
+    if not binding.get("start") or identity["start"] != binding["start"]:
+        return False, "pid %d has been reused: start time differs" % pid
+    if identity["uid"] != os.getuid():
+        return False, "pid %d now belongs to another user" % pid
+    return True, None
+
+
+def grok_owner_liveness(record):
+    """`(verdict, detail)` for a Grok session: the bridge process is the owner."""
+    owner = record.get("owner") or {}
+    if not owner.get("agent_session_id"):
+        return "unknown", "no owner registered"
+    ok, reason = verify_grok_bridge_binding(owner.get("process"), record.get("logical_session_id"))
+    if ok:
+        return "alive", "Grok bridge process binding re-proved"
+    if any(text in (reason or "") for text in ("no longer running", "reused", "another user")):
+        return "dead", "the Grok bridge has exited"
+    return "unknown", reason or "no independent evidence either way"
+
+
+def logical_set_grok_session(lsid, grok_session_id):
+    """Bind the exact Grok session id, once. It is never rebound and never inferred."""
+    if not isinstance(grok_session_id, str) or not re.match(r"^[A-Za-z0-9._:-]{8,80}$", grok_session_id):
+        return False, "malformed Grok session id", None
+
+    def mutate(record):
+        if agent_type_of(record) != AGENT_GROK:
+            raise LogicalRefusal("not a Grok session")
+        existing = record.get("grok_session_id")
+        if existing and existing != grok_session_id:
+            raise LogicalRefusal("this logical session is already bound to a different Grok session")
+        record["grok_session_id"] = grok_session_id
+        if not existing:
+            logical_history(record, "grok_session_bound")
+
+    ok, why, _, record = logical_mutate(lsid, mutate)
+    if ok:
+        log_event("grok_session_bound", logical_session_id=lsid)
+    return ok, why, record
+
+
+def grok_reown(lsid, grok_session_id, binding, by="local"):
+    """A new bridge takes over a Grok session whose previous bridge is gone. Fenced and exclusive."""
+
+    def mutate(record):
+        if agent_type_of(record) != AGENT_GROK:
+            raise LogicalRefusal("not a Grok session")
+        if record.get("state") in LS_TERMINAL:
+            raise LogicalRefusal("logical session has ended")
+        if not record.get("grok_session_id") or record["grok_session_id"] != grok_session_id:
+            raise LogicalRefusal("the stored Grok session id does not match")
+        owner = record.get("owner") or {}
+        alive, _ = verify_grok_bridge_binding(owner.get("process"), lsid)
+        if alive and (owner.get("process") or {}).get("pid") != (binding or {}).get("pid"):
+            raise LogicalRefusal("another Grok bridge still owns this session")
+        record["owner_epoch"] = int(record.get("owner_epoch") or 0) + 1
+        record["owner"] = {
+            "agent_session_id": grok_session_id,
+            "generation": int(owner.get("generation") or 1),
+            "chain_id": None,
+            "epoch": record["owner_epoch"],
+            "process": binding,
+            "transfer_file": None,
+            "since_utc": utc_stamp(),
+        }
+        for message in record["inbox"]["messages"]:
+            if message.get("status") == "delivered":
+                message["status"] = "pending"
+                message["redelivered"] = int(message.get("redelivered") or 0) + 1
+                message["delivered_epoch"] = None
+        for approval in record.get("approvals") or []:
+            if approval.get("status") == AP_PENDING:
+                approval["rebound_from_epoch"] = approval.get("bound_epoch")
+                approval["bound_epoch"] = record["owner_epoch"]
+            elif approval.get("status") == AP_APPROVED:
+                approval["status"] = AP_INVALIDATED
+        record.pop("orphaned", None)
+        record["owner_health"] = {"verdict": "alive", "failures": 0}
+        record["state"] = _effective_active_state(record)
+        logical_history(record, "reattached", by=by)
+        return record["owner_epoch"]
+
+    ok, why, epoch, _ = logical_mutate(lsid, mutate)
+    if ok:
+        log_event("grok_session_reattached", logical_session_id=lsid, by=by)
+    return ok, why, epoch
+
+
+def logical_append_output_lines(lsid, agent_session_id, lines):
+    """Append several transcript lines in one record update (streaming without a write per line)."""
+    cleaned = []
+    for text in lines:
+        line = clean_untrusted_text(str(text)[: MAX_OUTPUT_LINE_CHARS * 2], MAX_OUTPUT_LINE_CHARS * 2)
+        if line is not None:
+            cleaned.append(redact_secrets(line)[:MAX_OUTPUT_LINE_CHARS])
+    if not cleaned:
+        return True, None, None
+
+    def mutate(record):
+        if not _is_owner(record, agent_session_id):
+            raise LogicalRefusal("not the current owner of this logical session")
+        for line in cleaned:
+            seq = int(record.get("output_next_seq") or 0) + 1
+            record["output_next_seq"] = seq
+            record["output"].append({"ts": utc_stamp(), "text": line, "seq": seq, "generation": (record.get("owner") or {}).get("generation")})
+        del record["output"][:-MAX_OUTPUT_LINES]
+
+    ok, why, _, _ = logical_mutate(lsid, mutate)
+    return ok, why, None
+
+
+def inbox_requeue(lsid, agent_session_id, message_id):
+    """Return one delivered-but-unacknowledged message to the queue (the child died mid-turn)."""
+
+    def mutate(record):
+        if not _is_owner(record, agent_session_id):
+            raise LogicalRefusal("not the current owner of this logical session")
+        for message in record["inbox"]["messages"]:
+            if message["id"] == message_id and message["status"] == "delivered":
+                message["status"] = "pending"
+                message["redelivered"] = int(message.get("redelivered") or 0) + 1
+                message["delivered_epoch"] = None
+                return True
+        return False
+
+    return logical_mutate(lsid, mutate)[:3]
+
+
+def grok_error_reason(exc):
+    """A short, content-free description of a Grok failure for the phone."""
+    text = ("%s %s" % (getattr(exc, "message", ""), getattr(exc, "rpc_code", ""))).lower()
+    if any(word in text for word in ("unauthor", "not authenticated", "auth_required", "login", "401", "expired token")):
+        return GROK_NOT_AUTHENTICATED
+    if "402" in text or "balance" in text or "payment" in text:
+        return "Grok reports that the usage balance is exhausted."
+    if getattr(exc, "code", None) == "process_exited":
+        return "The Grok process exited unexpectedly."
+    if getattr(exc, "code", None) == "protocol":
+        return "Grok sent an unexpected response."
+    if getattr(exc, "code", None) == "timeout":
+        return "Grok did not respond in time."
+    return "Grok reported an error."
+
+
+class GrokAcpClient(object):
+    """The smallest ACP client that drives one `grok agent stdio` child over JSON-RPC lines."""
+
+    def __init__(self, argv, cwd, env):
+        self.proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            cwd=cwd, env=env, universal_newlines=True, bufsize=1, encoding="utf-8", errors="replace",
+        )
+        self.inbox = queue.Queue()
+        self.next_id = 0
+        self.malformed = 0
+        self.pid = self.proc.pid
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        try:
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    message = None
+                if not isinstance(message, dict):
+                    self.malformed += 1
+                    self.inbox.put({"_malformed": True})
+                    continue
+                self.inbox.put(message)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.inbox.put(None)
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def _write(self, payload):
+        try:
+            self.proc.stdin.write(json.dumps(payload) + "\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError):
+            raise GrokError("process_exited", "the Grok process is not accepting input")
+
+    def notify(self, method, params=None):
+        payload = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            payload["params"] = params
+        self._write(payload)
+
+    def respond(self, request_id, result=None, error=None):
+        payload = {"jsonrpc": "2.0", "id": request_id}
+        if error is not None:
+            payload["error"] = error
+        else:
+            payload["result"] = result if result is not None else {}
+        self._write(payload)
+
+    def request(self, method, params, on_message=None, tick=None, timeout=GROK_ACP_TIMEOUT):
+        """Send one request; return its result. Agent messages meanwhile go to `on_message`.
+
+        `timeout=None` waits as long as the agent works (a prompt turn); `tick` still runs.
+        """
+        self.next_id += 1
+        rid = self.next_id
+        payload = {"jsonrpc": "2.0", "id": rid, "method": method}
+        if params is not None:
+            payload["params"] = params
+        self._write(payload)
+        deadline = None if timeout is None else time.time() + timeout
+        last_tick = 0.0
+        while True:
+            try:
+                message = self.inbox.get(timeout=GROK_TICK_SECONDS)
+            except queue.Empty:
+                message = False
+            now = time.time()
+            if tick and now - last_tick >= GROK_TICK_SECONDS:
+                last_tick = now
+                tick()
+            if message is False:
+                if deadline is not None and now > deadline:
+                    raise GrokError("timeout", "no response to %s" % method)
+                if not self.alive() and self.inbox.empty():
+                    raise GrokError("process_exited", "the Grok process exited")
+                continue
+            if message is None:
+                raise GrokError("process_exited", "the Grok process exited")
+            if message.get("_malformed"):
+                if self.malformed > GROK_MAX_MALFORMED:
+                    raise GrokError("protocol", "too many malformed messages from Grok")
+                continue
+            if "method" in message:
+                if on_message:
+                    on_message(message)
+                elif "id" in message:
+                    self.respond(message["id"], error={"code": -32601, "message": "not supported"})
+                continue
+            if message.get("id") == rid:
+                if isinstance(message.get("error"), dict):
+                    err = message["error"]
+                    data = err.get("data")
+                    detail = (data.get("message") if isinstance(data, dict) else None) or err.get("message") or "error"
+                    raise GrokError("rpc", str(detail)[:200], err.get("code"))
+                result = message.get("result")
+                if result is not None and not isinstance(result, dict):
+                    raise GrokError("protocol", "unexpected result shape for %s" % method)
+                return result or {}
+
+    def terminate(self):
+        if self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    self.proc.kill()  # our own child, after a polite request went unanswered
+                    self.proc.wait(timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        for stream in (self.proc.stdin, self.proc.stdout):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+
+class GrokBridge(object):
+    """One logical session's ACP client and sole writer. Runs as a detached process."""
+
+    def __init__(self, lsid, mode="start"):
+        self.lsid = lsid
+        self.mode = mode
+        self.sid = None
+        self.epoch = None
+        self.client = None
+        self.repository = None
+        self.terminating = False
+        self.loading = False
+        self.cancel_sent = False
+        self.cancel_time = 0.0
+        self.tools = {}
+        self.thoughts = 0
+        self.lines = []
+        self.partial = ""
+        self.last_flush = time.time()
+        self.last_text = 0.0
+        self.last_beat = 0.0
+        self.restarts = 0
+        self.grok_bin = None
+
+    # -- helpers ---------------------------------------------------------------
+    def audit(self, event, **fields):
+        log_event("grok_" + event, logical_session_id=self.lsid, **fields)
+
+    def history(self, event, **fields):
+        logical_mutate(self.lsid, lambda rec: logical_history(rec, event, **fields))
+
+    def record(self):
+        return logical_read(self.lsid) or {}
+
+    def still_owner(self, record=None):
+        record = record or self.record()
+        owner = record.get("owner") or {}
+        return owner.get("agent_session_id") == self.sid and owner.get("epoch") == self.epoch and record.get("state") not in LS_TERMINAL
+
+    def set_acp_state(self, state):
+        def mutate(record):
+            record["grok_acp"] = {"state": state, "utc": utc_stamp()}
+        logical_mutate(self.lsid, mutate)
+
+    def heartbeat(self, force=False):
+        now = time.time()
+        if not force and now - self.last_beat < GROK_HEARTBEAT_SECONDS:
+            return
+        self.last_beat = now
+        state = "running" if (self.client and self.client.alive()) else "idle"
+
+        def mutate(record):
+            if _is_owner(record, self.sid):
+                record["agent_poll_epoch"] = time.time()
+                record["agent_poll_utc"] = utc_stamp()
+                record["grok_acp"] = {"state": state, "utc": utc_stamp()}
+        logical_mutate(self.lsid, mutate)
+
+    # -- transcript --------------------------------------------------------------
+    def add_text(self, chunk):
+        self.partial += chunk
+        self.last_text = time.time()
+        while "\n" in self.partial:
+            line, self.partial = self.partial.split("\n", 1)
+            if line.strip():
+                self.lines.append(line.rstrip())
+        while len(self.partial) > MAX_OUTPUT_LINE_CHARS:
+            self.lines.append(self.partial[:MAX_OUTPUT_LINE_CHARS])
+            self.partial = self.partial[MAX_OUTPUT_LINE_CHARS:]
+        if len(self.lines) >= GROK_FLUSH_LINES:
+            self.flush()
+
+    def add_line(self, text):
+        self.flush(partial=True)
+        self.lines.append(text)
+        self.flush()
+
+    def flush(self, partial=False):
+        if partial and self.partial.strip():
+            self.lines.append(self.partial.rstrip())
+            self.partial = ""
+        if self.lines:
+            batch, self.lines = self.lines, []
+            logical_append_output_lines(self.lsid, self.sid, batch)
+        self.last_flush = time.time()
+
+    # -- ACP plumbing ------------------------------------------------------------
+    def spawn(self):
+        argv = [self.grok_bin, "agent", "--no-leader"]
+        if grok_permission_mode() == "always-approve":
+            argv.append("--always-approve")
+        argv.append("stdio")
+        env = dict(os.environ)
+        env.pop("CLAUDE_TERMINAL_HANDOFF_LAUNCH_TOKEN", None)
+        if grok_permission_mode() == "ask":
+            env["GROK_DEFAULT_PERMISSION_MODE"] = "ask"
+        if grok_sandbox_profile():
+            env["GROK_SANDBOX"] = grok_sandbox_profile()
+        self.client = GrokAcpClient(argv, self.repository, env)
+        self.audit("process_launched", pid=self.client.pid, permission_mode=grok_permission_mode(), sandbox=grok_sandbox_profile() or "off")
+        self.set_acp_state("running")
+        init = self.client.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}}, tick=self.tick_light)
+        capabilities = init.get("agentCapabilities")
+        if not isinstance(capabilities, dict) or not capabilities.get("loadSession"):
+            raise GrokError("protocol", "Grok does not support reloading sessions")
+
+    def new_session(self):
+        meta = {} if grok_permission_mode() == "always-approve" else {"yoloMode": False, "autoMode": False}
+        result = self.client.request(
+            "session/new", {"cwd": self.repository, "mcpServers": [], "_meta": meta},
+            on_message=self.on_message, tick=self.tick_light, timeout=GROK_NEW_SESSION_TIMEOUT,
+        )
+        sid = result.get("sessionId")
+        if not isinstance(sid, str) or not sid:
+            raise GrokError("protocol", "Grok did not return a session id")
+        return sid
+
+    def load_session(self, sid):
+        self.loading = True
+        try:
+            self.client.request(
+                "session/load", {"sessionId": sid, "cwd": self.repository, "mcpServers": []},
+                on_message=self.on_message, tick=self.tick_light, timeout=GROK_NEW_SESSION_TIMEOUT,
+            )
+        finally:
+            self.loading = False
+        self.audit("session_loaded")
+        self.history("grok_session_loaded")
+
+    def ensure_client(self):
+        if self.client and self.client.alive():
+            return
+        if self.client:
+            self.client.terminate()
+        self.spawn()
+        try:
+            self.load_session(self.sid)
+        except GrokError as exc:
+            self.audit("session_load_failed", reason=exc.code)
+            self.history("grok_load_failed", reason=exc.code)
+            raise GrokBridgeExit("could not reload the exact Grok session: %s" % grok_error_reason(exc), 1)
+
+    def on_message(self, message):
+        method = message.get("method")
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        if method == "session/update":
+            if params.get("sessionId") == self.sid and not self.loading:
+                self.on_update(params.get("update") if isinstance(params.get("update"), dict) else {})
+        elif method == "session/request_permission" and "id" in message:
+            self.on_permission(message["id"], params)
+        elif "id" in message:
+            self.client.respond(message["id"], error={"code": -32601, "message": "not supported"})
+
+    def on_update(self, update):
+        kind = update.get("sessionUpdate")
+        if kind == "agent_message_chunk":
+            content = update.get("content")
+            text = content.get("text") if isinstance(content, dict) else None
+            if isinstance(text, str):
+                self.add_text(text)
+        elif kind == "agent_thought_chunk":
+            self.thoughts += 1  # counted, never shown: hidden reasoning is not user-visible output
+        elif kind == "tool_call":
+            title = clean_untrusted_text(update.get("title") or update.get("kind") or "tool", GROK_TOOL_TITLE_MAX) or "tool"
+            self.tools[str(update.get("toolCallId"))] = title
+            self.add_line("[tool] %s" % title)
+        elif kind == "tool_call_update":
+            status = update.get("status")
+            title = self.tools.get(str(update.get("toolCallId")))
+            if title and status in ("completed", "failed"):
+                self.add_line("[tool %s] %s" % (status, title))
+
+    def on_permission(self, request_id, params):
+        tool = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
+        options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
+        title = redact_secrets(clean_untrusted_text(tool.get("title") or tool.get("kind") or "an action", GROK_TOOL_TITLE_MAX) or "an action")
+        allow = next((o for o in options if o.get("kind") == "allow_once" and o.get("optionId")), None)
+        reject = next((o for o in options if o.get("kind") == "reject_once" and o.get("optionId")), None)
+        self.flush(partial=True)
+        outcome = "denied"
+        if allow is not None:
+            ok, why, approval = approval_request(
+                self.lsid, self.sid, "Grok: %s" % title,
+                "Grok is asking to run a %s action. Approving allows this one action only." % (clean_untrusted_text(tool.get("kind") or "tool", 40) or "tool"),
+            )
+            self.audit("permission_requested", ok=bool(ok))
+            if ok:
+                outcome = self.wait_for_approval(approval["id"], "Grok: %s" % title)
+        self.audit("permission_decided", outcome=outcome)
+        if outcome == "approved" and allow is not None:
+            reply = {"outcome": {"outcome": "selected", "optionId": allow["optionId"]}}
+        elif outcome == "denied" and reject is not None:
+            reply = {"outcome": {"outcome": "selected", "optionId": reject["optionId"]}}
+        else:
+            reply = {"outcome": {"outcome": "cancelled"}}
+        self.client.respond(request_id, reply)
+
+    def wait_for_approval(self, approval_id, action):
+        while True:
+            self.tick()
+            record = self.record()
+            if not self.still_owner(record) or logical_halt_reason(record) == "stop":
+                return "cancelled"
+            _sweep_approvals(record)
+            approval = next((a for a in record.get("approvals") or [] if a.get("id") == approval_id), None)
+            status = (approval or {}).get("status")
+            if status == AP_APPROVED:
+                ok, _, _ = approval_consume(self.lsid, self.sid, approval_id, action)
+                return "approved" if ok else "denied"
+            if status not in (AP_PENDING, AP_APPROVED):
+                return "denied"
+            time.sleep(GROK_IDLE_SECONDS)
+
+    # -- control -----------------------------------------------------------------
+    def tick_light(self):
+        if self.terminating:
+            raise GrokBridgeExit("terminated", 0)
+
+    def tick(self):
+        self.tick_light()
+        record = self.record()
+        if not self.still_owner(record):
+            raise GrokBridgeExit("ownership changed or the session ended", 0)
+        now = time.time()
+        if logical_halt_reason(record) == "stop" and not self.cancel_sent and self.client and self.client.alive():
+            self.cancel_sent = True
+            self.cancel_time = now
+            self.audit("cancel_sent")
+            self.history("grok_cancel_sent")
+            try:
+                self.client.notify("session/cancel", {"sessionId": self.sid})
+            except GrokError:
+                pass
+        if self.cancel_sent and now - self.cancel_time > env_float("CLAUDE_TERMINAL_HANDOFF_GROK_STOP_GRACE", GROK_STOP_GRACE_SECONDS) and self.client and self.client.alive():
+            self.client.terminate()  # Grok did not stop when asked; end its process
+        quiet = self.partial.strip() and now - self.last_text >= GROK_QUIET_FLUSH_SECONDS
+        if quiet or now - self.last_flush >= GROK_FLUSH_SECONDS:
+            self.flush(partial=bool(quiet))
+        self.heartbeat()
+
+    def deliver(self, message):
+        text = message.get("text") or ""
+        first = (text.strip().splitlines() or [""])[0][:300]
+        self.audit("instruction_delivered", message_id=message["id"], chars=len(text))
+        try:
+            self.ensure_client()
+            self.cancel_sent = False
+            self.thoughts = 0
+            self.add_line("You: %s" % first)
+            result = self.client.request(
+                "session/prompt", {"sessionId": self.sid, "prompt": [{"type": "text", "text": text}]},
+                on_message=self.on_message, tick=self.tick, timeout=None,
+            )
+            stop_reason = result.get("stopReason")
+        except GrokError as exc:
+            self.flush(partial=True)
+            if exc.code == "process_exited" and not self.cancel_sent:
+                self.on_process_death(message)
+                return
+            if exc.code == "process_exited":
+                stop_reason = "cancelled"
+            else:
+                self.add_line("Grok error: %s" % grok_error_reason(exc))
+                self.audit("prompt_failed", reason=exc.code)
+                inbox_ack(self.lsid, self.sid, message["id"])  # not retried: a failing prompt must not loop
+                if exc.code in ("protocol", "timeout") and self.client:
+                    self.client.terminate()  # a desynchronised stream is not reused; the next turn reloads the exact session
+                    self.client = None
+                return
+        self.flush(partial=True)
+        self.audit("turn_ended", stop_reason=str(stop_reason)[:40], thought_chunks_suppressed=self.thoughts)
+        if self.cancel_sent or stop_reason == "cancelled":
+            self.add_line("Interrupted by STOP")
+        inbox_ack(self.lsid, self.sid, message["id"])
+        self.cancel_sent = False
+
+    def on_process_death(self, message):
+        self.audit("process_exited")
+        self.history("grok_process_exited")
+        self.set_acp_state("exited")
+        self.restarts += 1
+        inbox_requeue(self.lsid, self.sid, message["id"])
+        if self.restarts > GROK_MAX_RESTARTS:
+            raise GrokBridgeExit("the Grok process keeps exiting", 1)
+        self.client = None
+
+    def idle(self):
+        self.tick_light()
+        self.heartbeat()
+        time.sleep(GROK_IDLE_SECONDS)
+
+    # -- lifecycle -----------------------------------------------------------------
+    def fail(self, reason, code=1):
+        _remote_failure_record(self.lsid, reason)
+        self.audit("bridge_failed", reason=reason[:100])
+        return code
+
+    def run(self):
+        record = logical_read(self.lsid)
+        if not record or agent_type_of(record) != AGENT_GROK:
+            return 2
+        signal.signal(signal.SIGTERM, lambda *_: setattr(self, "terminating", True))
+        real, _, why = project_resolve(record.get("project") or "")
+        if real is None or real != record.get("repository"):
+            return self.fail("the project is no longer available at its registered location")
+        self.repository = real
+        self.grok_bin = find_grok_executable()
+        if not self.grok_bin:
+            return self.fail(GROK_NOT_INSTALLED)
+        token = None
+        if self.mode == "start":
+            token_file = th_path("prompts", "remote-%s.tok" % self.lsid)
+            try:
+                token = _read_text(token_file).strip()
+                os.unlink(token_file)
+            except (OSError, IOError):
+                return self.fail("the launch token is missing")
+        try:
+            self.spawn()
+            binding = None
+            if self.mode == "start":
+                self.sid = self.new_session()
+                ok, why, _ = logical_set_grok_session(self.lsid, self.sid)
+                if not ok:
+                    return self.fail(why)
+                binding = grok_bridge_binding(self.sid)
+                ok, why, _ = logical_register_owner(self.lsid, self.sid, 1, None, binding, token)
+                if not ok:
+                    return self.fail("registration refused: %s" % why)
+                self.epoch = (logical_read(self.lsid) or {}).get("owner_epoch")
+            else:
+                self.sid = record.get("grok_session_id")
+                if not self.sid:
+                    raise GrokBridgeExit("no Grok session id is recorded; refusing to start a new conversation", 1)
+                try:
+                    self.load_session(self.sid)
+                except GrokError as exc:
+                    self.audit("session_load_failed", reason=exc.code)
+                    self.history("grok_load_failed", reason=exc.code)
+                    raise GrokBridgeExit("could not reload the exact Grok session: %s" % grok_error_reason(exc), 1)
+                binding = grok_bridge_binding(self.sid)
+                ok, why, epoch = grok_reown(self.lsid, self.sid, binding, by="bridge")
+                if not ok:
+                    raise GrokBridgeExit("re-attach refused: %s" % why, 1)
+                self.epoch = epoch
+            self.heartbeat(force=True)
+            self.loop()
+            return 0
+        except GrokBridgeExit as exc:
+            self.audit("bridge_exit", reason=exc.reason[:100])
+            if self.mode == "start" and (logical_read(self.lsid) or {}).get("state") == LS_CREATING:
+                return self.fail(exc.reason)
+            return exc.code
+        except GrokError as exc:
+            reason = grok_error_reason(exc)
+            self.audit("bridge_error", reason=exc.code)
+            if (logical_read(self.lsid) or {}).get("state") == LS_CREATING:
+                return self.fail(reason)
+            return 1
+        finally:
+            try:
+                self.flush(partial=True)
+            except Exception:
+                pass
+            if self.client:
+                self.client.terminate()
+
+    def loop(self):
+        while not self.terminating:
+            record = self.record()
+            if not self.still_owner(record):
+                self.audit("ownership_lost")
+                return
+            if logical_halt_reason(record):
+                self.idle()
+                continue
+            ok, why, claimed = inbox_claim(self.lsid, self.sid, limit=1)
+            if not ok or not claimed:
+                self.idle()
+                continue
+            self.deliver(claimed[0])
+
+
+def grok_bridge_argv(lsid, mode):
+    command = (logical_read(lsid) or {}).get("th_command") or {}
+    return [command.get("python") or sys.executable or "python3", command.get("core") or os.path.abspath(__file__), "grok-bridge", lsid, "--mode", mode]
+
+
+def launch_grok_bridge(lsid, mode="start"):
+    """Start the bridge detached, so it survives a gateway restart. Returns a small result dict."""
+    argv = grok_bridge_argv(lsid, mode)
+    log_path = th_path("logs", "grok-bridge-%s.log" % lsid)
+    try:
+        handle = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab")
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=handle, stderr=handle, start_new_session=True, close_fds=True)
+        handle.close()
+    except OSError:
+        return {"launched": False}
+    threading.Thread(target=proc.wait, daemon=True).start()  # reap it when it exits; never leave a zombie
+    log_event("grok_bridge_launched", logical_session_id=lsid, mode=mode, pid=proc.pid)
+    return {"launched": True, "pid": proc.pid}
+
+
+def cmd_grok_bridge(args):
+    return GrokBridge(args.logical_session, args.mode).run()
+
+
+def grok_reattach(lsid, by="local", launcher=None):
+    """Recover an ORPHANED Grok session by starting a new bridge that reloads the exact stored session."""
+    record = logical_read(lsid)
+    if not record or agent_type_of(record) != AGENT_GROK:
+        return False, "not a Grok session", None
+    if record.get("state") != LS_ORPHANED:
+        return False, "session is not ORPHANED", None
+    if not record.get("grok_session_id"):
+        return False, "no Grok session id is recorded; a new conversation is never started implicitly", None
+    if grok_owner_liveness(record)[0] == "alive":
+        return False, "another Grok bridge still owns this session", None
+    grok_bin = find_grok_executable()
+    if not grok_bin:
+        return False, GROK_NOT_INSTALLED, None
+    ok, _, reason = grok_preflight(grok_bin)
+    if not ok:
+        return False, reason, None
+    result = (launcher or launch_grok_bridge)(lsid, "reattach")
+    if not result.get("launched"):
+        return False, "the Grok bridge could not be started", None
+    log_event("grok_reattach_requested", logical_session_id=lsid, by=by)
+    return True, None, logical_read(lsid)
+
+
+def grok_health():
+    """Agent-specific status for `th status`: no credentials, no session contents."""
+    grok_bin = find_grok_executable()
+    posture, detail = grok_config_permission_posture()
+    sessions = [r for r in logical_list() if agent_type_of(r) == AGENT_GROK and r.get("state") not in LS_TERMINAL]
+    return {
+        "executable_found": bool(grok_bin),
+        "version": grok_version(grok_bin) if grok_bin else None,
+        "credentials_present": grok_credentials_present(),
+        "terminal_handoff_permission_mode": grok_permission_mode(),
+        "sandbox_profile": grok_sandbox_profile() or "off",
+        "grok_config_permission_posture": posture,
+        "would_start_in_ask_mode": grok_permission_mode() != "ask" or posture != "bypass",
+        "active_sessions": [
+            {
+                "logical_session_id": r["logical_session_id"],
+                "state": r.get("state"),
+                "grok_session_bound": bool(r.get("grok_session_id")),
+                "acp": (r.get("grok_acp") or {}).get("state") or "unknown",
+                "owner": grok_owner_liveness(r)[0],
+            }
+            for r in sessions
+        ],
+    }
+
+
+def remote_create_grok_session(body, ctx, project_name, real, project, profile, task, custom_name, request_key,
+                               wait_seconds=None, sleep=time.sleep, preflight=None, launcher=None):
+    """Create a Grok logical session in an already-registered project and start its bridge."""
+    wait_seconds = DEFAULT_CREATE_WAIT if wait_seconds is None else wait_seconds
+    device_id = ctx["device_id"]
+    if AGENT_GROK not in project_agents(project):
+        log_event("remote_create_refused", device_id=device_id, project=project_name, reason="grok not enabled for project")
+        return 403, {"error": "agent_not_enabled", "reason": "Grok is not enabled for this project."}
+    grok_bin = find_grok_executable()
+    if not grok_bin:
+        return 503, {"error": "grok_unavailable", "reason": GROK_NOT_INSTALLED}
+    ok, error, reason = (preflight or grok_preflight)(grok_bin)
+    if not ok:
+        log_event("remote_create_refused", device_id=device_id, project=project_name, reason=error)
+        return 503, {"error": error, "reason": reason}
+    repo = capture_repo_state(real)
+    for flag in ("merge_in_progress", "rebase_in_progress", "cherry_pick_in_progress", "revert_in_progress"):
+        if repo.get(flag):
+            return 409, {"error": "repository_busy", "reason": "a git operation is in progress"}
+
+    with _create_lock():
+        for existing in logical_list():
+            if existing.get("created_request_id") == request_key:
+                return 200, dict(logical_public_view(existing), duplicate=True)
+        for existing in logical_list():
+            if existing.get("project") == project_name and existing.get("state") not in LS_TERMINAL:
+                return 409, {"error": "project_in_use", "logical_session_id": existing["logical_session_id"]}
+        launch_token = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
+        record = logical_create(
+            project=project_name,
+            repository=real,
+            branch=repo.get("branch"),
+            created_by="device:%s" % device_id,
+            launch_token_sha256=_sha256(launch_token),
+            launch_expires_epoch=time.time() + LAUNCH_TOKEN_TTL,
+            title=task.splitlines()[0][:120],
+            agent_type=AGENT_GROK,
+        )
+        lsid = record["logical_session_id"]
+
+        def annotate(rec):
+            rec["created_request_id"] = request_key
+            rec["name"] = custom_name
+            rec["th_command"] = {"python": sys.executable or "python3", "core": os.path.abspath(__file__)}
+            rec["permissions"] = {"profile": profile["profile"], "human_gate": list(profile["human_gate"]), "settings_file": None}
+
+        logical_mutate(lsid, annotate)
+    log_event("remote_session_created", logical_session_id=lsid, project=project_name, device_id=device_id, agent=AGENT_GROK)
+
+    ok, why, message = inbox_post(lsid, task, idempotency_key="task-%s" % lsid[3:], source="device:%s" % device_id, limit=MAX_TASK_CHARS)
+    if not ok:
+        return _remote_failure(lsid, "could not queue the task: %s" % why)
+    token_file = th_path("prompts", "remote-%s.tok" % lsid)
+    write_text_private(token_file, launch_token)
+    result = (launcher or launch_grok_bridge)(lsid, "start")
+    if not result.get("launched"):
+        _remove_launch_material(lsid)
+        return _remote_failure(lsid, "the Grok bridge could not be started")
+
+    deadline = time.time() + wait_seconds
+    while True:
+        record = logical_read(lsid)
+        if record.get("state") != LS_CREATING or time.time() >= deadline:
+            break
+        sleep(0.5)
+    if record.get("state") == LS_CREATING:
+        if wait_seconds <= 0:
+            return 202, dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac")
+        _remove_launch_material(lsid)
+        return _remote_failure(lsid, "the Mac did not confirm the session started", 504)
+    _remove_launch_material(lsid)
+    if record.get("state") in LS_TERMINAL:
+        reason = ((record.get("failure") or {}).get("reason")) or "the Grok session could not be started"
+        return 502, {"logical_session_id": lsid, "state": record.get("state"), "error": "launch_failed", "reason": reason}
+    log_event("remote_session_running", logical_session_id=lsid, agent=AGENT_GROK)
+    return 201, logical_public_view(logical_read(lsid))
 
 
 def remote_create_session_handler(body, ctx):
@@ -9355,6 +10440,8 @@ def owner_liveness(record, now=None):
     session record does not show the session alive. Anything else is unknown.
     """
     now = time.time() if now is None else now
+    if agent_type_of(record) == AGENT_GROK:
+        return grok_owner_liveness(record)
     owner = record.get("owner") or {}
     agent = owner.get("agent_session_id")
     if not agent:
@@ -9462,7 +10549,7 @@ def logical_reconcile(lsid, liveness=None, now=None, strict=False):
         _notify_attention(
             {"chain_id": lsid, "parent_session_id": lsid, "attempt_id": "orphaned", "successor_display_name": (record or {}).get("project") or "Session"},
             "owner_lost",
-            "the Claude session stopped responding",
+            "the %s session stopped responding" % AGENT_LABELS[agent_type_of(record)],
             "It is marked ORPHANED and will not be replaced automatically. Recover or abandon it deliberately.",
             "orphaned_%s_%s" % (lsid, (record or {}).get("owner_epoch")),
         )
@@ -10575,7 +11662,7 @@ def main(argv=None):
     p.set_defaults(func=cmd_session)
 
     p = sub.add_parser("project", help="Remote project registry and permission profiles")
-    p.add_argument("action", choices=("list", "add", "remove", "enable-remote", "disable-remote", "permissions"))
+    p.add_argument("action", choices=("list", "add", "remove", "enable-remote", "disable-remote", "enable-grok", "disable-grok", "permissions"))
     p.add_argument("rest", nargs="*")
     p.add_argument("--from-file", default=None)
     p.set_defaults(func=cmd_project)
@@ -10615,6 +11702,11 @@ def main(argv=None):
     p = sub.add_parser("coverage", help="Report status-line coverage across all Claude settings")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_coverage)
+
+    p = sub.add_parser("grok-bridge", help="Internal: run the ACP bridge for one Grok logical session")
+    p.add_argument("logical_session")
+    p.add_argument("--mode", choices=("start", "reattach"), default="start")
+    p.set_defaults(func=cmd_grok_bridge)
 
     p = sub.add_parser("status", help="Show Terminal Handoff runtime state")
     p.set_defaults(func=cmd_status)
