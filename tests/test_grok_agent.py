@@ -48,6 +48,7 @@ class GrokCase(LaunchCase):
             os.environ.pop(key, None)
         ok, why = CORE.project_set_agent("nova", "grok", True)
         self.assertTrue(ok, why)
+        self.start_server(wait=45.0)  # a bridge is a real process (interpreter start, module import, ACP handshake): allow for a loaded machine
         self.n = 0
 
     def tearDown(self):
