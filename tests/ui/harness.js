@@ -62,6 +62,7 @@ process.stdin.on('end', async () => {
     if (step.focus) { let t = null; app.walk((n) => { if (n.tag === step.focus && !t) t = n; }); document.activeElement = t; if (t && t.listeners.focus) t.listeners.focus({}); continue; }
     if (step.blur) { const t = document.activeElement; document.activeElement = null; if (t && t.listeners.blur) t.listeners.blur({}); await tick(); continue; }
     if (step.snap) { snaps[step.snap] = { boxes: boxes(), text: app.textContent, buttons: (() => { const b = []; app.walk((n) => { if (n.tag === 'button') b.push(n.textContent); }); return b; })() }; continue; }
+    if (step.aria) { let t = null; app.walk((n) => { if (n.attrs['aria-label'] === step.aria && !t) t = n; }); if (t) { t.value = step.value; if (t.listeners.change) t.listeners.change({}); } continue; }
     if (step.type) { let t = null; app.walk((n) => { if (n.tag === step.type && !t) t = n; }); if (t) t.value = step.value; continue; }
     let b = null; app.walk((n) => { if (n.tag === 'button' && n.textContent === step.click && !b) b = n; });
     if (b && b.listeners.click) b.listeners.click({});
