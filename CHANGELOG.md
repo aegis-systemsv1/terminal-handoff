@@ -12,9 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **New Session said "project and a non-empty task are required" for a task that was not
-  empty.** The task was over the 8000-character limit; the server reported that as an empty
-  task. It now says `the task is too long: N characters, the limit is 8000`. Empty tasks and
-  missing projects also get their own accurate messages. The limit itself is unchanged.
+  empty.** The task was over the length limit; the server reported that as an empty task.
+  It now says `Task is too long: N characters; maximum is 24,000`. Empty tasks and missing
+  projects also get their own accurate messages.
+
+### Changed
+
+- The New Session task limit rose from 8,000 to 24,000 characters. Follow-up instructions
+  keep their 8,000-character limit, and the 32 KB request-body limit is unchanged.
 
 ## [1.4.1] - 2026-09-20
 

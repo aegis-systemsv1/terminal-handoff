@@ -19,14 +19,21 @@ class TestNewSessionTask(NameCase):
         self.assertEqual(len(self.launched), 1)
 
     def test_task_at_the_limit_starts(self):
-        status, view = self.create(request_id="req-task-limit-1", task=("x" * 79 + "\n") * 100)
+        status, view = self.create(request_id="req-task-limit-1", task="x" * CORE.MAX_TASK_CHARS)
         self.assertEqual(status, 201, view)
 
+    def test_a_task_between_the_old_and_new_limits_now_starts(self):
+        status, view = self.create(request_id="req-task-mid-1", task="y" * 20000)
+        self.assertEqual(status, 201, view)
+
+    def test_follow_up_instructions_keep_their_own_limit(self):
+        self.assertEqual(CORE.MAX_INSTRUCTION_CHARS, 8000)
+        self.assertEqual(CORE.MAX_TASK_CHARS, 24000)
+
     def test_over_long_task_is_reported_as_too_long_not_empty(self):
-        status, body = self.create(request_id="req-task-long-1", name="ShipSure", task=("A long, real line of task text.\n" * 400))
+        status, body = self.create(request_id="req-task-long-1", name="ShipSure", task="A" * 25123)
         self.assertEqual(status, 400)
-        self.assertIn("too long", body["reason"])
-        self.assertIn(str(CORE.MAX_INSTRUCTION_CHARS), body["reason"])
+        self.assertEqual(body["reason"], "Task is too long: 25,123 characters; maximum is 24,000")
         self.assertNotIn("non-empty", body["reason"])
         self.assertEqual(self.launched, [])  # validation is not weakened: nothing starts
 
