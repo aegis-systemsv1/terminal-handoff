@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-09-21
+
+### Fixed
+
+- **New Session said "project and a non-empty task are required" for a task that was not
+  empty.** The task was over the 8000-character limit; the server reported that as an empty
+  task. It now says `the task is too long: N characters, the limit is 8000`. Empty tasks and
+  missing projects also get their own accurate messages. The limit itself is unchanged.
+
 ## [1.4.1] - 2026-09-20
 
 Two things physical iPhone use showed were not good enough. No change to handoff,

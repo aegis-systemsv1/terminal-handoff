@@ -44,7 +44,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.4.1"
+TERMINAL_HANDOFF_VERSION = "1.4.2"
 MANIFEST_SCHEMA_VERSION = 2
 NOTIFICATION_SCHEMA_VERSION = 1
 
@@ -8856,8 +8856,14 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
 
     project_name = body.get("project")
     task = clean_untrusted_text(body.get("task"), MAX_INSTRUCTION_CHARS)
-    if not isinstance(project_name, str) or task is None:
-        return 400, {"error": "bad_request", "reason": "project and a non-empty task are required"}
+    if not isinstance(project_name, str):
+        return 400, {"error": "bad_request", "reason": "a project is required"}
+    if task is None:
+        # An over-long task is a different failure from an empty one; say which (lengths only, never content).
+        full = clean_untrusted_text(body.get("task"), 10 ** 9)
+        if full is not None:
+            return 400, {"error": "bad_request", "reason": "the task is too long: %d characters, the limit is %d" % (len(full), MAX_INSTRUCTION_CHARS)}
+        return 400, {"error": "bad_request", "reason": "a non-empty task is required"}
     name_ok, custom_name, name_why = clean_session_name(body.get("name"))
     if not name_ok:
         return 400, {"error": "bad_request", "reason": name_why}
