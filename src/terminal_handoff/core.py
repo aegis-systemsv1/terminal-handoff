@@ -44,7 +44,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-TERMINAL_HANDOFF_VERSION = "1.4.1"
+TERMINAL_HANDOFF_VERSION = "1.4.2"
 MANIFEST_SCHEMA_VERSION = 2
 NOTIFICATION_SCHEMA_VERSION = 1
 
@@ -6121,6 +6121,7 @@ LS_STATES = (
 LS_TERMINAL = (LS_COMPLETED, LS_FAILED)
 
 MAX_INSTRUCTION_CHARS = 8000
+MAX_TASK_CHARS = 24000  # the New Session task only; follow-up instructions keep MAX_INSTRUCTION_CHARS
 MAX_IDEMPOTENCY_KEY = 80
 MAX_INBOX_KEPT = 300
 MAX_OUTPUT_LINES = 2000
@@ -6681,11 +6682,11 @@ def logical_halt_reason(record):
 # -- Durable instruction inbox ----------------------------------------------
 
 
-def inbox_post(lsid, text, idempotency_key=None, source="local"):
+def inbox_post(lsid, text, idempotency_key=None, source="local", limit=MAX_INSTRUCTION_CHARS):
     """Queue one instruction. Durable, ordered, deduplicated by key."""
-    body = clean_untrusted_text(text, MAX_INSTRUCTION_CHARS)
+    body = clean_untrusted_text(text, limit)
     if body is None:
-        return False, "instruction must be non-empty text of at most %d characters" % MAX_INSTRUCTION_CHARS, None
+        return False, "instruction must be non-empty text of at most %d characters" % limit, None
     key = None
     if idempotency_key is not None:
         if not isinstance(idempotency_key, str) or not re.match(r"^[A-Za-z0-9._:-]{8,%d}$" % MAX_IDEMPOTENCY_KEY, idempotency_key):
@@ -8855,9 +8856,15 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     request_key = "device:%s:%s" % (device_id, body["request_id"])
 
     project_name = body.get("project")
-    task = clean_untrusted_text(body.get("task"), MAX_INSTRUCTION_CHARS)
-    if not isinstance(project_name, str) or task is None:
-        return 400, {"error": "bad_request", "reason": "project and a non-empty task are required"}
+    task = clean_untrusted_text(body.get("task"), MAX_TASK_CHARS)
+    if not isinstance(project_name, str):
+        return 400, {"error": "bad_request", "reason": "a project is required"}
+    if task is None:
+        # An over-long task is a different failure from an empty one; say which (lengths only, never content).
+        full = clean_untrusted_text(body.get("task"), 10 ** 9)
+        if full is not None:
+            return 400, {"error": "bad_request", "reason": "Task is too long: {:,} characters; maximum is {:,}".format(len(full), MAX_TASK_CHARS)}
+        return 400, {"error": "bad_request", "reason": "a non-empty task is required"}
     name_ok, custom_name, name_why = clean_session_name(body.get("name"))
     if not name_ok:
         return 400, {"error": "bad_request", "reason": name_why}
@@ -8917,7 +8924,7 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
         logical_mutate(lsid, annotate)
     log_event("remote_session_created", logical_session_id=lsid, project=project_name, device_id=device_id)
 
-    ok, why, message = inbox_post(lsid, task, idempotency_key="task-%s" % lsid[3:], source="device:%s" % device_id)
+    ok, why, message = inbox_post(lsid, task, idempotency_key="task-%s" % lsid[3:], source="device:%s" % device_id, limit=MAX_TASK_CHARS)
     if not ok:
         return _remote_failure(lsid, "could not queue the task: %s" % why)
 

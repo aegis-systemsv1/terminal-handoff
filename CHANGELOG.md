@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-09-21
+
+### Fixed
+
+- **New Session said "project and a non-empty task are required" for a task that was not
+  empty.** The task was over the length limit; the server reported that as an empty task.
+  It now says `Task is too long: N characters; maximum is 24,000`. Empty tasks and missing
+  projects also get their own accurate messages.
+
+### Changed
+
+- The New Session task limit rose from 8,000 to 24,000 characters. Follow-up instructions
+  keep their 8,000-character limit, and the 32 KB request-body limit is unchanged.
+
 ## [1.4.1] - 2026-09-20
 
 Two things physical iPhone use showed were not good enough. No change to handoff,
