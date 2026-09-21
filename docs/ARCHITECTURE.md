@@ -419,3 +419,54 @@ parent is now bound *before* the claim, shrinking that window to a single spawn,
 45 s old, its claimant process gone (or over 5 minutes old), and no launch may have left any trace
 (manifest, transfer, launch script, completed or failed record). Recovery is bounded to three
 attempts, never touches manual claims, and is skipped by `evaluate --no-record`.
+
+## Agent adapters: Claude Code and Grok
+
+A logical session is agent-neutral. Its record carries `agent_type` (`claude` | `grok`, default `claude` for
+any record without one) and everything above the agent (ID, name, project, durable inbox, STOP, approvals,
+transcript, archive, owner epoch fencing) is shared. What differs is the *owner*: the one verified writer.
+
+```mermaid
+sequenceDiagram
+    participant Ph as iPhone
+    participant Gw as Gateway
+    participant Rec as Logical session record
+    participant Br as Grok bridge (detached)
+    participant Gk as grok agent stdio
+    Ph->>Gw: POST /sessions {project, agent: grok, task}
+    Gw->>Gw: registry, agent opt-in, preflight, pinned realpath
+    Gw->>Rec: create (CREATING), queue task, launch token
+    Gw->>Br: spawn (start_new_session)
+    Br->>Gk: initialize, session/new
+    Br->>Rec: bind grok_session_id, register owner (token, epoch 1)
+    loop each queued instruction
+        Br->>Rec: inbox_claim (owner only, not while STOP/pause)
+        Br->>Gk: session/prompt
+        Gk-->>Br: session/update (message, tool_call; thought dropped)
+        Br->>Rec: transcript lines
+        Gk-->>Br: session/request_permission
+        Br->>Rec: approval_request (WAITING_FOR_HUMAN)
+        Ph->>Gw: approve / deny
+        Br->>Gk: allow_once / reject_once
+        Br->>Rec: inbox_ack
+    end
+```
+
+**The bridge** (`grok-bridge`, an internal command) is a detached process, so a gateway restart does not
+end a Grok session. It is the ACP client, holds the `grok agent --no-leader stdio` child, registers as the
+session's owner through the same single-use launch token and epoch as a Claude owner, and re-proves its
+own `pid` + start time for liveness (`grok_owner_liveness`). Claude's liveness path is unchanged and is
+used for every non-Grok record.
+
+**Delivery** is push for Grok (the bridge sends each claimed message as `session/prompt`) and pull for
+Claude (the agent runs `session wait`). STOP is checked every half second while a turn runs: it sends
+`session/cancel`, and ends the child if it has not stopped within the grace period. The instruction
+interrupted by STOP is acknowledged, not re-run.
+
+**Reconnect.** If the bridge dies the session becomes ORPHANED like any dead owner. **Re-check** starts a new
+bridge in `reattach` mode: it spawns Grok, calls `session/load` with the *stored* session id (replayed
+history is discarded, not shown), and only then takes ownership (`grok_reown`, a fenced epoch bump that
+refuses while another bridge is alive). If the load fails it changes nothing.
+
+**Context.** There is no Terminal Handoff A to B handoff for Grok. Grok's own persistence, load and
+compaction apply. See [ADR 0007](decisions/0007-grok-agent-adapter.md).

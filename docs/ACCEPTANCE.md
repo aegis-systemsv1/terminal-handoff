@@ -83,3 +83,28 @@ See [README.md](../README.md#known-limitations). None was reopened as a blocker:
 Claude's runtime permission mode can change independently; Auto Mode profiles are not an OS sandbox; the
 interactive Stop hook is unverified; new projects need one-time Claude folder trust; wake latency varies
 while Claude is busy; Mac reboot recovery is not implemented.
+
+---
+
+# Grok acceptance (1.5.0): procedure and status
+
+**Status: pending. Not yet accepted.** The implementation is verified by automated tests against a scripted ACP
+agent and by a live protocol probe (initialize, session/new) against the installed Grok CLI. A live model turn
+was not possible when this was written (the Grok account reported an exhausted balance), so the steps below have
+not been run on a phone.
+
+Use the registered **scratch** project only; enable Grok for it with `th project enable-grok scratch`, and make
+sure `~/.grok/config.toml` does not select always-approve.
+
+1. Open Terminal Handoff on the iPhone; New Session; Project **scratch**; Agent **Grok**; Name **Grok iPhone Test**.
+2. Task: a harmless request that creates one small file in the project. Start Session.
+3. Confirm Grok starts and the transcript updates (replies and tool-call status; no reasoning).
+4. Disconnect the phone; confirm Grok keeps working. Reconnect; confirm the same logical session and the same
+   Grok session.
+5. Send a follow-up; confirm it runs in the same Grok session.
+6. STOP; queue an instruction while stopped; confirm it does not run. Resume; confirm it then runs.
+7. If Grok asks permission, confirm it appears as an approval on the phone and that approve and deny both work.
+8. Stop the session, wait for ORPHANED (or abandon), archive it; confirm the project's files and Grok's own
+   history are intact.
+
+Record the result here, with the date, when it has been run.

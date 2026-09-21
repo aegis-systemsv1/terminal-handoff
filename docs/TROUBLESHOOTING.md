@@ -295,3 +295,29 @@ transcripts or repositories.
 ## Remote control
 
 See the table in [REMOTE_CONTROL.md](REMOTE_CONTROL.md#troubleshooting).
+
+## Grok
+
+**"Grok CLI is not installed on this Mac."** `th status` shows `executable_found: false`. Install Grok or set
+`CLAUDE_TERMINAL_HANDOFF_GROK_BIN`.
+
+**"Grok CLI is not authenticated on this Mac."** Run `grok login` in a terminal on the Mac. Terminal Handoff
+only checks that a login exists (`credentials_present` in `th status`).
+
+**"Grok is set to always-approve ..."** `~/.grok/config.toml` has `[ui] permission_mode = "always-approve"` (or
+`yolo = true`). Terminal Handoff will not start Grok that way by default. Change it, or deliberately set
+`grok_permission_mode` to `always-approve` in `remote/config.json` (see [Configuration](CONFIGURATION.md#grok)).
+
+**Grok is not offered on New Session.** The project needs `th project enable-grok <name>`, and the gateway must
+have been restarted onto 1.5.0.
+
+**"Grok reports that the usage balance is exhausted."** Grok returned a payment error for the turn; add
+balance to the Grok account. The instruction is not retried automatically.
+
+**A Grok session shows ORPHANED.** The bridge exited. Use **Re-check**: it starts a new bridge that reloads the
+exact stored Grok session. If it cannot (`grok_load_failed` in the transcript), the session stays ORPHANED and
+nothing new is started; **Abandon** it. Bridge output is in `logs/grok-bridge-<id>.log`.
+
+**STOP did not interrupt Grok immediately.** Terminal Handoff sends `session/cancel` and, if Grok has not
+stopped after `CLAUDE_TERMINAL_HANDOFF_GROK_STOP_GRACE` seconds, ends its process. The next resume reloads the
+same session.

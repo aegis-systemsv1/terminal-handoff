@@ -116,7 +116,7 @@ The launcher drives Apple Terminal through AppleScript. iTerm2, Ghostty,
 WezTerm, Warp, Alacritty, Kitty and tmux are **not implemented**. Nothing about
 the detector is macOS-specific, but the launch step is.
 
-## 7. Claude Code only
+## 7. Claude Code and Grok only (Grok is not at parity)
 
 Terminal Handoff depends on Claude Code's status-line JSON contract and its
 `--model` / `--effort` flags. **Codex and other agent CLIs are not implemented
@@ -184,3 +184,16 @@ long-poll rather than a push, native Claude permission prompts cannot be
 answered remotely, `--setting-sources` is undocumented and verified per Claude
 version, ORPHANED sessions are not relaunched, and Mac reboot recovery is not
 implemented.
+
+## Grok (1.5.0)
+
+* **Not at parity with Claude.** No automatic context handoff (Grok's own session/compaction applies), no
+  Remote Control, and permissions are Grok's own system.
+* **Ask mode is not verifiable from outside Grok.** See the [security model](SECURITY_MODEL.md#grok):
+  Terminal Handoff fails closed rather than trust an unverifiable setting.
+* **Live acceptance pending.** Tested against a scripted ACP agent, not a live Grok model turn.
+* **At-least-once on a crash.** An instruction in flight when Grok's process dies is offered again once the
+  session is reloaded. One interrupted by STOP is not re-run.
+* **`session/load` replays history**, which Terminal Handoff discards; it relies on Grok honouring ACP
+  `loadSession`.
+* **Agent switching mid-session, and other agents (for example Codex), are not implemented.**

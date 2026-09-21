@@ -1,16 +1,16 @@
 # Terminal Handoff
 
-**A persistent session-control and handoff system for Claude Code on macOS.**
+**Secure remote control and persistent sessions for AI coding agents on macOS: Claude Code and Grok.**
 
 Terminal Handoff lets one Claude Code *task* outlive any single Claude session. When a session fills its context window, ownership of the task is transferred automatically to a fresh successor that continues the same work. The task is also securely controllable from an enrolled iPhone (or another authorised device) over a private Tailscale network, while the actual Claude Code process keeps running on your Mac, inside a project you registered, under your own Claude login.
 
 The idea that ties it together: a **logical session** is the persistent thing (its ID, name, project, instruction queue, STOP state, approvals and history), and individual Claude processes are **replaceable workers** underneath it. A phone talks to the logical session, never to a process, so it keeps controlling the right worker across every handoff.
 
-> **Version 1.4.0.** Physical iPhone acceptance was completed on 2026-09-20. See [Acceptance evidence](#acceptance-evidence) and [Known limitations](#known-limitations).
+> **Version 1.5.0.** Adds **Grok** as a second supported agent beside Claude Code. Claude Code behaviour is unchanged from 1.4.2 (physically accepted on an iPhone). Grok is built and tested against a mocked Agent Client Protocol agent; **its physical iPhone acceptance is pending**. See [Agents](#agents-claude-code-and-grok), [Acceptance evidence](#acceptance-evidence) and [Known limitations](#known-limitations).
 
 ## Contents
 
-[What it can do](#what-terminal-handoff-can-do) · [Architecture](#architecture) · [Session lifecycle](#remote-session-lifecycle) · [Automatic handoff](#automatic-handoff) · [Control from an iPhone](#remote-control-from-iphone) · [Security model](#security-model) · [Projects](#project-registration) · [Naming](#session-naming) · [STOP / resume](#stop--resume) · [Approval gates](#human-approval-gates) · [Recovery](#recovery) · [Install and set up](#installation-and-setup) · [CLI reference](#cli-reference) · [Acceptance evidence](#acceptance-evidence) · [Limitations](#known-limitations) · [Troubleshooting](#troubleshooting) · [Local handoff in detail](#local-handoff-in-detail)
+[What it can do](#what-terminal-handoff-can-do) · [Architecture](#architecture) · [Agents: Claude and Grok](#agents-claude-code-and-grok) · [Session lifecycle](#remote-session-lifecycle) · [Automatic handoff](#automatic-handoff) · [Control from an iPhone](#remote-control-from-iphone) · [Security model](#security-model) · [Projects](#project-registration) · [Naming](#session-naming) · [STOP / resume](#stop--resume) · [Approval gates](#human-approval-gates) · [Recovery](#recovery) · [Install and set up](#installation-and-setup) · [CLI reference](#cli-reference) · [Acceptance evidence](#acceptance-evidence) · [Limitations](#known-limitations) · [Troubleshooting](#troubleshooting) · [Local handoff in detail](#local-handoff-in-detail)
 
 ---
 
@@ -44,6 +44,10 @@ The idea that ties it together: a **logical session** is the persistent thing (i
 **Mobile experience**
 
 - Mobile-friendly iPhone controls; text **drafts and focus are preserved** while the page polls, and **native iOS copy/paste works**.
+
+**Two agents, one control plane**
+
+- Start either **Claude Code** or **Grok** from the phone (Agent selector on New Session; Claude Code is the default). The agent is fixed when the session is created. See [Agents](#agents-claude-code-and-grok) for what each one supports; they are **not** at feature parity.
 
 **Access and containment**
 
@@ -80,6 +84,41 @@ flowchart TD
 ```
 
 The **logical session is persistent; Claude processes are replaceable workers.** Its ID, custom name, instruction queue, STOP state, approvals and history all belong to the logical session, so none of them changes when the worker does.
+
+---
+
+## Agents: Claude Code and Grok
+
+A logical session records an explicit `agent_type` (`claude` or `grok`). A session with no `agent_type`, that is every session made before 1.5, is Claude Code. The agent cannot be changed after creation; there is no Claude to Grok (or reverse) switching in 1.5.
+
+```mermaid
+flowchart TB
+    P["iPhone"] --> G["Gateway (loopback, Tailscale)"]
+    G --> L["Logical Session<br/>agent_type = claude | grok"]
+    L --> A{"Agent adapter"}
+    A -->|claude| C["Claude Code<br/>(Terminal window, status-line registration,<br/>agent pulls the inbox)"]
+    A -->|grok| B["Grok bridge process<br/>(ACP client, sole writer)"]
+    B -->|"JSON-RPC over stdio"| X["grok agent stdio"]
+    C --> R["Registered project"]
+    X --> R
+```
+
+| | Claude Code | Grok |
+|---|---|---|
+| How it is driven | Runs in a Terminal window; pulls instructions from the durable inbox | Terminal Handoff is the ACP client (`grok agent stdio`); it pushes each instruction as `session/prompt` |
+| Owner | The Claude process, proved through its status line | A detached Terminal Handoff **bridge** process that owns the Grok child |
+| Session identity | Claude session id | The **exact Grok session id**, stored on the logical session; never inferred |
+| Context management | Automatic A to B handoff at the threshold | **None.** Grok's own persisted session, load and compaction. No Terminal Handoff replacement |
+| STOP | Cooperative flag plus optional `SIGTERM` | `session/cancel`; if Grok does not stop within the grace period its process is ended and the same session is reloaded on resume |
+| Permission prompts | Native Claude prompts cannot be answered from the phone; only Terminal Handoff gates can | A Grok permission request **is** a Terminal Handoff approval: approve or deny on the phone and the answer goes back through ACP |
+| Permission mode | Your Claude mode (including Auto) is preserved, unchanged | **Ask by default.** `always-approve` is never used unless you select it deliberately (see [Security model](docs/SECURITY_MODEL.md#grok)) |
+| Transcript | Lines the agent posts | Grok's replies, tool-call status and lifecycle events. **Reasoning is never shown** |
+| Remote Control health | Yes | Not applicable |
+| Reconnect | The Claude process keeps running; the phone reattaches | The bridge keeps running; if it dies, **Re-check** starts a new bridge that `session/load`s the exact stored session |
+
+**Enabling Grok.** Grok is opt-in per project, on top of the existing registration, permission profile and remote-launch switch: `th project enable-grok <name>` (and `disable-grok`). A project that has not been enabled cannot be started with Grok. Grok uses your existing local Grok login; Terminal Handoff never reads, copies or logs its credentials, and reports `Grok CLI is not authenticated on this Mac.` when there is none.
+
+**What Terminal Handoff will not do for Grok:** start it with `--always-approve` by default, show its reasoning, start it in an unregistered project, run two writers on one session, or start a new Grok conversation when it cannot reload the stored one.
 
 ---
 
@@ -359,7 +398,7 @@ The installed command is `python3 ~/.claude/terminal-handoff/terminal-handoff.py
 
 | Task | Command |
 |---|---|
-| Runtime status | `th status` |
+| Runtime status (includes a `grok` health block) | `th status` |
 | Status-line coverage | `th coverage` |
 | Version | `th version` |
 | Manual handoff (from inside the session) | `th manual-handoff --session-id <id>` |
@@ -369,6 +408,7 @@ The installed command is `python3 ~/.claude/terminal-handoff/terminal-handoff.py
 | List / add / remove | `th project list` · `th project add <name> <abs-path>` · `th project remove <name>` |
 | Permission profile | `th project permissions template\|show\|edit\|validate <name>` (`edit --from-file f.json`) |
 | Remote launch on / off | `th project enable-remote <name>` · `th project disable-remote <name>` |
+| Allow / stop allowing Grok in a project | `th project enable-grok <name>` · `th project disable-grok <name>` |
 | **Remote service** | |
 | Configure | `th remote configure --host H --tailscale-user U --port P --public-port PP --permission-mode auto` |
 | Health / preflight | `th remote check` |
@@ -428,6 +468,14 @@ Stated plainly. Overstating them would make this tool untrustworthy.
 8. The remote-control health signal is read from Claude's live session record, an implementation detail that is not a documented API, and `--setting-sources` is undocumented; isolation is proven per Claude version with `remote verify-isolation`.
 9. Remote sessions do not load project or user settings (including project hooks); `CLAUDE.md` files still load. One active remote session per project.
 
+**Grok** (new in 1.5.0)
+
+- **Grok is not at parity with Claude.** No automatic context handoff, no Remote Control, and its permission system is Grok's own. STOP relies on Grok honouring ACP `session/cancel`, with the process ended if it does not.
+- **Ask mode cannot be verified from outside Grok.** Grok's configuration can make every session always-approve and the environment cannot override that for ACP sessions. Terminal Handoff therefore **refuses to start Grok while `~/.grok/config.toml` selects always-approve**, unless you deliberately select it for Terminal Handoff.
+- **Grok also reads Claude-style permission rules** (for example `~/.claude/settings.local.json`) and remembers per-project "always allow" grants. Review both.
+- **Interrupted work is offered again once** if Grok's process dies mid-turn (at-least-once). An instruction interrupted by STOP is *not* re-run; send it again.
+- **Live acceptance is pending.** The integration is tested against a scripted ACP agent; a real Grok turn was not run (the Grok account balance was exhausted during development).
+
 **Local handoff** (unchanged)
 
 10. **`ultracode` cannot be preserved.** It resolves to `xhigh` plus a hidden flag the status-line JSON never exposes.
@@ -456,6 +504,10 @@ Start with `th status` and the log: `tail -20 ~/.claude/terminal-handoff/logs/te
 | **Remote Control shows degraded** | The session keeps running. Check `/remote-control` in that session; Terminal Handoff rechecks after each handoff. |
 | **Session seems stuck at generation 1** | The threshold may not be reached (default 80%). If the log shows `trigger_claimed` but no launch, a stale claim is recovered automatically after about 45 s (up to three times). |
 | **Automatic handoff claim** | `stale_trigger_claim_released` in the log means recovery ran; nothing to do. |
+| **Grok: "not authenticated"** | Run `grok login` in a terminal on the Mac. Terminal Handoff only checks that a login exists and never reads it. |
+| **Grok: "set to always-approve"** | Terminal Handoff will not start Grok that way by default. Change `[ui] permission_mode` in `~/.grok/config.toml`, or deliberately opt in (see [Configuration](docs/CONFIGURATION.md#grok)). |
+| **Grok is not offered for a project** | `th project enable-grok <name>`; it also needs remote launch enabled. |
+| **Grok session is ORPHANED** | Its bridge exited. **Re-check** starts a new bridge that reloads the exact stored Grok session; it never starts a new conversation. |
 | **Session is ORPHANED** | The owner process is gone. **Re-check** if it has returned, otherwise **Abandon** and start a new session. |
 | **STOP will not clear** | Clearing STOP needs a reason: `th session resume --clear-stop --reason "..."`, or Resume... on the phone. The agent cannot clear it. |
 | **Queued instruction not executing** | Check the session is not STOPPED or paused, or waiting at a gate. The page shows whether Claude is listening; a busy agent picks it up at its next check. |
