@@ -197,3 +197,23 @@ implemented.
 * **`session/load` replays history**, which Terminal Handoff discards; it relies on Grok honouring ACP
   `loadSession`.
 * **Agent switching mid-session, and other agents (for example Codex), are not implemented.**
+
+## Checkpoint (`th checkpoint`)
+
+* **No `th resume` yet.** A checkpoint is a snapshot; nothing currently reconstructs a session from one.
+* **No Codex support.** `--agent-type codex` records a caller-supplied label only - nothing is verified or
+  captured about an actual Codex session.
+* **`--ai-summary` and `--compact` cost real, billed API calls.** Terminal Handoff was previously
+  zero-API-cost; this is a deliberate, opt-in exception.
+* **Real LLM output has inherent variance.** The AI summary worker has, in real testing, produced clean
+  JSON, JSON prefaced with prose (handled), and occasionally an empty response (degrades to
+  `unavailable`, never fabricated). This is not a fixed reliability number.
+* **Smart Compact's VERIFY only catches structurally cross-checkable claims** - it compares
+  `tests_performed` against a real exit code and `files_in_progress` against the actual working tree,
+  both already present elsewhere in the same checkpoint. It cannot catch a narrative misjudgement in the
+  AI summary's own prose (confirmed in real testing: an early instruction later legitimately superseded
+  was described as "violated"; the prompt was fixed to reduce this, not eliminate the underlying
+  limitation - see [CHECKPOINT.md](CHECKPOINT.md#known-limitations)).
+* **The automated test suite never starts a real Claude Code session or AI worker**, consistent with the
+  rest of Terminal Handoff's tests. Real-worker defects (like the two above) are only caught by manual
+  acceptance runs against a real transcript.

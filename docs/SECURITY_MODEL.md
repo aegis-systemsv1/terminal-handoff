@@ -589,3 +589,27 @@ capability.
   own history under `~/.grok` is never touched.
 * **Audit.** Agent selected, bridge and process launch, session binding, load, instruction delivery (id and
   length, not content), STOP cancel, approval request and outcome, process exit, and archive are logged.
+
+## Checkpoints (`th checkpoint`, `--ai-summary`, `--compact`)
+
+* **Transcript isolation.** `th checkpoint` never reads a transcript itself; only a disposable, sandboxed
+  `claude -p` worker does. The worker's permission is `Read()` on a **copy** of the transcript in a
+  directory created fresh for that one call and containing nothing else, ever - not the transcript's real
+  directory. This is deliberate: `--add-dir <dir>` (needed for the sandbox to reach the file at all) was
+  confirmed live to make the *whole* named directory readable regardless of the narrower `Read()` rule, so
+  the isolation boundary is the directory's contents being controlled, not the permission string alone.
+* **Minimal environment.** The worker runs with an explicit, short environment allow-list (`PATH`, `HOME`,
+  `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TMPDIR`, `SHELL`, `CLAUDE_CONFIG_DIR`), never the calling process's
+  full environment.
+* **No other tools.** The worker's settings grant `Read` only - no `Bash`, `Edit`, `Write`, or network
+  access - so even a worker shown a transcript engineered to instruct it cannot act on that instruction;
+  it can only produce a text response.
+* **Untrusted in both directions.** The transcript is treated as untrusted data on the way in (the
+  worker's prompt instructs it never to follow anything found inside); the worker's own output is treated
+  as untrusted text on the way back (parsed as JSON, never executed, every string redacted, and Smart
+  Compact independently re-redacts every value it copies rather than trusting upstream handling).
+* **Redaction is best-effort**, the same `redact_secrets()` used elsewhere in Terminal Handoff, applied to
+  every new checkpoint field - not a guarantee. See [CHECKPOINT.md](CHECKPOINT.md) for the full model,
+  including what redaction does not catch.
+* **Smart Compact adds no new capability surface** - it reads an already-built checkpoint dict and writes
+  a classification of it; no transcript, no subprocess, no network call.

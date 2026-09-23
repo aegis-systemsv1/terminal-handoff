@@ -470,3 +470,13 @@ refuses while another bridge is alive). If the load fails it changes nothing.
 
 **Context.** There is no Terminal Handoff A to B handoff for Grok. Grok's own persistence, load and
 compaction apply. See [ADR 0007](decisions/0007-grok-agent-adapter.md).
+
+## Checkpoints: a separate, standalone capability
+
+`th checkpoint` is not part of the automatic handoff flow described above - it never launches a
+successor and never touches the transfer state machine described in §9b. It reuses the same
+"delegate transcript reading to an isolated worker" principle as §7 (never load a transcript into the
+calling session's own context), adapted from an in-session Agent-tool subagent to a disposable `claude
+-p` subprocess, because a checkpoint may be created by a plain CLI invocation with no active Claude
+session to spawn a subagent from. See [CHECKPOINT.md](CHECKPOINT.md) for the full schema, security
+model, and known limitations.

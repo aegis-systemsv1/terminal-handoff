@@ -12326,6 +12326,49 @@ def _verify_files_in_progress(session_summary, working_tree_block):
     return entry
 
 
+def _verify_recommended_next_action(session_summary, git_block):
+    action = session_summary.get("recommended_next_action")
+    if session_summary.get("provenance") != PROVENANCE_AI_GENERATED:
+        return None
+    if not action or action == AI_SUMMARY_UNRESOLVED_VALUE:
+        return None  # nothing claimed, nothing to verify
+    action_text = action.lower()
+    dirty = bool(git_block.get("dirty"))
+    entry = {
+        "claim": "AI summary recommends: %s" % _clamp_text(action, 300),
+        "check": "cross-checked against the deterministic git.dirty state recorded in this same checkpoint",
+    }
+    # A deliberately simple, honestly-labelled heuristic - a substring check,
+    # not semantic understanding, same posture as _verify_test_claims above.
+    # It only catches a narrow, explicit self-contradiction about repository
+    # cleanliness; it is not a general claim-verifier for arbitrary prose.
+    claims_repo_clean = any(phrase in action_text for phrase in (
+        "nothing left to do", "nothing more to do", "repository is clean",
+        "working tree is clean", "all changes committed", "everything is committed",
+        "no changes to commit", "no further action needed",
+    ))
+    claims_must_commit = any(phrase in action_text for phrase in (
+        "commit the changes", "commit these changes", "commit and push",
+        "there are uncommitted changes", "still need to commit", "needs to be committed",
+    ))
+    if claims_repo_clean and dirty:
+        entry["status"] = VERIFY_CONTRADICTED
+        entry["detail"] = (
+            "recommended next action implies a clean working tree, but this checkpoint's git state is "
+            "dirty (uncommitted changes present)"
+        )
+    elif claims_must_commit and not dirty:
+        entry["status"] = VERIFY_CONTRADICTED
+        entry["detail"] = (
+            "recommended next action implies uncommitted changes remain, but this checkpoint's git "
+            "state is clean"
+        )
+    else:
+        entry["status"] = VERIFY_UNVERIFIABLE
+        entry["detail"] = "recommended next action does not make a structurally cross-checkable claim about git state"
+    return entry
+
+
 def _verify_git_staleness(git_block, now=None):
     repo_path = git_block.get("repository_path")
     if not repo_path or not os.path.isdir(repo_path):
@@ -12404,6 +12447,12 @@ def build_smart_compact(checkpoint, now=None):
                     "session_summary.outstanding_work", session_summary.get("outstanding_work"), PROVENANCE_AI_GENERATED
                 )
             )
+            keep.append(
+                _compact_item(
+                    "session_summary.recommended_next_action",
+                    session_summary.get("recommended_next_action"), PROVENANCE_AI_GENERATED,
+                )
+            )
 
         compress = [
             _compact_item("git.history.recent_commits", _compact_commit_lines(history_block.get("recent_commits")),
@@ -12431,6 +12480,7 @@ def build_smart_compact(checkpoint, now=None):
             _verify_git_staleness(git_block, now=now),
             _verify_test_claims(session_summary, tests_block),
             _verify_files_in_progress(session_summary, working_tree_block),
+            _verify_recommended_next_action(session_summary, git_block),
         ) if entry is not None]
 
         return {

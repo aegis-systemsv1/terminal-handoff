@@ -425,6 +425,14 @@ The installed command is `python3 ~/.claude/terminal-handoff/terminal-handoff.py
 | Resume from STOP | `th session resume --clear-stop --reason "why it is safe"` |
 | Approval decision (human) | `th session decide --approval-id ap_... --decision approve\|deny --nonce N --owner-epoch E` |
 | Recovery | `th session recover --recover-action reattach\|abandon` · `th session reconcile [--startup]` |
+| **Checkpoints** | |
+| Deterministic snapshot | `th checkpoint [--repo PATH]` |
+| Record/execute test evidence | `... --test-command CMD --run-tests` \| `... --test-command CMD --test-exit-code N` |
+| AI session summary | `... --transcript <path>.jsonl --ai-summary [--ai-model MODEL]` |
+| Smart Compact (KEEP/COMPRESS/DROP/VERIFY) | `... --compact` |
+
+Full schema, security model (transcript isolation, worker sandboxing), Smart Compact behaviour, and
+known limitations are in [docs/CHECKPOINT.md](docs/CHECKPOINT.md).
 
 The commands an agent runs itself inside a session (`session inbox`, `wait`, `ack`, `note`, `check`, `gate`, `consume`, `hook-stop`, and `continuation wait|status|gate|resume|remote-check`) are documented in [docs/REMOTE_CONTROL.md](docs/REMOTE_CONTROL.md). The agent cannot run `decide`, `stop`, `resume`, `pause`, `recover` or `post`.
 

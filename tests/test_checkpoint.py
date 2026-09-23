@@ -1018,6 +1018,43 @@ class TestSmartCompactKeep(SmartCompactTestCase):
         self.assertEqual(item["provenance"], "ai_generated")
         self.assertNotEqual(item["provenance"], "machine_verified")
 
+    def test_recommended_next_action_is_kept_verbatim_with_ai_provenance(self):
+        repo = self.make_repo("compact-next-action")
+        action = "Run the full regression suite, then request review before merging."
+        checkpoint = self.checkpoint_with_summary(repo, {"recommended_next_action": action})
+        item = next(
+            i for i in checkpoint["smart_compact"]["keep"] if i["field"].endswith("recommended_next_action")
+        )
+        self.assertEqual(item["value"], action)
+        self.assertEqual(item["provenance"], "ai_generated")
+        self.assertNotEqual(item["provenance"], "machine_verified")
+
+    def test_recommended_next_action_survives_when_missing_from_worker_output(self):
+        repo = self.make_repo("compact-next-action-missing")
+        transcript = self.make_transcript("compact-missing-next-action", directory=self.tmp)
+        # No "recommended_next_action" key at all in the worker's JSON - not
+        # even an empty string - to prove the field is never simply absent
+        # from the checkpoint or from Smart Compact's KEEP.
+        worker = ai_returns(json.dumps({"current_task": "some task"}))
+        checkpoint = CORE.build_checkpoint(
+            repo_path=repo, transcript_path=transcript, ai_summary=True, ai_worker=worker, smart_compact=True,
+        )
+        self.assertEqual(checkpoint["session_summary"]["recommended_next_action"], "unresolved")
+        item = next(
+            i for i in checkpoint["smart_compact"]["keep"] if i["field"].endswith("recommended_next_action")
+        )
+        self.assertEqual(item["value"], "unresolved")
+        self.assertEqual(item["provenance"], "ai_generated")
+
+    def test_recommended_next_action_survives_when_empty_string(self):
+        repo = self.make_repo("compact-next-action-empty")
+        checkpoint = self.checkpoint_with_summary(repo, {"recommended_next_action": ""})
+        self.assertEqual(checkpoint["session_summary"]["recommended_next_action"], "unresolved")
+        item = next(
+            i for i in checkpoint["smart_compact"]["keep"] if i["field"].endswith("recommended_next_action")
+        )
+        self.assertEqual(item["value"], "unresolved")
+
 
 class TestSmartCompactCompress(SmartCompactTestCase):
     def test_failed_approaches_land_in_compress_unchanged(self):
@@ -1109,6 +1146,76 @@ class TestSmartCompactVerify(SmartCompactTestCase):
         checkpoint = self.checkpoint_with_summary(repo)
         entry = next(v for v in checkpoint["smart_compact"]["verify"] if "checkpoint git state" in v["claim"])
         self.assertEqual(entry["status"], "current")
+
+    def test_recommended_next_action_claiming_clean_tree_while_dirty_is_contradicted(self):
+        repo = self.make_repo("compact-next-action-clean-claim-dirty-repo")
+        with open(os.path.join(repo, "new.txt"), "w") as handle:
+            handle.write("uncommitted\n")
+        checkpoint = self.checkpoint_with_summary(
+            repo, {"recommended_next_action": "Nothing more to do - the repository is clean."},
+        )
+        entry = next(v for v in checkpoint["smart_compact"]["verify"] if "AI summary recommends" in v["claim"])
+        self.assertEqual(entry["status"], "contradicted")
+        self.assertIn("dirty", entry["detail"])
+
+    def test_recommended_next_action_claiming_uncommitted_work_while_clean_is_contradicted(self):
+        repo = self.make_repo("compact-next-action-commit-claim-clean-repo")
+        checkpoint = self.checkpoint_with_summary(
+            repo, {"recommended_next_action": "Commit the changes before continuing."},
+        )
+        entry = next(v for v in checkpoint["smart_compact"]["verify"] if "AI summary recommends" in v["claim"])
+        self.assertEqual(entry["status"], "contradicted")
+        self.assertIn("clean", entry["detail"])
+
+    def test_recommended_next_action_without_a_cross_checkable_claim_is_unverifiable(self):
+        repo = self.make_repo("compact-next-action-generic")
+        checkpoint = self.checkpoint_with_summary(
+            repo, {"recommended_next_action": "Run the full regression suite before merging."},
+        )
+        entry = next(v for v in checkpoint["smart_compact"]["verify"] if "AI summary recommends" in v["claim"])
+        self.assertEqual(entry["status"], "unverifiable")
+
+    def test_recommended_next_action_conflict_is_never_silently_accepted(self):
+        # The specific requirement: a conflict between the recommendation and
+        # verified git state must be flagged in `verify`, never dropped and
+        # never left to silently resolve in the recommendation's favour.
+        repo = self.make_repo("compact-next-action-not-silent")
+        with open(os.path.join(repo, "new.txt"), "w") as handle:
+            handle.write("uncommitted\n")
+        checkpoint = self.checkpoint_with_summary(
+            repo, {"recommended_next_action": "Working tree is clean, nothing left to do."},
+        )
+        statuses = [
+            v["status"] for v in checkpoint["smart_compact"]["verify"] if "AI summary recommends" in v["claim"]
+        ]
+        self.assertEqual(statuses, ["contradicted"])
+        # And the conflicting claim still appears verbatim in keep - flagged,
+        # not hidden.
+        keep_item = next(
+            i for i in checkpoint["smart_compact"]["keep"] if i["field"].endswith("recommended_next_action")
+        )
+        self.assertIn("clean", keep_item["value"])
+
+    def test_recommended_next_action_unresolved_produces_no_verify_claim(self):
+        repo = self.make_repo("compact-next-action-unresolved")
+        checkpoint = self.checkpoint_with_summary(repo, {"recommended_next_action": ""})
+        claims = [v["claim"] for v in checkpoint["smart_compact"]["verify"]]
+        self.assertFalse(any("AI summary recommends" in c for c in claims))
+
+    def test_recommended_next_action_in_keep_is_never_promoted_to_verified_fact(self):
+        repo = self.make_repo("compact-next-action-no-promotion")
+        with open(os.path.join(repo, "new.txt"), "w") as handle:
+            handle.write("uncommitted\n")
+        checkpoint = self.checkpoint_with_summary(
+            repo, {"recommended_next_action": "Nothing more to do - the repository is clean."},
+        )
+        # Even though this claim is flagged contradicted in verify, its KEEP
+        # entry still carries ai_generated provenance, never machine_verified
+        # and never silently dropped because it was found to be wrong.
+        item = next(
+            i for i in checkpoint["smart_compact"]["keep"] if i["field"].endswith("recommended_next_action")
+        )
+        self.assertEqual(item["provenance"], "ai_generated")
 
     def test_missing_test_evidence_is_unverifiable_not_contradicted(self):
         repo = self.make_repo("compact-missing-evidence")
