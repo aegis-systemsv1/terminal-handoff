@@ -42,6 +42,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   produced. `th checkpoint` never loads the transcript itself; only the isolated worker subprocess does. No
   Smart Compact, no `th resume`, and no Codex support are part of this slice.
 
+- **Smart Compact for `th checkpoint`** (Slice 3 of Terminal Handoff V2, on top of Slices 1-2): `--compact`
+  classifies an already-built checkpoint's own fields into KEEP / COMPRESS / DROP / VERIFY - no second
+  transcript read, no second AI call; it operates purely on what Slices 1 and 2 already captured, so it can
+  never diverge from the rest of the checkpoint. KEEP always carries the current task, explicit user
+  instructions/constraints, and unresolved work verbatim, plus verified git/test facts; these are never
+  compressed, dropped, or paraphrased. COMPRESS carries useful history (decisions, completed work, known
+  problems, commits condensed to one-liners). DROP removes raw, reconstructible material (test output text,
+  machine identity) with a stated reason, never the value itself. VERIFY cross-checks AI-summary claims against
+  the checkpoint's own deterministic blocks (tests_performed against the tests block's exit code, files claimed
+  "in progress" against the actual working-tree capture) and checks the recorded git state against the live
+  repository at compact time - each result is `confirmed`, `contradicted`, `stale`/`current`, or `unverifiable`,
+  never a silent upgrade to fact. Every classified item keeps its original provenance travelling with it; the
+  compact block's own provenance (`machine_generated`) never bleeds into the items it carries. Every string is
+  independently re-redacted through `redact_secrets()` regardless of upstream handling. Tested against a real,
+  extended (91-line, ~300KB) Claude Code transcript spanning a genuine test-driven-development cycle (a
+  deliberately wrong assertion, its failure, and its fix), an explicit constraint, and unresolved work; the
+  compacted checkpoint was ~11KB, a 96% reduction, while VERIFY correctly flagged a real mismatch between the
+  AI summary's claimed in-progress files and the files actually still uncommitted. That same real run also
+  surfaced and fixed two defects: `_parse_ai_summary_output()` failed outright when the worker prefaced its
+  JSON with a sentence of prose (now extracts the JSON regardless of surrounding text), and the summarisation
+  prompt could describe a later, explicit instruction that superseded an earlier one as a "violation" of the
+  earlier one (prompt now explicitly instructs chronological reading before judging anything a problem).
+
 ## [1.5.0] - 2026-09-21
 
 Grok is now a second supported agent. Claude Code behaviour is unchanged.

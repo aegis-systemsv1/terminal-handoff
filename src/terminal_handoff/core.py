@@ -11983,15 +11983,18 @@ Do not paste file contents, secrets, credentials, API keys, tokens, passwords, o
 OUTPUT FORMAT - READ THIS SECOND:
 Respond with exactly one JSON object and nothing else: no markdown code fences, no prose before or after it. Every field below must be present. If the transcript does not let you determine a field, use exactly the string "unresolved" for that field (or an empty list for list fields) - never guess or invent a plausible-sounding answer.
 
+CHRONOLOGY MATTERS:
+Read the whole transcript before judging anything as a mistake, problem, or violation. The user's instructions can change over the course of a session - a later, explicit instruction (e.g. "now commit these files") can legitimately supersede an earlier one (e.g. "don't commit yet"). Acting on a later instruction is not a violation of an earlier one it replaced. Only report something in "known_problems" as a constraint violation if the assistant acted against an instruction that was still in force at the time, with nothing later authorizing the change.
+
 Fields:
-- "current_task": string. The current task/objective, in the user's own terms where possible.
+- "current_task": string. The current task/objective, in the user's own terms where possible. If it changed during the session, describe the most recent one.
 - "work_completed": list of short strings. What was actually finished.
 - "decisions_made": list of short strings. Explicit decisions and their reasons.
 - "files_in_progress": list of short strings. File paths being worked on - paths only.
-- "known_problems": list of short strings. Failed approaches, bugs found, blockers.
+- "known_problems": list of short strings. Genuine failed approaches, bugs found, or blockers - not an instruction that a later instruction legitimately superseded.
 - "tests_performed": list of short strings. What was tested and the actual result (never invent a result that was not stated).
 - "outstanding_work": list of short strings. What remains unfinished.
-- "user_instructions_and_constraints": list of short strings. Explicit instructions or constraints the user stated, quoted as close to verbatim as possible.
+- "user_instructions_and_constraints": list of short strings. Explicit instructions or constraints the user stated, quoted as close to verbatim as possible. If a later instruction changed or lifted an earlier one, list the current, still-applicable one(s) and say so.
 - "recommended_next_action": string. The single most useful next step for whoever picks this up.
 
 Keep each string under %(field_limit)d characters. Respond with the JSON object now."""
@@ -12085,27 +12088,50 @@ def _run_ai_summary_worker(transcript_path, claude_bin, model, timeout, run=subp
             shutil.rmtree(work, ignore_errors=True)
 
 
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+
+
 def _parse_ai_summary_output(raw_text):
-    """Return (summary_dict, error). Tolerant of a leading/trailing markdown
-    code fence; otherwise requires a single well-formed JSON object.
+    """Return (summary_dict, error).
+
+    Real transcripts occasionally make the worker preface its answer with a
+    sentence or two before the JSON ("Now I have enough information...")
+    rather than emitting only the object as instructed - confirmed against a
+    real, long (91-line) transcript, not assumed. Tries, in order: the whole
+    trimmed text as-is; a ```json fence found anywhere in the text (not only
+    at the very start); the outermost {...} span in the text. Only the first
+    of these that parses as a JSON object is used - this is text extraction,
+    never code execution.
     """
     if raw_text is None:
         return None, "the worker produced no output"
     text = raw_text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else ""
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[0]
-        text = text.strip()
     if not text:
         return None, "the worker produced empty output"
-    try:
-        parsed = json.loads(text)
-    except ValueError as exc:
-        return None, "the worker's output was not valid JSON: %s" % exc
-    if not isinstance(parsed, dict):
-        return None, "the worker's output was not a JSON object"
-    return parsed, None
+
+    candidates = [text]
+    fence_match = _JSON_FENCE_RE.search(text)
+    if fence_match:
+        candidates.append(fence_match.group(1).strip())
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidates.append(text[first_brace:last_brace + 1])
+
+    last_error = "the worker produced no parseable JSON"
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except ValueError as exc:
+            last_error = "the worker's output was not valid JSON: %s" % exc
+            continue
+        if not isinstance(parsed, dict):
+            last_error = "the worker's output was not a JSON object"
+            continue
+        return parsed, None
+    return None, last_error
 
 
 def _clamp_text(value, limit=AI_SUMMARY_FIELD_CHAR_LIMIT):
@@ -12193,11 +12219,247 @@ def _capture_checkpoint_session_summary(transcript_path, session_id, ai_summary_
     return shaped
 
 
+# ---------------------------------------------------------------------------
+# Smart Compact (V2 Slice 3)
+#
+# Deliberately NOT a second pipeline: it classifies fields that Slice 1
+# (deterministic capture) and Slice 2 (AI summary) already produced, in the
+# same checkpoint, into KEEP / COMPRESS / DROP / VERIFY. No new transcript
+# read, no second AI call - it operates on the checkpoint dict alone, so it
+# can never diverge from what the rest of the checkpoint already says.
+#
+# Every classified item keeps its OWN source provenance travelling with it
+# (never re-labelled as machine_verified just for landing in KEEP) and VERIFY
+# never resolves a claim by asserting it true - it can only confirm,
+# contradict, flag stale, or say unverifiable; a confirmed AI claim is
+# reported as "confirmed", never silently promoted to a fact in KEEP/COMPRESS.
+# ---------------------------------------------------------------------------
+
+SMART_COMPACT_SCHEMA_VERSION = 1
+PROVENANCE_MACHINE_GENERATED = "machine_generated"  # Terminal Handoff's own classification, not a new claim
+
+VERIFY_CONFIRMED = "confirmed"
+VERIFY_CONTRADICTED = "contradicted"
+VERIFY_UNVERIFIABLE = "unverifiable"
+VERIFY_STALE = "stale"
+VERIFY_CURRENT = "current"
+
+
+def _compact_redact(value):
+    """Defense in depth: re-redact every string Smart Compact copies, rather
+    than trusting that whatever produced the source checkpoint already did.
+    Recurses through lists/dicts; non-string scalars pass through unchanged.
+    """
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list):
+        return [_compact_redact(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _compact_redact(item) for key, item in value.items()}
+    return value
+
+
+def _compact_item(field, value, provenance):
+    return {"field": field, "value": _compact_redact(value), "provenance": provenance}
+
+
+def _compact_commit_lines(recent_commits):
+    return ["%s %s" % (c.get("sha", "?"), c.get("subject", "")) for c in (recent_commits or [])]
+
+
+def _verify_test_claims(session_summary, tests_block):
+    tests_performed = session_summary.get("tests_performed") or []
+    if session_summary.get("provenance") != PROVENANCE_AI_GENERATED or not tests_performed:
+        return None  # nothing claimed, nothing to verify
+    claim_text = " ".join(tests_performed).lower()
+    entry = {
+        "claim": "AI summary reports tests_performed: %s" % _clamp_text(tests_performed, 300),
+        "check": "cross-checked against the deterministic tests block recorded in this same checkpoint",
+    }
+    if tests_block.get("provenance") not in (PROVENANCE_MACHINE_VERIFIED, PROVENANCE_RECORDED_EVIDENCE):
+        entry["status"] = VERIFY_UNVERIFIABLE
+        entry["detail"] = (
+            "no deterministic test evidence exists in this checkpoint (tests block: %s) - the AI may be "
+            "describing tests run earlier in the session that were not captured with --run-tests/--test-exit-code"
+            % tests_block.get("provenance")
+        )
+        return entry
+    # A deliberately simple, honestly-labelled heuristic - a substring check,
+    # not semantic understanding. It looks for a mismatch, not for proof.
+    claims_failure = any(word in claim_text for word in ("fail", "error", "broke", "broken"))
+    actually_succeeded = bool(tests_block.get("successful_execution"))
+    if claims_failure and actually_succeeded:
+        entry["status"] = VERIFY_CONTRADICTED
+        entry["detail"] = "AI summary language suggests failure, but the recorded test exit code was 0"
+    elif not claims_failure and not actually_succeeded:
+        entry["status"] = VERIFY_CONTRADICTED
+        entry["detail"] = "AI summary does not mention failure, but the recorded test exit code was non-zero"
+    else:
+        entry["status"] = VERIFY_CONFIRMED
+        entry["detail"] = "AI summary is consistent with the recorded exit code (%s)" % tests_block.get("exit_code")
+    return entry
+
+
+def _verify_files_in_progress(session_summary, working_tree_block):
+    claimed = session_summary.get("files_in_progress") or []
+    if session_summary.get("provenance") != PROVENANCE_AI_GENERATED or not claimed:
+        return None
+    actual_paths = set()
+    for key in ("staged_files", "modified_files", "untracked_files"):
+        for entry in working_tree_block.get(key) or []:
+            actual_paths.add(entry.get("path"))
+    claimed_paths = {c["path"] for c in claimed if isinstance(c, dict) and c.get("path")}
+    missing = sorted(claimed_paths - actual_paths)
+    entry = {
+        "claim": "AI summary reports files_in_progress: %s" % _clamp_text(sorted(claimed_paths), 300),
+        "check": "cross-checked against the working_tree block captured in this same checkpoint",
+    }
+    if not missing:
+        entry["status"] = VERIFY_CONFIRMED
+        entry["detail"] = "every claimed file appears in the checkpoint's own working-tree capture"
+    else:
+        entry["status"] = VERIFY_CONTRADICTED
+        entry["detail"] = (
+            "claimed but not present in the working-tree capture (already committed, reverted, or "
+            "misreported): %s" % ", ".join(missing)
+        )
+    return entry
+
+
+def _verify_git_staleness(git_block, now=None):
+    repo_path = git_block.get("repository_path")
+    if not repo_path or not os.path.isdir(repo_path):
+        return {
+            "claim": "checkpoint git state (head_sha=%s)" % git_block.get("head_sha"),
+            "check": "repository path re-checked at compact time",
+            "status": VERIFY_UNVERIFIABLE,
+            "detail": "repository path no longer exists; live state cannot be compared",
+        }
+    try:
+        live = capture_repo_state(repo_path)
+    except Exception as exc:  # noqa: BLE001 - VERIFY must never abort compaction
+        return {
+            "claim": "checkpoint git state (head_sha=%s)" % git_block.get("head_sha"),
+            "check": "repository path re-checked at compact time",
+            "status": VERIFY_UNVERIFIABLE,
+            "detail": "could not re-read live repository state: %s" % redact_secrets(str(exc)),
+        }
+    entry = {
+        "claim": "checkpoint git state (head_sha=%s, dirty=%s)" % (git_block.get("head_sha"), git_block.get("dirty")),
+        "check": "compared against the live repository at compact time",
+    }
+    if live.get("head_sha") == git_block.get("head_sha") and bool(live.get("status_porcelain_count", 0) > 0) == bool(
+        git_block.get("dirty")
+    ):
+        entry["status"] = VERIFY_CURRENT
+        entry["detail"] = "live repository state matches this checkpoint"
+    else:
+        entry["status"] = VERIFY_STALE
+        entry["detail"] = "live HEAD is now %s (checkpoint recorded %s); repository has moved since this checkpoint" % (
+            live.get("head_sha"), git_block.get("head_sha"),
+        )
+    return entry
+
+
+def build_smart_compact(checkpoint, now=None):
+    """Classify an already-built checkpoint's fields into KEEP/COMPRESS/DROP/
+    VERIFY. Never raises: any internal problem degrades to an explicit
+    unavailable block, same posture as every other optional checkpoint block.
+    """
+    try:
+        git_block = checkpoint.get("git") or {}
+        working_tree_block = checkpoint.get("working_tree") or {}
+        history_block = checkpoint.get("history") or {}
+        tests_block = checkpoint.get("tests") or {}
+        session_summary = checkpoint.get("session_summary") or {}
+
+        keep = [
+            _compact_item("git.head_sha", git_block.get("head_sha"), git_block.get("provenance")),
+            _compact_item("git.branch", git_block.get("branch"), git_block.get("provenance")),
+            _compact_item("git.dirty", git_block.get("dirty"), git_block.get("provenance")),
+        ]
+        if tests_block.get("provenance") in (PROVENANCE_MACHINE_VERIFIED, PROVENANCE_RECORDED_EVIDENCE):
+            keep.append(_compact_item("tests.exit_code", tests_block.get("exit_code"), tests_block.get("provenance")))
+            keep.append(
+                _compact_item(
+                    "tests.successful_execution", tests_block.get("successful_execution"), tests_block.get("provenance")
+                )
+            )
+        if session_summary.get("provenance") == PROVENANCE_AI_GENERATED:
+            # Never compressed, never dropped, never paraphrased further -
+            # exactly as captured by Slice 2, verbatim.
+            keep.append(
+                _compact_item(
+                    "session_summary.current_task", session_summary.get("current_task"), PROVENANCE_AI_GENERATED
+                )
+            )
+            keep.append(
+                _compact_item(
+                    "session_summary.user_instructions_and_constraints",
+                    session_summary.get("user_instructions_and_constraints"), PROVENANCE_AI_GENERATED,
+                )
+            )
+            keep.append(
+                _compact_item(
+                    "session_summary.outstanding_work", session_summary.get("outstanding_work"), PROVENANCE_AI_GENERATED
+                )
+            )
+
+        compress = [
+            _compact_item("git.history.recent_commits", _compact_commit_lines(history_block.get("recent_commits")),
+                          history_block.get("provenance")),
+        ]
+        if session_summary.get("provenance") == PROVENANCE_AI_GENERATED:
+            for field in ("work_completed", "decisions_made", "known_problems"):
+                compress.append(
+                    _compact_item("session_summary.%s" % field, session_summary.get(field), PROVENANCE_AI_GENERATED)
+                )
+
+        drop = [
+            {
+                "field": "tests.output_tail",
+                "reason": "raw output is reconstructible by re-running the recorded test command; "
+                          "the pass/fail fact is kept above",
+            },
+            {
+                "field": "environment",
+                "reason": "machine identity (hostname/platform/python version) is not needed to continue the work",
+            },
+        ]
+
+        verify = [entry for entry in (
+            _verify_git_staleness(git_block, now=now),
+            _verify_test_claims(session_summary, tests_block),
+            _verify_files_in_progress(session_summary, working_tree_block),
+        ) if entry is not None]
+
+        return {
+            "schema_version": SMART_COMPACT_SCHEMA_VERSION,
+            "provenance": PROVENANCE_MACHINE_GENERATED,
+            "generated_utc": utc_stamp(now),
+            "note": (
+                "A classification of this checkpoint's own fields, not new information. KEEP/COMPRESS items "
+                "retain their original provenance; nothing here is upgraded to a verified fact by appearing "
+                "in this block."
+            ),
+            "keep": keep,
+            "compress": compress,
+            "drop": drop,
+            "verify": verify,
+        }
+    except Exception as exc:  # noqa: BLE001 - compaction failure must never corrupt the checkpoint
+        return {
+            "schema_version": SMART_COMPACT_SCHEMA_VERSION,
+            "provenance": PROVENANCE_UNAVAILABLE,
+            "reason": "smart compact classification failed: %s" % redact_secrets(str(exc)),
+        }
+
+
 def build_checkpoint(repo_path=None, session_id=None, agent_type=None,
                       test_command=None, run_tests=False, test_exit_code=None,
                       test_output_text=None, test_output_file=None,
                       transcript_path=None, ai_summary=False, ai_model=None,
-                      ai_worker=None, now=None):
+                      ai_worker=None, smart_compact=False, now=None):
     """Build a complete, self-contained checkpoint dict. May raise
     CheckpointCaptureError if authoritative repository state is unavailable;
     never emits a partial checkpoint.
@@ -12225,6 +12487,13 @@ def build_checkpoint(repo_path=None, session_id=None, agent_type=None,
             transcript_path, session_id, ai_summary, ai_model=ai_model, ai_worker=ai_worker, now=now,
         ),
     }
+    if smart_compact:
+        checkpoint["smart_compact"] = build_smart_compact(checkpoint, now=now)
+    else:
+        checkpoint["smart_compact"] = {
+            "provenance": PROVENANCE_UNAVAILABLE,
+            "reason": "smart compact was not requested for this checkpoint",
+        }
     checkpoint["integrity"] = compute_checkpoint_integrity(checkpoint)
     return checkpoint
 
@@ -12244,6 +12513,7 @@ def cmd_checkpoint(args):
             transcript_path=args.transcript,
             ai_summary=args.ai_summary,
             ai_model=args.ai_model,
+            smart_compact=args.compact,
         )
     except CheckpointCaptureError as exc:
         print("checkpoint: %s" % exc, file=sys.stderr)
@@ -12268,6 +12538,10 @@ def cmd_checkpoint(args):
             "present" if session_summary.get("provenance") == PROVENANCE_AI_GENERATED
             else "unavailable: %s" % session_summary.get("reason", "unknown")
         ),
+        "smart_compact": (
+            "present" if checkpoint.get("smart_compact", {}).get("provenance") == PROVENANCE_MACHINE_GENERATED
+            else "unavailable: %s" % checkpoint.get("smart_compact", {}).get("reason", "unknown")
+        ),
     }
 
     if args.json:
@@ -12280,6 +12554,7 @@ def cmd_checkpoint(args):
         print("  head_sha:   %s" % summary["head_sha"])
         print("  dirty:      %s" % ("yes" if summary["dirty"] else "no"))
         print("  integrity:  %s" % summary["integrity"])
+        print("  smart_compact: %s" % summary["smart_compact"])
         print("  ai_summary: %s" % summary["ai_summary"])
     return 0
 
@@ -12513,6 +12788,13 @@ def main(argv=None):
     p.add_argument(
         "--ai-model", default=None,
         help="Model for the AI summary worker (default: %s)" % AI_SUMMARY_MODEL_DEFAULT,
+    )
+    p.add_argument(
+        "--compact", action="store_true",
+        help=(
+            "Classify this checkpoint's fields into KEEP/COMPRESS/DROP/VERIFY (Smart Compact). "
+            "Operates only on fields already in this checkpoint - no new transcript read, no new AI call"
+        ),
     )
     p.add_argument("--json", action="store_true", help="Print the checkpoint summary as JSON")
     p.set_defaults(func=cmd_checkpoint)
