@@ -9034,10 +9034,16 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
             break
         sleep(0.5)
     if record.get("state") == LS_CREATING:
-        if wait_seconds <= 0:
-            return 202, dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac")
-        _remove_launch_material(lsid)
-        return _remote_failure(lsid, "the Mac did not confirm the session started", 504)
+        # The synchronous wait elapsing is not evidence the launch failed: Claude
+        # registers via its own status-line cadence (see remote_registration()),
+        # which this request does not control and which can legitimately land
+        # after any fixed wait here, especially under load. Launch material is
+        # left in place (as it already was for the wait<=0 case below) and the
+        # launch token stays valid, so a slightly-late registration still
+        # succeeds; only the background reconciliation loop (logical_reconcile),
+        # using the token's real expiry, may eventually declare a
+        # truly-abandoned session dead.
+        return 202, dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac")
     _remove_launch_material(lsid)
     if record.get("state") in LS_TERMINAL:
         return 502, logical_public_view(record)
@@ -10091,10 +10097,10 @@ def remote_create_grok_session(body, ctx, project_name, real, project, profile, 
             break
         sleep(0.5)
     if record.get("state") == LS_CREATING:
-        if wait_seconds <= 0:
-            return 202, dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac")
-        _remove_launch_material(lsid)
-        return _remote_failure(lsid, "the Mac did not confirm the session started", 504)
+        # Same reasoning as the Claude path above: the synchronous wait elapsing
+        # is not evidence of failure. The launch token stays valid; only
+        # logical_reconcile's real-expiry check may declare this session dead.
+        return 202, dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac")
     _remove_launch_material(lsid)
     if record.get("state") in LS_TERMINAL:
         reason = ((record.get("failure") or {}).get("reason")) or "the Grok session could not be started"

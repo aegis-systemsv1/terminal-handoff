@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -164,13 +165,67 @@ class TestCreateSession(LaunchCase):
         self.behaviour = "silent"
         self.start_server(wait=1.0)
         status, view = self.create()
-        self.assertEqual(status, 504)
-        self.assertEqual(view["state"], "FAILED")
+        # Registration rides Claude's own status-line cadence, which this one
+        # HTTP call cannot control. The wait elapsing with nothing registered
+        # is reported as still-pending (202/CREATING), never as a failure -
+        # see test_synchronous_wait_elapsing_does_not_fail_the_launch and
+        # test_a_late_registration_after_the_wait_elapses_still_succeeds for
+        # the regression coverage of that distinction.
+        self.assertEqual(status, 202)
+        self.assertEqual(view["state"], "CREATING")
+
+    def test_synchronous_wait_elapsing_does_not_fail_the_launch(self):
+        # NOVA-TH-REG-001: the synchronous wait timing out used to be treated
+        # as proof the launch had failed - it invalidated the launch token and
+        # marked the session FAILED, even though Claude Code was genuinely
+        # still starting and its status line simply had not fired yet. Timing
+        # out here must leave the session exactly as registerable as before.
+        self.behaviour = "silent"
+        self.start_server(wait=1.0)
+        status, view = self.create()
+        self.assertEqual(status, 202)
+        self.assertEqual(view["state"], "CREATING")
         record = CORE.logical_read(view["logical_session_id"])
+        self.assertEqual(record["state"], "CREATING")
+        self.assertIsNotNone(
+            record["launch"]["token_sha256"],
+            "a slow synchronous wait must not invalidate the launch token",
+        )
+
+    def test_a_late_registration_after_the_wait_elapses_still_succeeds(self):
+        # The regression this whole fix is about: a real Claude session that
+        # takes longer than the synchronous wait to report its first status
+        # line must still be able to register as owner afterwards.
+        self.behaviour = "silent"
+        self.start_server(wait=1.0)
+        status, view = self.create()
+        self.assertEqual(status, 202)  # the synchronous wait already gave up on this call
+        lsid = view["logical_session_id"]
+        token = self.token_of(self.script_texts[0])
+        self.register(lsid, token)
+        record = CORE.logical_read(lsid)
+        self.assertEqual(record["owner"]["agent_session_id"], AGENT)
+        self.assertEqual(record["state"], "RUNNING")
+
+    def test_reconciliation_still_fails_a_truly_abandoned_session(self):
+        # The synchronous HTTP wait is no longer an authority on failure - the
+        # background reconciliation loop is, using the launch token's own
+        # (much longer, deliberately generous) real expiry. This preserves the
+        # existing security guarantee that a session cannot be left claimable
+        # forever: it is just enforced by the correct mechanism now.
+        self.behaviour = "silent"
+        self.start_server(wait=0.0)
+        status, view = self.create()
+        lsid = view["logical_session_id"]
+        self.assertEqual(CORE.logical_read(lsid)["state"], "CREATING")
+        far_future = time.time() + CORE.LAUNCH_TOKEN_TTL + 61
+        record = CORE.logical_reconcile(lsid, now=far_future)
         self.assertEqual(record["state"], "FAILED")
-        # a late session can no longer register, and is told it is not the owner
-        self.register(record["logical_session_id"], "irrelevant")
-        self.assertIsNone(CORE.logical_read(record["logical_session_id"])["owner"])
+        self.assertEqual(record["failure"]["reason"], "the launched session never registered")
+        # and it is now genuinely, permanently unregisterable
+        token = self.token_of(self.script_texts[0])
+        self.register(lsid, token)
+        self.assertIsNone(CORE.logical_read(lsid)["owner"])
 
     def test_accepted_but_unconfirmed_is_creating_not_running(self):
         self.behaviour = "silent"
