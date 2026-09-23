@@ -20,6 +20,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (commit subjects, test command, test output). A `sha256` integrity hash covers the whole checkpoint except
   itself. No AI summary, no Smart Compact, no `th resume`, and no Codex support are part of this slice.
 
+- **AI session summary for `th checkpoint`** (Slice 2 of Terminal Handoff V2, on top of Slice 1): `--transcript
+  <path> --ai-summary` asks a single, fully isolated `claude -p` worker to extract the current task, work
+  completed, decisions made, files in progress, known problems, tests performed, outstanding work, explicit
+  user instructions/constraints, and a recommended next action from a transcript. The worker's only permission
+  is reading that one exact file (`--setting-sources ""` plus a `Read(<path>)`-only settings file). It runs with
+  a minimal explicit environment, never the caller's full one. **Security note, found and fixed during
+  acceptance testing, not by unit tests alone**: `--add-dir <dir>` makes the whole named directory readable
+  regardless of any narrower `Read()` rule - confirmed live against the real CLI, where a worker asked (with a
+  plain, non-adversarial prompt) to read a sibling file sitting next to the real transcript could do so. The fix
+  is structural, not a permission rule: the transcript is copied into a directory created fresh for this one
+  call, containing nothing else, ever, and `--add-dir` is granted to that directory instead of the transcript's
+  real (potentially multi-session) one. Re-verified live afterward that the same sibling-file attempt fails
+  closed. Its entire output is treated as untrusted text - parsed as JSON, every string passed
+  through `redact_secrets()`, file paths reused through the existing sensitive-filename classifier - never
+  executed and never treated as an instruction, regardless of what the transcript it read contained. The
+  summary block always carries `provenance: ai_generated`, is never upgraded to `machine_verified`, and any
+  missing or undeterminable field is reported as an explicit `"unresolved"` marker rather than guessed. If the
+  transcript is missing, unreadable, or the worker fails or returns malformed output for any reason, the block
+  degrades to `provenance: unavailable` with a reason - the deterministic Slice 1 checkpoint is always still
+  produced. `th checkpoint` never loads the transcript itself; only the isolated worker subprocess does. No
+  Smart Compact, no `th resume`, and no Codex support are part of this slice.
+
 ## [1.5.0] - 2026-09-21
 
 Grok is now a second supported agent. Claude Code behaviour is unchanged.
