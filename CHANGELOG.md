@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`th checkpoint`** (Slice 1 of Terminal Handoff V2): a standalone, deterministic, machine-verifiable
+  snapshot of repository and session state. Unlike a handoff manifest it never launches a successor and
+  never touches the transfer state machine - a pure capture, safe to run at any time. Captures git identity,
+  branch/upstream/ahead-behind, dirty state, staged/modified/untracked filenames (never contents), the last
+  5 commits, and optionally already-executed or Terminal-Handoff-executed test evidence (command, exit code,
+  bounded output tail - never a parsed pass/fail inferred from text). Every top-level block carries an
+  explicit `provenance` (`machine_verified` / `recorded_evidence` / `unavailable` / `unsupported`); unknown
+  state is never represented as a bare `null`. `redact_secrets()` is applied to every free-text field
+  (commit subjects, test command, test output). A `sha256` integrity hash covers the whole checkpoint except
+  itself. No AI summary, no Smart Compact, no `th resume`, and no Codex support are part of this slice.
+
 ## [1.5.0] - 2026-09-21
 
 Grok is now a second supported agent. Claude Code behaviour is unchanged.

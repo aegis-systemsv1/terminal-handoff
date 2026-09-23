@@ -34,6 +34,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import socketserver
 import subprocess
 import sys
@@ -48,6 +49,7 @@ from datetime import datetime, timezone
 TERMINAL_HANDOFF_VERSION = "1.5.0"
 MANIFEST_SCHEMA_VERSION = 2
 NOTIFICATION_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 1
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -118,6 +120,7 @@ STATE_DIRS = (
     "recoveries",
     "logical",
     "remote",
+    "checkpoints",
 )
 
 TRUTHY = ("1", "true", "yes", "on")
@@ -6148,7 +6151,15 @@ _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
     re.compile(r"\bthd_[A-Za-z0-9._-]{8,}"),
     re.compile(r"(?i)\b(password|passwd|token|secret|api[_-]?key|authorization|cookie)\b(\s*[=:]\s*)\S+"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    # Matches a full PEM private-key block: the header, everything up to the
+    # nearest matching footer, or - if no footer is present in this call's
+    # text (e.g. output was already truncated upstream) - up to the end of
+    # the string. Non-greedy so two separate blocks in the same text are
+    # each matched (and redacted) individually rather than swallowed as one.
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
+        re.DOTALL,
+    ),
 )
 
 
@@ -11557,6 +11568,432 @@ def cmd_reset_circuit(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint (`th checkpoint`)
+#
+# A checkpoint is a standalone, deterministic, machine-verifiable snapshot of
+# repository and session state. Unlike a handoff manifest it never launches a
+# successor and never touches the transfer state machine - it is a pure
+# capture, safe to run at any time, any number of times.
+#
+# Every top-level block carries its own "provenance" so a reader never has to
+# infer trustworthiness from position in the document:
+#   machine_verified  - Terminal Handoff proved this itself, right now
+#   recorded_evidence - asserted by the caller (e.g. --session-id, prior test
+#                        results); Terminal Handoff did not independently
+#                        verify it
+#   unavailable       - this information does not exist for this invocation
+#                        (e.g. no upstream configured, no test evidence given)
+#   unsupported       - reserved for a future agent/capability this build does
+#                        not implement
+#
+# This slice contains no AI interpretation and no free-text summary: every
+# field here is either read directly from git/the filesystem, or supplied
+# verbatim by the caller and labelled as such.
+# ---------------------------------------------------------------------------
+
+PROVENANCE_MACHINE_VERIFIED = "machine_verified"
+PROVENANCE_RECORDED_EVIDENCE = "recorded_evidence"
+PROVENANCE_UNAVAILABLE = "unavailable"
+PROVENANCE_UNSUPPORTED = "unsupported"
+
+CHECKPOINT_RECENT_COMMIT_LIMIT = 5
+CHECKPOINT_TEST_OUTPUT_LIMIT = 4000  # characters, after redaction, before truncation
+CHECKPOINT_TEST_TIMEOUT_SECONDS = 300.0
+
+# Filenames that are flagged, never silently listed as ordinary paths. This is
+# a visibility control, not a redaction: the path itself is still shown (a
+# checkpoint records which files changed, never their contents), but every
+# consumer of a checkpoint can see at a glance which paths warrant caution
+# before, say, a human pastes one into chat. Deliberately overinclusive: a
+# false positive here just adds a label, never hides anything.
+_SENSITIVE_FILENAME_PATTERNS = (
+    (re.compile(r"(?i)^\.env(\..*)?$"), "environment file (.env)"),
+    (re.compile(r"(?i)\.pem$"), "PEM key or certificate file"),
+    (re.compile(r"(?i)\.key$"), "key file"),
+    (re.compile(r"(?i)^id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$"), "SSH key file"),
+    (re.compile(r"(?i)\.(p12|pfx|jks|keystore)$"), "certificate or keystore file"),
+    (re.compile(r"(?i)credentials"), "filename contains \"credentials\""),
+    (re.compile(r"(?i)secrets?\b"), "filename contains \"secret\""),
+    (re.compile(r"(?i)^\.npmrc$"), "npm auth config (.npmrc)"),
+    (re.compile(r"(?i)^\.netrc$"), "network credentials file (.netrc)"),
+    (re.compile(r"(?i)^\.git-credentials$"), "git credential store"),
+    (re.compile(r"(?i)^\.pgpass$"), "database password file (.pgpass)"),
+    (re.compile(r"(?i)token"), "filename contains \"token\""),
+)
+
+
+class CheckpointCaptureError(Exception):
+    """Raised only when authoritative repository state cannot be captured."""
+
+
+def checkpoint_path(checkpoint_id):
+    return th_path("checkpoints", "%s.json" % checkpoint_id)
+
+
+def _sensitive_filename_reason(path):
+    basename = os.path.basename(path)
+    for pattern, label in _SENSITIVE_FILENAME_PATTERNS:
+        if pattern.search(basename):
+            return label
+    return None
+
+
+def _classify_working_tree_paths(paths):
+    classified = []
+    for path in paths:
+        reason = _sensitive_filename_reason(path)
+        entry = {"path": path, "sensitive": bool(reason)}
+        if reason:
+            entry["reason"] = reason
+        classified.append(entry)
+    return classified
+
+
+def _canonical_json_bytes(obj):
+    return json.dumps(obj, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+
+
+def _checkpoint_content_hash(body):
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+
+
+def compute_checkpoint_integrity(checkpoint):
+    """Return the {"algorithm", "content_sha256"} block for `checkpoint`.
+
+    Excludes the "integrity" key itself so verification is never circular.
+    """
+    body = {k: v for k, v in checkpoint.items() if k != "integrity"}
+    return {"algorithm": "sha256", "content_sha256": _checkpoint_content_hash(body)}
+
+
+def verify_checkpoint_integrity(checkpoint):
+    """True only if the checkpoint's recorded hash matches its own content.
+
+    False for a missing integrity block, a missing hash, or any mismatch -
+    including a checkpoint that has simply been hand-edited.
+    """
+    integrity = checkpoint.get("integrity") or {}
+    recorded = integrity.get("content_sha256")
+    if not recorded or not isinstance(recorded, str):
+        return False
+    body = {k: v for k, v in checkpoint.items() if k != "integrity"}
+    try:
+        expected = _checkpoint_content_hash(body)
+    except (TypeError, ValueError):
+        return False
+    return hmac.compare_digest(recorded, expected)
+
+
+def _capture_branch_block(repo_root):
+    name = run_git(repo_root, ["symbolic-ref", "-q", "--short", "HEAD"])
+    if name:
+        return {"available": True, "name": name, "detached_head": False}
+    return {
+        "available": False,
+        "detached_head": True,
+        "reason": "HEAD is detached (not on a named branch)",
+    }
+
+
+def _capture_upstream_block(repo_root):
+    upstream = run_git(repo_root, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
+    if not upstream:
+        return {"available": False, "reason": "no upstream tracking branch is configured"}
+    result = {"available": True, "name": upstream}
+    counts = run_git(repo_root, ["rev-list", "--left-right", "--count", "HEAD...%s" % upstream])
+    if counts:
+        parts = counts.split()
+        if len(parts) == 2:
+            try:
+                result["ahead"] = int(parts[0])
+                result["behind"] = int(parts[1])
+            except ValueError:
+                pass
+    return result
+
+
+def _capture_checkpoint_repository(repo_path):
+    """Return (git_block, working_tree_block, history_block) or raise.
+
+    Raises CheckpointCaptureError only when authoritative repository state -
+    a real git repository with at least one commit - cannot be established.
+    Everything softer (no upstream, detached HEAD, no commits beyond the
+    first) is a normal, capturable state, represented explicitly rather than
+    failing the checkpoint.
+    """
+    resolved = os.path.abspath(os.path.expanduser(repo_path))
+    if not os.path.isdir(resolved):
+        raise CheckpointCaptureError(
+            "repository path does not exist or is not a directory: %s" % resolved
+        )
+
+    repo = capture_repo_state(resolved)
+    if not repo.get("is_git_repository"):
+        raise CheckpointCaptureError("not a git repository: %s" % resolved)
+
+    head_sha = repo.get("head_sha")
+    if not head_sha:
+        raise CheckpointCaptureError(
+            "unable to resolve HEAD (repository may have no commits yet): %s" % resolved
+        )
+
+    root = repo.get("repo_root") or resolved
+
+    commits = []
+    for commit in repo.get("recent_commits", [])[:CHECKPOINT_RECENT_COMMIT_LIMIT]:
+        commits.append(
+            {
+                "sha": commit.get("sha"),
+                "date": commit.get("date"),
+                "author": commit.get("author"),
+                "subject": redact_secrets(commit.get("subject") or ""),
+            }
+        )
+
+    working_tree = {
+        "provenance": PROVENANCE_MACHINE_VERIFIED,
+        "staged_files": _classify_working_tree_paths(repo.get("staged_files", [])),
+        "modified_files": _classify_working_tree_paths(repo.get("modified_tracked_files", [])),
+        "untracked_files": _classify_working_tree_paths(repo.get("untracked_files", [])),
+    }
+
+    git_block = {
+        "provenance": PROVENANCE_MACHINE_VERIFIED,
+        "repository_path": resolved,
+        "repo_root": root,
+        "head_sha": head_sha,
+        "branch": _capture_branch_block(root),
+        "upstream": _capture_upstream_block(root),
+        "dirty": repo.get("status_porcelain_count", 0) > 0,
+        "status_porcelain_count": repo.get("status_porcelain_count", 0),
+        "in_progress": {
+            "merge": bool(repo.get("merge_in_progress")),
+            "rebase": bool(repo.get("rebase_in_progress")),
+            "cherry_pick": bool(repo.get("cherry_pick_in_progress")),
+            "revert": bool(repo.get("revert_in_progress")),
+            "bisect": bool(repo.get("bisect_in_progress")),
+        },
+        "is_linked_worktree": bool(repo.get("is_linked_worktree")),
+        "worktree_path": repo.get("worktree_path"),
+    }
+
+    history_block = {
+        "provenance": PROVENANCE_MACHINE_VERIFIED,
+        "recent_commits": commits,
+        "limit": CHECKPOINT_RECENT_COMMIT_LIMIT,
+    }
+
+    return git_block, working_tree, history_block
+
+
+def _capture_checkpoint_environment():
+    return {
+        "provenance": PROVENANCE_MACHINE_VERIFIED,
+        "hostname": socket.gethostname(),
+        "terminal_handoff_version": TERMINAL_HANDOFF_VERSION,
+        "python_version": sys.version.split()[0],
+        "platform": sys.platform,
+    }
+
+
+def _capture_checkpoint_session(session_id, agent_type):
+    if session_id:
+        return {
+            "provenance": PROVENANCE_RECORDED_EVIDENCE,
+            "session_id": session_id,
+            "agent_type": agent_type or AGENT_CLAUDE,
+            "note": "asserted by the caller; not independently verified by Terminal Handoff",
+        }
+    return {
+        "provenance": PROVENANCE_UNAVAILABLE,
+        "reason": (
+            "th checkpoint was invoked directly; no Claude/Codex status-line "
+            "payload was supplied to bind a session id to this checkpoint"
+        ),
+    }
+
+
+def _capture_checkpoint_tests(test_command, run_tests, test_exit_code, test_output_text,
+                               test_output_file, cwd):
+    """Never raises. Test evidence is always optional: any problem here
+    degrades to an explicit "unavailable" block rather than failing the
+    checkpoint, because the git/environment capture is what a checkpoint
+    exists to guarantee.
+    """
+    if run_tests and test_exit_code is not None:
+        return {
+            "provenance": PROVENANCE_UNAVAILABLE,
+            "reason": "--run-tests and --test-exit-code are mutually exclusive; no test evidence captured",
+        }
+    if test_output_text and test_output_file:
+        return {
+            "provenance": PROVENANCE_UNAVAILABLE,
+            "reason": "--test-output and --test-output-file are mutually exclusive; no test evidence captured",
+        }
+    if not test_command:
+        return {"provenance": PROVENANCE_UNAVAILABLE, "reason": "no test evidence provided for this checkpoint"}
+    if not run_tests and test_exit_code is None:
+        return {
+            "provenance": PROVENANCE_UNAVAILABLE,
+            "reason": (
+                "--test-command was given without --run-tests or --test-exit-code; "
+                "no test evidence captured"
+            ),
+        }
+
+    redacted_command = redact_secrets(test_command)
+
+    if run_tests:
+        try:
+            argv = shlex.split(test_command)
+        except ValueError as exc:
+            return {
+                "provenance": PROVENANCE_UNAVAILABLE,
+                "reason": "could not parse --run-tests command: %s" % redact_secrets(str(exc)),
+                "command": redacted_command,
+            }
+        if not argv:
+            return {"provenance": PROVENANCE_UNAVAILABLE, "reason": "--run-tests command was empty"}
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            )
+            raw_out, _ = proc.communicate(timeout=CHECKPOINT_TEST_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            return {
+                "provenance": PROVENANCE_UNAVAILABLE,
+                "reason": "test command exceeded the %.0fs timeout" % CHECKPOINT_TEST_TIMEOUT_SECONDS,
+                "command": redacted_command,
+            }
+        except OSError as exc:
+            return {
+                "provenance": PROVENANCE_UNAVAILABLE,
+                "reason": "failed to execute test command: %s" % redact_secrets(str(exc)),
+                "command": redacted_command,
+            }
+        exit_code = proc.returncode
+        output_text = raw_out.decode("utf-8", "replace")
+        executed_by = "terminal_handoff"
+    else:
+        exit_code = test_exit_code
+        executed_by = "caller_reported"
+        if test_output_file:
+            try:
+                with open(test_output_file, "r", errors="replace") as handle:
+                    output_text = handle.read()
+            except OSError as exc:
+                return {
+                    "provenance": PROVENANCE_UNAVAILABLE,
+                    "reason": "could not read --test-output-file: %s" % redact_secrets(str(exc)),
+                    "command": redacted_command,
+                }
+        else:
+            output_text = test_output_text or ""
+
+    redacted_output = redact_secrets(output_text)
+    truncated = len(redacted_output) > CHECKPOINT_TEST_OUTPUT_LIMIT
+    tail = redacted_output[-CHECKPOINT_TEST_OUTPUT_LIMIT:] if truncated else redacted_output
+    if truncated:
+        tail = "...[truncated]\n" + tail
+
+    return {
+        "provenance": PROVENANCE_MACHINE_VERIFIED if executed_by == "terminal_handoff" else PROVENANCE_RECORDED_EVIDENCE,
+        "command": redacted_command,
+        "exit_code": exit_code,
+        # Derived strictly from the exit code. Output text is never scanned
+        # for pass/fail language - see module docstring: never infer PASS
+        # from text.
+        "successful_execution": exit_code == 0,
+        "output_tail": tail,
+        "output_truncated": truncated,
+        "executed_by": executed_by,
+    }
+
+
+def build_checkpoint(repo_path=None, session_id=None, agent_type=None,
+                      test_command=None, run_tests=False, test_exit_code=None,
+                      test_output_text=None, test_output_file=None, now=None):
+    """Build a complete, self-contained checkpoint dict. May raise
+    CheckpointCaptureError if authoritative repository state is unavailable;
+    never emits a partial checkpoint.
+    """
+    repo_path = repo_path or os.getcwd()
+    git_block, working_tree_block, history_block = _capture_checkpoint_repository(repo_path)
+
+    checkpoint = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_id": "chk_%s" % uuid.uuid4().hex,
+        "metadata": {
+            "provenance": PROVENANCE_MACHINE_VERIFIED,
+            "created_utc": utc_stamp(now),
+        },
+        "environment": _capture_checkpoint_environment(),
+        "session": _capture_checkpoint_session(session_id, agent_type),
+        "git": git_block,
+        "working_tree": working_tree_block,
+        "history": history_block,
+        "tests": _capture_checkpoint_tests(
+            test_command, run_tests, test_exit_code, test_output_text, test_output_file,
+            cwd=git_block["repository_path"],
+        ),
+    }
+    checkpoint["integrity"] = compute_checkpoint_integrity(checkpoint)
+    return checkpoint
+
+
+def cmd_checkpoint(args):
+    ensure_dirs()
+    try:
+        checkpoint = build_checkpoint(
+            repo_path=args.repo,
+            session_id=args.session_id,
+            agent_type=args.agent_type,
+            test_command=args.test_command,
+            run_tests=args.run_tests,
+            test_exit_code=args.test_exit_code,
+            test_output_text=args.test_output,
+            test_output_file=args.test_output_file,
+        )
+    except CheckpointCaptureError as exc:
+        print("checkpoint: %s" % exc, file=sys.stderr)
+        return 1
+
+    path = checkpoint_path(checkpoint["checkpoint_id"])
+    write_json_private(path, checkpoint, mode=0o600)
+    log_event("checkpoint_created", checkpoint_id=checkpoint["checkpoint_id"], path=path)
+
+    branch = checkpoint["git"]["branch"]
+    summary = {
+        "checkpoint_id": checkpoint["checkpoint_id"],
+        "path": path,
+        "repository": checkpoint["git"]["repository_path"],
+        "branch": branch.get("name") if branch.get("available") else None,
+        "detached_head": bool(branch.get("detached_head")),
+        "head_sha": checkpoint["git"]["head_sha"],
+        "dirty": checkpoint["git"]["dirty"],
+        "integrity": "present" if checkpoint.get("integrity", {}).get("content_sha256") else "missing",
+    }
+
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print("Checkpoint %s" % summary["checkpoint_id"])
+        print("  path:       %s" % summary["path"])
+        print("  repository: %s" % summary["repository"])
+        print("  branch:     %s" % ("(detached HEAD)" if summary["detached_head"] else summary["branch"]))
+        print("  head_sha:   %s" % summary["head_sha"])
+        print("  dirty:      %s" % ("yes" if summary["dirty"] else "no"))
+        print("  integrity:  %s" % summary["integrity"])
+    return 0
+
+
 def cmd_version(args):
     print("Terminal Handoff %s (manifest schema %d)" % (TERMINAL_HANDOFF_VERSION, MANIFEST_SCHEMA_VERSION))
     return 0
@@ -11743,6 +12180,36 @@ def main(argv=None):
 
     p = sub.add_parser("reset-circuit", help="Reset the storm circuit breaker")
     p.set_defaults(func=cmd_reset_circuit)
+
+    p = sub.add_parser(
+        "checkpoint",
+        help="Create a deterministic, machine-verifiable checkpoint of the current repository/session state",
+    )
+    p.add_argument("--repo", default=None, help="Repository path to checkpoint (default: current working directory)")
+    p.add_argument(
+        "--session-id", default=None,
+        help="Session id to record as caller-asserted evidence (not independently verified)",
+    )
+    p.add_argument("--agent-type", choices=("claude", "grok", "codex"), default=None)
+    p.add_argument(
+        "--test-command", default=None,
+        help="A test command to execute (with --run-tests) or describe (with --test-exit-code)",
+    )
+    p.add_argument(
+        "--run-tests", action="store_true",
+        help="Execute --test-command now and record its evidence (nothing is executed unless this is passed)",
+    )
+    p.add_argument(
+        "--test-exit-code", type=int, default=None,
+        help="Exit code of a test command already executed elsewhere (recorded evidence, not executed)",
+    )
+    p.add_argument("--test-output", default=None, help="Inline captured output of an already-executed test command")
+    p.add_argument(
+        "--test-output-file", default=None,
+        help="Path to a file containing captured output of an already-executed test command",
+    )
+    p.add_argument("--json", action="store_true", help="Print the checkpoint summary as JSON")
+    p.set_defaults(func=cmd_checkpoint)
 
     p = sub.add_parser("version", help="Print the Terminal Handoff version")
     p.set_defaults(func=cmd_version)
