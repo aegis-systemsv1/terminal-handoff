@@ -11,7 +11,6 @@ is exercised either through CLAUDE_TERMINAL_HANDOFF_TEST_MODE=1 (the
 existing project-wide convention) or with an injected `popen` standing in
 for the real subprocess call.
 """
-import copy
 import json
 import os
 import sys
@@ -584,10 +583,15 @@ class TestResumeIdentity(ResumeTestCase):
         repo = self.make_repo("identity-positive")
         chain_id = "chaintestpositive1"
         session_id = "resume-identity-positive-session"
+        # find_claude_executable() must not depend on whether this machine
+        # happens to have a real `claude` binary installed - CI has none, so
+        # without this mock cmd_resume() correctly refuses before ever
+        # reaching the identity-resolution code path this test checks. Same
+        # pattern as test_resume_refuses_when_claude_binary_missing.
         with mock.patch.dict(os.environ, {
             "CLAUDE_TERMINAL_HANDOFF_HOME": self.home,
             "CLAUDE_TERMINAL_HANDOFF_TEST_MODE": "1",
-        }):
+        }), mock.patch.object(CORE, "find_claude_executable", return_value=self.fake_claude):
             CORE.ensure_dirs()
             CORE.record_chain_generation(
                 chain_id, 3, session_id=session_id, display_name="Identity Test 3",
@@ -631,10 +635,12 @@ class TestResumeIdentity(ResumeTestCase):
     def test_no_chain_record_means_no_identity_is_invented(self):
         repo = self.make_repo("identity-negative")
         session_id = "resume-identity-negative-session"
+        # Same reason as the sibling test above: do not depend on whether
+        # this machine happens to have a real `claude` binary installed.
         with mock.patch.dict(os.environ, {
             "CLAUDE_TERMINAL_HANDOFF_HOME": self.home,
             "CLAUDE_TERMINAL_HANDOFF_TEST_MODE": "1",
-        }):
+        }), mock.patch.object(CORE, "find_claude_executable", return_value=self.fake_claude):
             CORE.ensure_dirs()
             # Deliberately no record_chain_generation() call - this session
             # id has never been part of any Terminal Handoff chain.
