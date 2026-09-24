@@ -197,3 +197,45 @@ implemented.
 * **`session/load` replays history**, which Terminal Handoff discards; it relies on Grok honouring ACP
   `loadSession`.
 * **Agent switching mid-session, and other agents (for example Codex), are not implemented.**
+
+## Checkpoint (`th checkpoint`)
+
+* **No Codex support.** `--agent-type codex` records a caller-supplied label only - nothing is verified or
+  captured about an actual Codex session.
+* **`--ai-summary` and `--compact` cost real, billed API calls.** Terminal Handoff was previously
+  zero-API-cost; this is a deliberate, opt-in exception.
+* **Real LLM output has inherent variance.** The AI summary worker has, in real testing, produced clean
+  JSON, JSON prefaced with prose (handled), and occasionally an empty response (degrades to
+  `unavailable`, never fabricated). This is not a fixed reliability number.
+* **Smart Compact's VERIFY only catches structurally cross-checkable claims** - it compares
+  `tests_performed` against a real exit code and `files_in_progress` against the actual working tree,
+  both already present elsewhere in the same checkpoint. It cannot catch a narrative misjudgement in the
+  AI summary's own prose (confirmed in real testing: an early instruction later legitimately superseded
+  was described as "violated"; the prompt was fixed to reduce this, not eliminate the underlying
+  limitation - see [CHECKPOINT.md](CHECKPOINT.md#known-limitations)).
+* **The automated test suite never starts a real Claude Code session or AI worker**, consistent with the
+  rest of Terminal Handoff's tests. Real-worker defects (like the two above) are only caught by manual
+  acceptance runs against a real transcript.
+
+## Resume (`th resume`)
+
+* **No integration with the live chain-generation registry.** Resume reads an existing chain record for
+  a checkpoint's session id, when one exists, for display only - it never calls
+  `record_chain_generation()` and never advances a generation counter. See
+  [RESUME.md](RESUME.md#known-limitations) for why this is a deliberate boundary, not an omission.
+* **No heartbeat or ownership-transfer verification**, unlike automatic/manual handoff - resume reports
+  success based on the Terminal window having been opened, not on the successor proving it is alive.
+* **Repository-drift detection compares filenames, never contents.** A file modified without being
+  added to or removed from the working tree's tracked/staged/untracked lists will not show up in the
+  `working_tree_filenames` drift field specifically (its effect on `dirty` still will).
+  `git.branch`/`head_sha`/`dirty` and filename-set drift are the only fields compared.
+* **`repository_identity`'s VERIFIED/CHANGED status is object reachability, not path equality** - it
+  checks whether the checkpoint's recorded `head_sha` still exists in the target repository's history,
+  not whether the recorded and live paths are the same string (which can differ cosmetically, e.g. a
+  `/tmp` → `/private/tmp` symlink, for the exact same repository).
+* **No Codex integration.** Out of scope for this slice.
+* **Real-worker acceptance was demonstrated with a one-shot `claude -p` call standing in for the
+  successor**, not a full interactive GUI Terminal.app session, to avoid opening an uncontrolled window
+  during automated acceptance testing. The actual window-opening code path
+  (`launch_resume_terminal`) is covered by dedicated tests with an injected subprocess double, and by
+  manual verification, not by the same real-transcript acceptance run.

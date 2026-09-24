@@ -68,6 +68,21 @@ class TestManualHandoff(THTestCase):
     def setUp(self):
         super(TestManualHandoff, self).setUp()
         self.saved_env = dict(os.environ)
+        # `self.env()` (base_env()) already computes a clean environment with
+        # every CLAUDE_TERMINAL_HANDOFF_*/CLAUDE_CODE_* key stripped out and
+        # only the test's own controlled values set - but `.update()` alone
+        # only adds/overwrites those keys, it never removes ones the *real*
+        # process environment already had. When this suite runs inside an
+        # actual live Terminal Handoff session (this file's own process is
+        # itself a chain successor, e.g. during `/loop` or a nested `th`
+        # invocation), CLAUDE_TERMINAL_HANDOFF_CHAIN_ID/GENERATION/BASE_NAME
+        # remain set from that real session and silently override this
+        # test's synthetic session_name - a fresh "Ranger" manual handoff was
+        # computed as a continuation of the live chain instead. Clearing
+        # os.environ first (matching tearDown's own clear+update pattern)
+        # makes the test's environment exactly what self.env() computed,
+        # regardless of what the real invoking process already had set.
+        os.environ.clear()
         os.environ.update(self.env(CLAUDE_TERMINAL_HANDOFF_TEST_MODE="1"))
         os.environ["CLAUDE_TERMINAL_HANDOFF_HOME"] = self.home
 

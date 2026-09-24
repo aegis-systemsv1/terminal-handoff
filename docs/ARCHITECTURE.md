@@ -470,3 +470,28 @@ refuses while another bridge is alive). If the load fails it changes nothing.
 
 **Context.** There is no Terminal Handoff A to B handoff for Grok. Grok's own persistence, load and
 compaction apply. See [ADR 0007](decisions/0007-grok-agent-adapter.md).
+
+## Checkpoints: a separate, standalone capability
+
+`th checkpoint` is not part of the automatic handoff flow described above - it never launches a
+successor and never touches the transfer state machine described in §9b. It reuses the same
+"delegate transcript reading to an isolated worker" principle as §7 (never load a transcript into the
+calling session's own context), adapted from an in-session Agent-tool subagent to a disposable `claude
+-p` subprocess, because a checkpoint may be created by a plain CLI invocation with no active Claude
+session to spawn a subagent from. See [CHECKPOINT.md](CHECKPOINT.md) for the full schema, security
+model, and known limitations.
+
+## Resume: reading a checkpoint back, deliberately outside the transfer state machine
+
+`th resume <checkpoint>` (V2 Slice 4) launches a fresh Claude Code successor session from a checkpoint,
+but it is architecturally distinct from the automatic/manual handoff flow above, not a variant of it:
+there is no live parent process to prove relinquished ownership from, since the session that wrote the
+checkpoint may no longer exist. It therefore never touches the transfer state machine, the
+ownership-transfer heartbeat protocol (§9b), or the chain-generation ceiling that govern §2-§9. It does
+reuse the same defensive posture as the handoff flow elsewhere in this document - a short, argv-safe
+bootstrap prompt pointing at a full brief file kept out of `ps` output (the same pattern §6/§7 use for
+successor prompts), and the same `FORBIDDEN_LAUNCH_TOKENS` list barring Claude Code's own
+`--resume`/`--continue`/`-c`/`-r`/`--fork-session` from ever reaching a launched successor. See
+[RESUME.md](RESUME.md) for the full trust model, repository-drift handling, fail-closed behaviour, and
+known limitations - including that resume reads existing chain identity for display only and never
+writes to the chain-generation registry itself.
