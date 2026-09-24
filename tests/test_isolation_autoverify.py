@@ -7,7 +7,9 @@ every other outcome. It never trusts a version it has not itself verified."""
 import os
 import re
 import sys
+import fcntl
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +44,8 @@ class AutoVerifyCase(LogicalCase):
         return run
 
     def versions(self):
+        if not os.path.exists(CORE.isolation_state_path()):
+            return {}
         return (json_file(CORE.isolation_state_path()) or {}).get("versions", {})
 
 
@@ -142,6 +146,127 @@ class TestAutoVerify(AutoVerifyCase):
         self.assertTrue(all(ok for ok, _ in results))
         self.assertEqual(len(calls), 2)  # one probe (two attempts), not four
         self.assertTrue(self.versions()[VERSION]["profile_settings_effective"])
+
+
+class TestSingleFlightLocking(AutoVerifyCase):
+    def good_result(self, version=VERSION, **extra):
+        rec = {"claude_version": version, "broader_project_allow_blocked": True,
+               "profile_settings_effective": True, "verified_utc": "T"}
+        rec.update(extra)
+        return rec
+
+    def run_thread(self, fn, box):
+        t = threading.Thread(target=lambda: box.append(fn()))
+        t.start()
+        return t
+
+    def test_the_probe_does_not_hold_the_general_json_lock(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_probe(claude_bin, run=None):
+            entered.set()
+            release.wait(30)
+            return self.good_result()
+
+        box = []
+        t = self.run_thread(lambda: CORE.ensure_isolation_verified(self.fake_claude, run=self.run_for(), probe=slow_probe), box)
+        self.assertTrue(entered.wait(10))
+        started = time.monotonic()
+        CORE.update_json_locked(CORE.isolation_state_path(), lambda d: d.setdefault("versions", {}).__setitem__("other", {"x": 1}))
+        self.assertLess(time.monotonic() - started, 2.0)  # not blocked behind the in-flight probe
+        release.set()
+        t.join(30)
+        self.assertTrue(box[0][0])
+        self.assertIn("other", self.versions())
+        self.assertIn(VERSION, self.versions())
+
+    def test_unrelated_versions_verify_in_parallel(self):
+        both = threading.Barrier(2, timeout=10)
+
+        def probe_for(version):
+            def probe(claude_bin, run=None):
+                both.wait()  # only passes if BOTH probes are in flight at once
+                return self.good_result(version)
+            return probe
+
+        box = []
+        threads = [
+            self.run_thread(lambda v=v: CORE.ensure_isolation_verified(self.fake_claude, run=self.run_for(version=v), probe=probe_for(v)), box)
+            for v in ("2.1.290", "2.1.291")
+        ]
+        for t in threads:
+            t.join(30)
+        self.assertEqual([ok for ok, _ in box], [True, True])
+        self.assertEqual(set(self.versions()), {"2.1.290", "2.1.291"})
+
+    def test_a_waiter_consumes_the_holders_failure_without_reprobing(self):
+        entered, release = threading.Event(), threading.Event()
+        probes = []
+
+        def failing_probe(claude_bin, run=None):
+            probes.append(1)
+            entered.set()
+            release.wait(30)
+            return self.good_result(broader_project_allow_blocked=False)
+
+        box = []
+        first = self.run_thread(lambda: CORE.ensure_isolation_verified(self.fake_claude, run=self.run_for(), probe=failing_probe), box)
+        self.assertTrue(entered.wait(10))
+        second = self.run_thread(lambda: CORE.ensure_isolation_verified(self.fake_claude, run=self.run_for(), probe=failing_probe), box)
+        time.sleep(0.3)  # let the second launch queue on the version lock
+        release.set()
+        first.join(30)
+        second.join(30)
+        self.assertEqual(len(probes), 1)
+        self.assertEqual([ok for ok, _ in box], [False, False])
+        self.assertTrue(all("broader_project_allow_blocked" in why for _, why in box))
+        self.assertNotIn(VERSION, self.versions())  # failures are never written to isolation.json
+
+    def test_a_later_independent_launch_reprobes_after_a_failure(self):
+        probes = []
+
+        def probe(claude_bin, run=None):
+            probes.append(1)
+            return self.good_result(broader_project_allow_blocked=len(probes) > 1)
+
+        self.assertFalse(CORE.ensure_isolation_verified(self.fake_claude, run=self.run_for(), probe=probe)[0])
+        time.sleep(0.05)
+        self.assertTrue(CORE.ensure_isolation_verified(self.fake_claude, run=self.run_for(), probe=probe)[0])
+        self.assertEqual(len(probes), 2)
+
+    def test_a_stuck_verifier_makes_a_launch_fail_closed(self):
+        lock = CORE.th_path("remote", "isolation-verify-%s.lock" % CORE._isolation_version_slug(VERSION))
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        fd = os.open(lock, os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        probes = []
+        try:
+            ok, why = CORE.ensure_isolation_verified(
+                self.fake_claude, run=self.run_for(), probe=lambda *a, **k: probes.append(1),
+                wait_timeout=0.3, poll=0.02)
+        finally:
+            os.close(fd)
+        self.assertFalse(ok)
+        self.assertIn("in progress", why)
+        self.assertEqual(probes, [])
+
+    def test_a_result_recorded_during_the_probe_is_kept_not_overwritten(self):
+        def probe(claude_bin, run=None):
+            CORE.update_json_locked(CORE.isolation_state_path(), lambda d: d.setdefault("versions", {}).__setitem__(
+                VERSION, self.good_result(verified_utc="MANUAL")))
+            return self.good_result(verified_utc="PROBE")
+
+        ok, _ = CORE.ensure_isolation_verified(self.fake_claude, run=self.run_for(), probe=probe)
+        self.assertTrue(ok)
+        self.assertEqual(self.versions()[VERSION]["verified_utc"], "MANUAL")
+
+    def test_the_verifying_lock_is_released_after_every_outcome(self):
+        def boom(claude_bin, run=None):
+            raise RuntimeError("x")
+
+        CORE.ensure_isolation_verified(self.fake_claude, run=self.run_for(), probe=boom)
+        ok, _ = CORE.ensure_isolation_verified(self.fake_claude, run=self.run_for(), wait_timeout=0.5)
+        self.assertTrue(ok)  # would time out if the first call leaked the lock
 
 
 if __name__ == "__main__":

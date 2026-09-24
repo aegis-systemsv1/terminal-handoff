@@ -113,6 +113,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the positive identity-resolution path through `cmd_resume` was previously exercised only by manual
   verification) was also closed with two new tests.
 
+### Fixed
+
+- **Remote launches no longer stay blocked on every Claude Code patch upgrade.** Isolation was previously
+  only *read* at launch, so each new version (2.1.280, 2.1.281, 2.1.282) refused phone launches with
+  `isolation_unverified` until someone ran `remote verify-isolation` by hand. The first launch on a Claude
+  version with no valid record now runs that same verification automatically:
+  - a PASS is recorded in `remote/isolation.json` for that **exact version string only** and reused by every
+    later launch, with no re-probe;
+  - a failed, errored or timed-out verification **blocks the launch** (fail closed) and names the failed
+    check (`broader_project_allow_blocked` and/or `profile_settings_effective`); failures are never written
+    to `isolation.json`, so the next launch re-verifies instead of a transient error blocking a version
+    until a manual re-run;
+  - **no future version is implicitly trusted**: a patch version is never inferred from a neighbour, a
+    malformed or partial record (or one whose `claude_version` does not match its key) is re-verified, and
+    an unreadable Claude version is refused without probing.
+  Verification is single-flight per Claude version (`remote/isolation-verify-<version>.lock`): only one
+  process probes a version and concurrent launches for it wait for and reuse its result. The probe, which
+  can take minutes, never holds the general `isolation.json` lock; that lock is taken only for the short
+  re-check-and-write, so other versions and other isolation operations are not blocked. A launch that waits
+  longer than 330 seconds for another launch's verification refuses rather than proceeding. Project
+  permissions, registrations and the isolation probe itself are unchanged.
+
 ## [1.5.0] - 2026-09-21
 
 Grok is now a second supported agent. Claude Code behaviour is unchanged.
