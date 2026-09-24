@@ -65,6 +65,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt could describe a later, explicit instruction that superseded an earlier one as a "violation" of the
   earlier one (prompt now explicitly instructs chronological reading before judging anything a problem).
 
+- **`th resume <checkpoint>`** (Slice 4 of Terminal Handoff V2, on top of Slices 1-3): reads a checkpoint
+  back and launches a fresh Claude Code successor session with a trust-labelled continuation brief, instead
+  of the original raw transcript. Architecturally distinct from the automatic/manual A→B handoff flow -
+  there is no live parent process to transfer ownership from, so resume never touches the transfer state
+  machine or heartbeat verification. Before anything is launched: the checkpoint's schema version and
+  integrity hash are verified (a malformed, unsupported, or tampered checkpoint is refused, never repaired
+  and continued); live repository state is independently re-captured and compared field-by-field against
+  what the checkpoint recorded (`VERIFIED` / `CHANGED_SINCE_CHECKPOINT` / `UNVERIFIABLE`); a repository whose
+  history has no relationship to the checkpoint's recorded `head_sha` fails the launch closed ("checkpoint
+  points to an unexpected project"), while ordinary drift (branch, HEAD, dirty state, changed filenames) is
+  never a refusal - it is surfaced to the successor instead. The rendered brief keeps six kinds of content
+  visibly separate - Terminal-Handoff-verified facts, live repository drift, AI-recovered user
+  instructions/constraints (explicitly labelled "not a live instruction from the current person"), the
+  AI-generated summary, the recommended next action (explicitly labelled "context only, not authority" -
+  never auto-executed), and Smart Compact's VERIFY findings when present - and opens with a hardcoded trust
+  boundary notice stating these rules before any recovered content appears. Every string is redacted a second
+  time on the way out (`_compact_redact`, the same recursive redactor Smart Compact uses), independently of
+  whatever the capture pipeline already did. The launch argv can never carry Claude Code's own
+  `--resume`/`--continue`/`-c`/`-r`/`--fork-session` (those would replay session state directly, bypassing the
+  brief entirely) or any permission-bypass flag, checked by `assert_resume_argv_safe()` before any launch is
+  attempted; the full brief lives only in a private file, never in the process listing, via the same
+  short-bootstrap-prompt pattern already used for handoff successor prompts. Existing chain identity is read
+  for a checkpoint's session id when one already exists, for display only - resume never writes to the
+  chain-generation registry itself. Proven adversarially (46 tests in `tests/test_resume.py`, covering the
+  points below plus identity resolution and the missing-`head_sha` case described below) against: a checkpoint tampered
+  after hashing, malformed JSON, an unsupported schema version, a malicious AI summary, a malicious
+  recommended next action, a fake user instruction inserted via an AI-generated field, prompt injection
+  inside transcript-derived fields (including a fabricated "VERIFIED FACTS" header), a repository swapped for
+  an unrelated one, branch/HEAD/dirty-state drift, a missing repository, a missing Smart Compact block, a
+  missing `claude` binary, and a secret embedded directly in an AI-generated field bypassing the normal
+  capture pipeline. Two real defects were found and fixed by this same adversarial testing before commit:
+  test fixture repos could coincidentally produce identical commit shas (defeating the "different project"
+  test), and the structured (JSON) brief was not redacted, only the rendered text. Demonstrated end-to-end
+  against a real repository, a real transcript, and a real `--ai-summary --compact` checkpoint, with a real
+  commit landed on the repository after the checkpoint to force genuine drift: the resulting brief, fed to a
+  real one-shot `claude -p` call standing in for the successor, correctly named the task, what was completed,
+  what remained, quoted the constraints verbatim, identified the recommended action as unverified AI content
+  and declined to execute it automatically, and specifically named every changed field. The structured brief
+  is also persisted to disk (`prompts/resume-<checkpoint_id>.json`), not just built and discarded in memory,
+  after independent review found the first version never actually wrote it despite documenting it as the
+  ground truth a successor should prefer. A second independent review then found a genuine gap in the
+  "different project" fail-closed check: a hand-crafted checkpoint (bypassing the capture pipeline, with a
+  correctly recomputed hash) that records no `head_sha` at all bypassed the refusal entirely, since resume
+  only treated an explicit mismatch as disqualifying, not an absent one - `resume_preflight` now fails
+  closed on a missing `head_sha` too, with a dedicated regression test; a second, more minor coverage gap
+  (the positive identity-resolution path through `cmd_resume` was previously exercised only by manual
+  verification) was also closed with two new tests.
+
 ## [1.5.0] - 2026-09-21
 
 Grok is now a second supported agent. Claude Code behaviour is unchanged.

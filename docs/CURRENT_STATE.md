@@ -37,7 +37,8 @@ part of normal operation.
 `~/.claude/terminal-handoff/` (mode 0700): `logical/` (logical sessions), `remote/` (gateway config,
 project registry, device hashes, signing key, isolation record), `transfers/`, `handoffs/`, `chains/`,
 `logs/`, `checkpoints/` (see [CHECKPOINT.md](CHECKPOINT.md) - a separate, standalone capability, not part
-of the remote-control system described in this document). Nothing there is committed to the repository.
+of the remote-control system described in this document), `resumes/` (audit records of `th resume`
+launches - see [RESUME.md](RESUME.md)). Nothing there is committed to the repository.
 
 ## Decisions
 

@@ -613,3 +613,49 @@ capability.
   including what redaction does not catch.
 * **Smart Compact adds no new capability surface** - it reads an already-built checkpoint dict and writes
   a classification of it; no transcript, no subprocess, no network call.
+
+## Resume (`th resume`)
+
+* **Checkpoint integrity is verified before anything else runs.** `verify_checkpoint_integrity()` is
+  checked before any content is read into a brief or acted on; a tampered or corrupted checkpoint is
+  refused outright (fail closed), never repaired and continued.
+* **Provenance is never flattened or upgraded.** The rendered brief and its structured (JSON) form keep
+  every field's original label - `machine_verified`/`recorded_evidence` (Terminal Handoff's own,
+  re-confirmed live) is always visually and structurally separate from `ai_generated` (the checkpoint's
+  AI summary) and from resume's own live drift comparison. Nothing recovered from a checkpoint's
+  AI-generated fields can acquire `machine_verified` provenance merely by appearing in a brief -
+  `render_resume_brief()` never writes that label onto anything sourced from `session_summary`.
+* **The recommended next action is data, never an instruction the pipeline acts on.** It reaches the
+  successor only as literal text inside a clearly labelled section of a file the successor's own Claude
+  Code session chooses to read and reason about; no code path in `th resume` parses it as a command or
+  shells out with it.
+* **Transcript-derived prompt injection cannot escalate.** Whatever an AI-summary field contains -
+  including text engineered to look like a Terminal Handoff system instruction, a fake "VERIFIED FACTS"
+  header, or a fabricated `head_sha` - is inserted into the brief as an inert string inside its own
+  section; the brief's actual structure (which heading contains what) is built entirely from Python
+  dict/string operations over the checkpoint's own JSON keys, never by interpreting recovered text as
+  markup or control data. See [RESUME.md](RESUME.md#trust-model) for the adversarial tests proving this.
+* **Redaction is defense in depth, applied a second time on the way out.** The checkpoint's own capture
+  pipeline (Slices 1-2) already redacts; `render_resume_brief()` redacts every recovered string again,
+  independently, in both the rendered text and the structured brief, via the same recursive redactor
+  Smart Compact uses (`_compact_redact`) - proven against a hand-constructed checkpoint that bypassed the
+  normal capture pipeline entirely.
+* **The launch argv can never carry Claude Code's own session-replay flags.** `assert_resume_argv_safe()`
+  checks the same `FORBIDDEN_LAUNCH_TOKENS` list the handoff launcher uses (`--resume`, `--continue`,
+  `-c`, `-r`, `--fork-session`, and every permission-bypass flag) before any launch is attempted - a
+  resumed session is always a genuinely fresh one seeded only with the brief this module built, never a
+  replay of Claude Code's own stored session state.
+* **The full brief never appears in the process listing.** Only a short, argv-safe bootstrap prompt
+  naming the brief's file path is passed as a launch argument; the brief's full content - which may
+  include checkpoint-derived text - lives only in a private (`0600`) file, the same pattern
+  automatic/manual handoff already uses for successor prompts.
+* **A different repository is refused, not silently resumed into.** If the checkpoint's recorded
+  `head_sha` is not reachable anywhere in the target repository's history, resume refuses before writing
+  a brief or attempting a launch, rather than seeding a successor with continuation context for the wrong
+  project.
+* **No identity is fabricated.** Resume reads an existing, already-authoritative chain record for a
+  checkpoint's session id when one exists (for display only, see [RESUME.md](RESUME.md)); when none
+  exists, the successor is a plain, standalone session with no invented chain/generation identity.
+* **Terminal launch reuses the same safe primitives as the handoff launcher** - `applescript_quote`,
+  `shlex.quote` throughout the generated launch script, no `eval`, no shell interpolation of checkpoint
+  or brief content - and never opens a window under `CLAUDE_TERMINAL_HANDOFF_TEST_MODE=1`.

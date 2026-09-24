@@ -7,15 +7,18 @@ where a previous session left off, without loading that session's full transcrip
 **A checkpoint is not a handoff.** It never launches a successor, never writes to the transfer state
 machine, and can be created any number of times, at any point, safely. Nothing about the automatic
 A→B handoff flow described in [ARCHITECTURE.md](ARCHITECTURE.md) is affected by checkpoints, and vice
-versa. `th resume` (reading a checkpoint back into a fresh session) does not exist yet — this document
-covers creation only.
+versa. This document covers checkpoint creation; reading one back into a fresh session is
+[`th resume`](RESUME.md).
 
-Checkpoints were built in three slices, each strictly additive over the last:
+Checkpoints were built in four slices, each strictly additive over the last:
 
 1. **Deterministic capture** — repository, working tree, test evidence. No AI involved.
 2. **AI session summary** (`--ai-summary`) — an isolated AI worker's account of a transcript.
 3. **Smart Compact** (`--compact`) — classifies what slices 1–2 already captured into
    KEEP / COMPRESS / DROP / VERIFY.
+4. **[Resume](RESUME.md)** (`th resume`) — reads a checkpoint back and launches a fresh Claude Code
+   successor session with a trust-labelled continuation brief built from what slices 1–3 captured. No
+   new capture happens here; see RESUME.md for the trust model and fail-closed behaviour.
 
 ## Command
 
