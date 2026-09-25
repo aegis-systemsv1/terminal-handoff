@@ -8961,7 +8961,7 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     claude_bin = find_claude_executable()
     if not claude_bin:
         return 503, {"error": "claude_unavailable"}
-    isolated, why = (isolation_check or isolation_ok)(claude_bin)
+    isolated, why = (isolation_check or ensure_isolation_verified)(claude_bin)
     if not isolated:
         log_event("remote_create_refused", device_id=device_id, project=project_name, reason="isolation unverified")
         return 503, {"error": "isolation_unverified", "reason": why}
@@ -10770,12 +10770,176 @@ def isolation_probe(claude_bin, run=subprocess.run, model="claude-haiku-4-5-2025
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _isolation_record_valid(value, version=None):
+    """A usable isolation_probe() result: both booleans genuinely present,
+    not a malformed, partial or stale-schema record. A record failing this
+    is treated exactly like no record at all - never trusted, never treated
+    as an implicit pass or fail, always re-probed for real."""
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("broader_project_allow_blocked"), bool)
+        and isinstance(value.get("profile_settings_effective"), bool)
+        and (version is None or value.get("claude_version") == version)
+    )
+
+
+def _isolation_record_ok(result):
+    return bool(result.get("broader_project_allow_blocked")) and bool(result.get("profile_settings_effective"))
+
+
+def _isolation_failed_checks(result):
+    """Which named checks failed, so a refusal can show the actual failed
+    isolation check rather than a bare 'not verified' message."""
+    failed = []
+    if not result.get("broader_project_allow_blocked"):
+        failed.append("broader_project_allow_blocked")
+    if not result.get("profile_settings_effective"):
+        failed.append("profile_settings_effective")
+    return failed
+
+
 def isolation_ok(claude_bin, run=subprocess.run):
     version = claude_version(claude_bin, run)
     result = ((read_json(isolation_state_path(), {}) or {}).get("versions") or {}).get(version or "?")
-    if not result or not result.get("broader_project_allow_blocked") or not result.get("profile_settings_effective"):
+    if not _isolation_record_valid(result) or not _isolation_record_ok(result):
         return False, "permission isolation has not been verified for Claude %s; run `remote verify-isolation`" % version
     return True, None
+
+
+# ---------------------------------------------------------------------------
+# Automatic isolation verification (self-healing across Claude Code patch
+# upgrades)
+#
+# isolation_ok() above is a pure, read-only check: a not-yet-recorded
+# version fails closed and stays failed closed until a human runs
+# `remote verify-isolation` by hand. ensure_isolation_verified() is the launch
+# gate's replacement: when the current Claude Code version has no valid
+# record, it runs the SAME probe `remote verify-isolation` runs and decides
+# from that fresh, real result - automatic verification, never automatic
+# trust. Only the exact version probed is ever recorded, and only a PASS.
+#
+# Locking (two locks, deliberately separate):
+#   * a per-version single-flight lock (remote/isolation-verify-<version>.lock)
+#     is held for the whole probe, which can take minutes. It serialises
+#     verification of ONE version; other versions and every other
+#     isolation.json operation are unaffected.
+#   * the general isolation.json lock (update_json_locked) is taken only for
+#     the short final read/re-check/write, never across the probe.
+# A launch that had to wait for the single-flight lock consumes the holder's
+# outcome instead of probing again: a recorded PASS, or - for a failure, which
+# is never written to isolation.json - a small sidecar marker stamped after
+# the waiter began waiting. A later, independent launch always re-probes.
+# ---------------------------------------------------------------------------
+
+ISOLATION_VERIFY_WAIT = 330  # > the probe's two 120s attempts plus overhead
+
+
+def _isolation_version_slug(version):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", version)[:64] or "unknown"
+
+
+def _isolation_recorded(version):
+    data = read_json(isolation_state_path(), {})
+    versions = data.get("versions") if isinstance(data, dict) else None
+    existing = versions.get(version) if isinstance(versions, dict) else None
+    return existing if _isolation_record_valid(existing, version) else None
+
+
+def _isolation_verdict(result, version):
+    if _isolation_record_valid(result, version) and _isolation_record_ok(result):
+        return True, None
+    failed = _isolation_failed_checks(result) if isinstance(result, dict) else []
+    return False, "permission isolation verification failed for Claude %s: %s" % (
+        version, ", ".join(failed) or "result missing or malformed",
+    )
+
+
+def _isolation_record_pass(version, result):
+    """Short JSON-lock phase: re-check, then record. If another process
+    already recorded a valid result for this version, keep and return that."""
+    outcome = {}
+
+    def mutate(data):
+        versions = data.get("versions")
+        if not isinstance(versions, dict):
+            versions = data["versions"] = {}
+        existing = versions.get(version)
+        if _isolation_record_valid(existing, version):
+            outcome["result"] = existing
+            return
+        versions[version] = result
+        outcome["result"] = result
+
+    update_json_locked(isolation_state_path(), mutate)
+    return outcome["result"]
+
+
+def ensure_isolation_verified(claude_bin, run=subprocess.run, probe=isolation_probe,
+                              wait_timeout=None, poll=0.05):
+    """Return (ok, reason). Never raises: any unexpected failure fails closed,
+    the same posture as every other optional/external step in this codebase."""
+    version = claude_version(claude_bin, run)
+    if not version:
+        return False, "permission isolation cannot be verified: the Claude version could not be determined"
+    wait_timeout = ISOLATION_VERIFY_WAIT if wait_timeout is None else wait_timeout
+    try:
+        existing = _isolation_recorded(version)
+        if existing is not None:
+            return _isolation_verdict(existing, version)
+
+        started = time.time()
+        slug = _isolation_version_slug(version)
+        lock_path = th_path("remote", "isolation-verify-%s.lock" % slug)
+        marker_path = th_path("remote", "isolation-verify-%s.result" % slug)
+        ensure_dirs()
+        _mkdir_private(os.path.dirname(lock_path))
+        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            deadline = time.monotonic() + wait_timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        log_event("isolation_auto_verify_timeout", claude_version=version)
+                        return False, "permission isolation verification for Claude %s is still in progress in another launch; refusing" % version
+                    time.sleep(poll)
+            try:
+                existing = _isolation_recorded(version)
+                if existing is not None:
+                    return _isolation_verdict(existing, version)
+                marker = read_json(marker_path, {})
+                if isinstance(marker, dict) and isinstance(marker.get("epoch"), (int, float)) and marker["epoch"] >= started:
+                    return _isolation_verdict(marker.get("result"), version)
+
+                result = probe(claude_bin, run=run)
+                ok, reason = _isolation_verdict(result, version)
+                if ok:
+                    result = _isolation_record_pass(version, result)
+                    ok, reason = _isolation_verdict(result, version)
+                    try:
+                        os.unlink(marker_path)
+                    except OSError:
+                        pass
+                else:
+                    write_json_private(marker_path, {"epoch": time.time(), "result": result})
+                res = result if isinstance(result, dict) else {}
+                log_event(
+                    "isolation_auto_verified", claude_version=version, ok=ok,
+                    broader_project_allow_blocked=bool(res.get("broader_project_allow_blocked")),
+                    profile_settings_effective=bool(res.get("profile_settings_effective")),
+                )
+                return ok, reason
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+    except Exception as exc:  # noqa: BLE001 - a launch gate must never crash open
+        log_event("isolation_auto_verify_error", claude_version=version, error=redact_secrets(str(exc)))
+        return False, "permission isolation verification failed unexpectedly for Claude %s: %s" % (
+            version, redact_secrets(str(exc)),
+        )
 
 
 def cmd_verify_isolation():

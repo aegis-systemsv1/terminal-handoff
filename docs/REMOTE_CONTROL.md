@@ -357,8 +357,27 @@ terminal-handoff remote verify-isolation
 runs two small `claude -p` probes in a throwaway directory (a project allow rule
 must be *blocked*, and the profile file alone must be able to *grant*), and
 records the result **per Claude version**. Until it passes for the installed
-version, remote launch returns `isolation_unverified` (fail closed). A Claude
-upgrade requires re-verification.
+version, remote launch returns `isolation_unverified` (fail closed).
+
+You do not need to run it by hand after a Claude upgrade. The first remote
+launch on a Claude version with no valid record runs the same verification
+automatically, before the launch continues:
+
+* a **pass** is recorded for that exact version string and reused by every
+  later launch (no re-probe);
+* a **failure, error or timeout blocks the launch**, and the
+  `isolation_unverified` reason names the failed check. A failure is not
+  recorded, so the next launch verifies again;
+* **no future version is implicitly trusted**: each new patch version is
+  verified on its own, and a malformed, partial or mismatched record is
+  re-verified rather than trusted.
+
+Only one process verifies a given version at a time (a per-version lock);
+concurrent launches for it wait for and reuse the result, and other versions
+and other isolation state are not blocked while a probe runs. The probe takes
+up to a few minutes, so the first launch on a new version is slow; a launch
+that waits more than 330 seconds for another launch's verification refuses.
+`remote verify-isolation` still works for verifying ahead of time.
 
 Trade-off: a remote session does not load the repository's own
 `.claude/settings*.json` (including any project hooks). `CLAUDE.md` files still
@@ -600,7 +619,8 @@ handoffs.
 * **Wake is delivered by a bounded long-poll**, not a push. If the agent is
   mid-task or not in a `wait` loop, latency is up to its next check.
 * **`--setting-sources` is undocumented**; isolation is proven per Claude version
-  by `remote verify-isolation` and must be re-run after upgrades. Managed
+  by `remote verify-isolation`, and runs automatically on the first launch
+  after a Claude upgrade (a failure blocks that launch). Managed
   settings cannot be excluded.
 * **Native Claude permission prompts cannot be answered remotely** by Terminal
   Handoff; an unattended session that meets one waits for you.
@@ -624,7 +644,7 @@ handoffs.
 | Page loads but shows *Not available from this network* | request lacks a tailnet identity; use `tailscale serve`, not another proxy |
 | `401` for a known device | token expired or revoked: `remote list-devices`, enrol again |
 | `429` | lockout or rate limit; wait, or check `security_state.json` windows |
-| `isolation_unverified` | `remote verify-isolation` for the installed Claude version |
+| `isolation_unverified` | the automatic verification for the installed Claude version failed (the reason names the check): fix it, or run `remote verify-isolation` to see the probe |
 | `permission_profile_required` | `project permissions validate <name>`, then `enable-remote` |
 | `project_in_use` | another active session on that project; stop or abandon it |
 | `504` on create | Terminal did not open a registered Claude in time; check Automation permission for Terminal |

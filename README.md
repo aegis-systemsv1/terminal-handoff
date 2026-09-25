@@ -262,7 +262,7 @@ th project permissions edit my-app --from-file profile.json
 th project permissions validate my-app                    # must say: valid
 
 ( cd "$HOME/code/my-app" && claude )    # accept "Yes, I trust this folder" ONCE, then /exit
-th remote verify-isolation              # once per Claude version (see Install)
+th remote verify-isolation              # optional: verifies ahead of time; a new Claude version is also verified automatically on its first remote launch
 th project enable-remote my-app         # only succeeds with a valid profile
 ```
 
@@ -344,7 +344,7 @@ Re-running the installer from an updated checkout updates the runtime. Keep a co
 **2. Remote gateway (optional).** Commands use the `th` shorthand defined above.
 
 ```sh
-# a. Verify Claude's per-session permission isolation (once per Claude version)
+# a. Verify Claude's per-session permission isolation (optional: a new Claude version is also verified automatically on its first remote launch)
 th remote verify-isolation
 
 # b. Configure the gateway (loopback only) for THIS Mac's tailnet name and YOUR Tailscale login
@@ -476,7 +476,7 @@ Stated plainly. Overstating them would make this tool untrustworthy.
 5. **Wake latency varies while Claude is actively working.** Instructions are queued durably and delivered promptly when the agent is waiting; a busy agent sees them at its next check.
 6. **Remote project access is deliberately opt-in.**
 7. **Mac reboot recovery is not implemented** (service restart recovery is). Relaunching an `ORPHANED` session automatically is deliberately not done.
-8. The remote-control health signal is read from Claude's live session record, an implementation detail that is not a documented API, and `--setting-sources` is undocumented; isolation is proven per Claude version with `remote verify-isolation`.
+8. The remote-control health signal is read from Claude's live session record, an implementation detail that is not a documented API, and `--setting-sources` is undocumented; isolation is proven per exact Claude version, automatically on the first remote launch of a new version (or ahead of time with `remote verify-isolation`); a failed verification blocks the launch, and no future version is implicitly trusted.
 9. Remote sessions do not load project or user settings (including project hooks); `CLAUDE.md` files still load. One active remote session per project.
 
 **Grok** (new in 1.5.0)
