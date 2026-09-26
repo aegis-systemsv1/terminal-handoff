@@ -179,6 +179,16 @@ or messaging apps.
 
 ## Remote control
 
+* **Task size.** A New Session task may be up to 524,288 bytes of UTF-8, proven end to end through the gateway,
+  the payload store, part-by-part Claude delivery and the Grok bridge. Above that it is rejected with counts, not
+  truncated. A prompt that large also has to fit the agent's context window. Task payloads are retained with their
+  session record (there is no purge). Nothing enforces that a *model* reads a large task attentively; the tool only
+  refuses to acknowledge it until every part was fetched. It was not exercised through a
+  real iPhone or Tailscale in the automated tests. Follow-up instructions stay at 8,000 characters. A phone page
+  reload loses an unsent draft (nothing is stored in the browser).
+* **Automatic stale-session recovery** applies only to a session of the requested project whose owner is
+  *conclusively* dead by the existing evidence; anything ambiguous stays blocked.
+
 See [REMOTE_CONTROL.md](REMOTE_CONTROL.md#limitations): waking is a bounded
 long-poll rather than a push, native Claude permission prompts cannot be
 answered remotely, `--setting-sources` is undocumented and verified per Claude
