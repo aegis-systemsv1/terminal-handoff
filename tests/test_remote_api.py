@@ -311,7 +311,7 @@ class TestApiSurface(RemoteCase):
         self.assertEqual(self.post("/instructions", {"text": "hello", "request_id": "short"})[0], 400)
         self.assertEqual(self.post("/instructions", {"text": "hello"})[0], 400)
         self.assertEqual(self.post("/instructions", {"text": "x" * 9000, "request_id": "req-big00001"})[0], 400)
-        self.assertEqual(self.call("POST", path, token=self.token, raw="x" * 40000)[0], 400)
+        self.assertEqual(self.call("POST", path, token=self.token, raw="x" * 40000)[0], 413)  # over this route's body limit, said plainly
 
     def test_other_methods_are_refused(self):
         for method in ("PUT", "DELETE", "PATCH"):
