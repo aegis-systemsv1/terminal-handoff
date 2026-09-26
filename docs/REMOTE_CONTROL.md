@@ -414,9 +414,64 @@ sequenceDiagram
 ```
 
 Success (`201 RUNNING`) is returned only after the launched Claude has
-registered as owner. The task text goes into the inbox and is read by the agent
-as data; it never reaches a shell or argv. Only one active session per project
-is allowed (a single writer).
+registered as owner. The task text is stored exactly (see [Large prompts](#large-prompts))
+and read by the agent as data; it never reaches a shell or argv. Only one active session
+per project is allowed (a single writer); a stale one is reconciled first (see
+[Stale sessions](#stale-sessions-and-project_in_use)).
+
+## Large prompts
+
+The New Session task can be up to **524,288 bytes** of UTF-8 (about 512 KiB; hundreds of thousands of
+characters). It is sent in the JSON request body (never a URL), and:
+
+* **Stored exactly.** `tasks/<logical-session>.task`, written to a temporary file, fsynced, renamed into place with
+  mode 0600 inside a 0700 directory, then read back and hashed. Nothing is trimmed, normalised or truncated; only NUL
+  and unpaired surrogates (which cannot be stored) are refused. It is kept with the session record for as long as the
+  record exists: records are archived, not deleted, and there is no purge, so the payload is retained (up to 512 KiB
+  per session, and it may contain whatever you pasted). The launch-artifact sweep removes only `.tmp-` crash debris.
+* **Delivered by reference.** A small task (up to 8,000 characters and up to 12,000 once JSON-escaped, which is how
+  `session inbox` prints it) is queued inline in the inbox, byte-exact. A larger one is queued as a short pointer with
+  its size and SHA-256. **Claude** reads it with
+  `session task --part N` (N from 1 to the part count); each part is at most 16,000 characters, printed verbatim
+  between a header line and a footer line so it fits in one tool result, and the concatenation is exactly the
+  submitted text. `session task` with no `--part` shows the size, the hash, and which parts have been read; the
+  session page shows the same. `session inbox` reports `task_progress`, and `session ack` of a stored task is
+  **refused until every part has been read** (a real model was seen to skip parts while still answering). Only the
+  session's current owner can read its task. **Grok** is pushed the exact stored text as the ACP prompt after its hash is
+  verified; a missing or altered payload is refused, never sent partly.
+* **A large prompt is never in argv, a URL, a launch script, a log, an event or a notification.** The launch is the
+  same short bootstrap as before. The session record holds only the pointer and the size and hash; a small inline task
+  is in the inbox record exactly as before, and the first line of any task is the session's display title (control,
+  bidi and zero-width characters removed), as it always was.
+* **Bounded.** The request body limit for session creation is 4 MiB (headroom for JSON escaping); every other
+  endpoint stays at 32 KiB. A task over 524,288 bytes, or a body over its limit, is rejected before anything
+  launches with the byte and character counts. A very large task is still limited by the agent's context window:
+  512 KiB is roughly 130,000 tokens.
+* **Phone.** The Task box is large and monospaced and shows characters, bytes and lines as you paste. It refuses to
+  send over the limit, keeps your text when a launch is rejected (and retries with a fresh request id), and
+  confirms that the whole task was accepted. The draft is kept in memory only, so leaving the page and coming
+  back within the same tab keeps it, but a reload does not.
+
+Follow-up instructions (`Tell Claude...`) keep their 8,000-character limit.
+
+## Stale sessions and `project_in_use`
+
+A launch is refused with `project_in_use` only when a session genuinely holds the project. Before refusing,
+Terminal Handoff reconciles the sessions holding it, inside the create lock, using the same owner-health evidence
+as `session recover`:
+
+| Existing session | Result |
+|---|---|
+| ORPHANED, and a *fresh* check proves the owner conclusively dead | **abandoned automatically** (`by auto:project-launch`); the same launch continues; the response lists it in `auto_recovered` |
+| RUNNING/PAUSED/etc. whose owner is conclusively dead | two fresh "dead" verdicts a settle apart, then ORPHANED (never on "unknown"; no alert), then abandoned as above |
+| RUNNING with a live owner | blocks; never touched, signalled or killed |
+| ORPHANED but the owner is alive, or "unknown" | blocks and says why; recover or abandon it deliberately |
+| CREATING (still inside its launch window) | blocks ("still starting"); one whose window has passed without registering is failed as before |
+| handoff in progress, recovery refused or failing, ownership changed or the owner no longer provably dead at the moment of recovery | blocks; nothing is changed |
+
+Only sessions of the requested project are examined or changed. Two racing launches cannot both recover or both
+take the project: one wins, the other is told which session now holds it. The refusal names the holder, for example
+`Project 'nova' is in use by session Nova Health (RUNNING, Claude Code). Its owner is alive.`
 
 ## Session names
 
@@ -458,7 +513,9 @@ which sends one alert. A parent that a completing handoff is *meant* to stop is
 not orphaned.
 
 `ORPHANED` is never repaired automatically and **no replacement agent is
-launched**. You choose: **Re-check** (re-attach, only if the owner is now
+launched**. The one automatic step is at launch: an ORPHANED session whose owner is conclusively dead no longer
+blocks a new launch on its project, it is abandoned and the launch continues (see
+[Stale sessions](#stale-sessions-and-project_in_use)). Otherwise you choose: **Re-check** (re-attach, only if the owner is now
 verifiably alive) or **Abandon** (`FAILED`). STOP, the inbox and pending
 approvals are preserved throughout. Relaunching a replacement agent is not
 implemented.
@@ -524,7 +581,7 @@ dynamic text is set with `textContent`.
 | Cross-site request | `Origin` check, CSRF token for cookies, JSON-only bodies, `SameSite=Strict` |
 | DNS rebinding / local web page | `Host` allowlist; header identity only trusted on loopback |
 | Path traversal / symlink swap | names only; regex; pinned realpath re-checked at launch |
-| Command / prompt injection through task text | data in inbox; never shell or argv; agent told instructions never approve gates |
+| Command / prompt injection through task text | data in a private per-session payload file, read part by part or pushed over ACP; never shell, argv, URL, log or title; agent told instructions never approve gates |
 | Arbitrary shell or PID control | no such endpoint exists; body fields are whitelisted; handler contains no process or shell call |
 | Replay | request ids (durable dedupe for instructions, creation and approvals); approval nonce, epoch, one-shot consume |
 | Stale owner / split brain | fenced owner epoch; single `TRANSFER_COMPLETE` ownership gate; one session per project |
@@ -646,7 +703,8 @@ handoffs.
 | `429` | lockout or rate limit; wait, or check `security_state.json` windows |
 | `isolation_unverified` | the automatic verification for the installed Claude version failed (the reason names the check): fix it, or run `remote verify-isolation` to see the probe |
 | `permission_profile_required` | `project permissions validate <name>`, then `enable-remote` |
-| `project_in_use` | another active session on that project; stop or abandon it |
+| `project_in_use` | a session genuinely holds the project: the message names it and its state. A dead ORPHANED one is recovered automatically now; a live or unprovable one is not: stop it, or recover/abandon it deliberately |
+| `413 task_too_large` / `payload_too_large` | the task is over 524,288 bytes (or the body over its limit); the message gives the counts. Shorten it: nothing is ever truncated |
 | `504` on create | Terminal did not open a registered Claude in time; check Automation permission for Terminal |
 | Session shows ORPHANED | the owner process is gone; **Re-check** if it has come back, otherwise **Abandon** |
 | Instruction seems ignored | UI shows whether Claude is listening; it will read the inbox at its next check |

@@ -172,7 +172,7 @@ The threshold is a **production setting of 80%**. A lower value exists only as a
 4. Tap **+ New Session**.
 5. Choose an **authorised project** (only projects you enabled for remote launch appear).
 6. Optionally **name** the session.
-7. Enter the task and tap **Start Session**.
+7. Enter the task and tap **Start Session**. The task may be very large (up to 512 KiB), is kept exactly as pasted, and its size is shown as you type; see [Large prompts](docs/REMOTE_CONTROL.md#large-prompts). If an old dead session was holding the project, it is recovered automatically and your launch continues.
 8. **Monitor** status, owner generation, Remote Control health and the **transcript**.
 9. **Send further instructions** ("Tell Claude…").
 10. **Rename**, **Pause**, **STOP** or **Resume** when required.

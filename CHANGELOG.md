@@ -113,6 +113,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the positive identity-resolution path through `cmd_resume` was previously exercised only by manual
   verification) was also closed with two new tests.
 
+- **Very large prompts from the phone (up to 512 KiB, byte-exact).** The New Session task is no longer an inline
+  text field limited to 24,000 characters. The full task is sent as request data, validated (never trimmed,
+  normalised or truncated), and stored exactly as UTF-8 in a per-session payload file
+  (`tasks/<logical-session>.task`, written atomically with mode 0600 and read back and hashed). The agent receives
+  it by reference: a small task (up to 8,000 characters, and up to 12,000 characters once JSON-escaped, which is how
+  the agent's inbox command prints it: a CJK character is 6 characters of JSON and an emoji 12) is still queued inline,
+  byte-exact with whitespace and control characters preserved; a larger one is queued as a short pointer, and Claude reads every part with the new
+  `session task --part N` command (each part is at most 16,000 characters, printed verbatim between a header and a
+  footer, so it fits a tool result; a long single line is split by characters), while Grok is pushed the exact stored
+  text over ACP after a hash check. `session task` (no `--part`) shows size and how many parts have been read, and the
+  session page shows the same. Live testing with a real Claude showed a model can skip parts while still answering
+  plausibly, so completeness is enforced: `session inbox` reports `task_progress`, and `session ack` of a stored task is
+  refused until every part has been read. Only the current owner may read a session's task (a person at a terminal may
+  too; an agent tool call has no terminal). A large prompt is never placed in argv, a launch script, a URL, a log line, an
+  event, a notification or the session record; its first line is the session's display title (control, bidi and
+  zero-width characters removed), and a small inline task is in the inbox record exactly as before. The payload is kept
+  with the session record for as long as the record exists: records are archived, never deleted, and no purge exists, so
+  neither does one for the payload (the launch-artifact sweep removes only crash debris from an interrupted write). Limits are explicit: 524,288 bytes of UTF-8 for the task, and
+  a 4 MiB request body for session creation only (every other endpoint keeps 32 KiB). Anything over is rejected
+  before launch with the byte and character counts (`413 task_too_large` / `payload_too_large`), and only NUL and
+  unpaired surrogates, which cannot be stored, are refused. The body limit response drains the upload first so the
+  phone shows the message instead of a dropped connection. The task box on the phone is large and monospaced, shows
+  characters, bytes and lines as you paste (counted the way the Mac counts them), refuses to send over the limit,
+  keeps the text in the box when a launch is rejected and retries with a fresh request id (a definitive answer is
+  never replayed), and states that the whole task was accepted, with a short fingerprint. The draft is held in
+  memory only; nothing is written to browser storage. The agent's allow list gains `session task` (read-only, owner
+  only). Follow-up instructions keep their 8,000-character limit.
+
 ### Fixed
 
 - **Remote launches no longer stay blocked on every Claude Code patch upgrade.** Isolation was previously
@@ -134,6 +162,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-check-and-write, so other versions and other isolation operations are not blocked. A launch that waits
   longer than 330 seconds for another launch's verification refuses rather than proceeding. Project
   permissions, registrations and the isolation probe itself are unchanged.
+
+- **A stale session no longer blocks a project (`project_in_use`).** Phone launches were repeatedly refused
+  by an ORPHANED session whose owner process was already dead, until someone ran
+  `session recover --recover-action abandon` by hand. Before a launch is refused, the sessions holding that
+  project are now reconciled with the same authoritative owner-health evidence: an ORPHANED session whose owner a
+  *fresh* check proves conclusively dead is abandoned automatically (the same transition, recorded as
+  `by auto:project-launch`) and the **same launch continues**; a not-yet-marked session whose owner is
+  conclusively dead first needs two fresh "dead" verdicts a settle apart and then takes the same ORPHANED transition
+  (never on "unknown", and no owner-lost alert for a session the launch is recovering). The abandon itself re-checks
+  that the owner is dead under the session's own lock, at the moment of the state change. A live owner keeps blocking and is never
+  signalled or killed; "unknown", "alive", a session mid-handoff, a still-starting session, a refused or failing
+  recovery, and any ownership change between the check and the abandon all fail closed with the reason. Only the
+  requested project's sessions are examined or changed, and the reconciliation runs inside the create lock, so
+  two racing launches cannot both recover or both take the project. The refusal now names the holder
+  (`Project 'nova' is in use by session Nova Health (RUNNING, Claude Code). Its owner is alive.`) instead of a bare
+  `project_in_use`, and a launch that recovered a stale session reports it (`auto_recovered`). Both the Claude and
+  Grok launch paths share this.
 
 ## [1.5.0] - 2026-09-21
 

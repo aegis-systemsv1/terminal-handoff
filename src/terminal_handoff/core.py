@@ -6127,7 +6127,14 @@ LS_STATES = (
 LS_TERMINAL = (LS_COMPLETED, LS_FAILED)
 
 MAX_INSTRUCTION_CHARS = 8000
-MAX_TASK_CHARS = 24000  # the New Session task only; follow-up instructions keep MAX_INSTRUCTION_CHARS
+# The New Session task is stored exactly, as bytes, in a per-session payload file and
+# delivered by reference, so its size is bounded by what was proven end to end
+# (gateway body, payload store, part-by-part delivery, Grok push) and by an agent's
+# context window, not by any inline text field. Follow-up instructions keep MAX_INSTRUCTION_CHARS.
+MAX_TASK_BYTES = 524288  # 512 KiB of UTF-8
+MAX_CREATE_BODY_BYTES = 4 * 1024 * 1024  # JSON framing/escaping headroom around a MAX_TASK_BYTES task
+TASK_PART_CHARS = 16000  # one `session task --part` output; comfortably under Claude's ~30k-char Bash output cap
+TASK_INLINE_JSON_CHARS = 12000  # an inline task must also fit this once JSON-escaped, which is how `session inbox` prints it
 MAX_IDEMPOTENCY_KEY = 80
 MAX_INBOX_KEPT = 300
 MAX_OUTPUT_LINES = 2000
@@ -6718,9 +6725,15 @@ def logical_halt_reason(record):
 # -- Durable instruction inbox ----------------------------------------------
 
 
-def inbox_post(lsid, text, idempotency_key=None, source="local", limit=MAX_INSTRUCTION_CHARS):
-    """Queue one instruction. Durable, ordered, deduplicated by key."""
-    body = clean_untrusted_text(text, limit)
+def inbox_post(lsid, text, idempotency_key=None, source="local", limit=MAX_INSTRUCTION_CHARS, trusted=False, extra=None):
+    """Queue one instruction. Durable, ordered, deduplicated by key.
+
+    `trusted` is only for text Terminal Handoff itself composed (a task pointer
+    or an already-validated task): it is stored exactly, not re-cleaned."""
+    if trusted:
+        body = text if isinstance(text, str) and text and len(text) <= limit else None
+    else:
+        body = clean_untrusted_text(text, limit)
     if body is None:
         return False, "instruction must be non-empty text of at most %d characters" % limit, None
     key = None
@@ -6747,6 +6760,8 @@ def inbox_post(lsid, text, idempotency_key=None, source="local", limit=MAX_INSTR
             "status": "pending",
             "redelivered": 0,
         }
+        if extra:
+            message.update(extra)
         inbox["next_seq"] += 1
         inbox["messages"].append(message)
         acked = [m for m in inbox["messages"] if m["status"] == "acked"]
@@ -6833,6 +6848,17 @@ def logical_append_output(lsid, agent_session_id, text):
     return ok, why, None
 
 
+def _task_public(meta):
+    """Size and progress of the stored task, for the phone. Never the text; only a short fingerprint."""
+    if not meta:
+        return None
+    return {
+        "chars": meta.get("chars"), "bytes": meta.get("bytes"), "lines": meta.get("lines"), "parts": meta.get("parts"),
+        "parts_read": len(meta.get("served") or {}), "fingerprint": (meta.get("sha256") or "")[:12],
+        "inline": bool(meta.get("inline")),
+    }
+
+
 def logical_public_view(record):
     """What a remote client may see. No PIDs, bindings, hashes or paths."""
     import copy
@@ -6886,6 +6912,7 @@ def logical_public_view(record):
         ][-5:],
         "human_gate": next((approval_public(a, True) for a in (record.get("approvals") or []) if a.get("status") == "pending"), None),
         "project_available": record.get("project_available", True),
+        "task": _task_public(record.get("task")),
     }
 
 
@@ -6895,6 +6922,63 @@ def logical_link_for_agent(lsid_hint, agent_session_id):
         return lsid_hint
     found = logical_find_by_agent_session(agent_session_id)
     return found.get("logical_session_id") if found else None
+
+
+def _unread_task_reason(record, message_id):
+    """Why a task message cannot be acknowledged yet, or None. An agent must not act on, or close out, a partly read task."""
+    message = next((m for m in (record.get("inbox") or {}).get("messages", []) if m.get("id") == message_id), None)
+    ref = (message or {}).get("task_ref")
+    if not ref:
+        return None
+    served = ((record.get("task") or {}).get("served")) or {}
+    if len(served) >= ref["parts"]:
+        return None
+    nxt = next(i for i in range(1, ref["parts"] + 1) if str(i) not in served)
+    return "the task has not been fully read: %d of %d parts. Read part %d next (`session task --part %d`), and every other unread part, before acknowledging" % (
+        len(served), ref["parts"], nxt, nxt)
+
+
+def _cmd_session_task(record, lsid, agent, part):
+    """Serve the stored task: `--part N` prints that part verbatim, no `--part` prints its size and progress."""
+    owner = _is_owner(record, agent) if agent else False
+    # Only the current owner reads a session's task. A person at a terminal (no agent id, real stdin tty) may too;
+    # an agent tool call has no tty, so clearing its environment does not open another session's task.
+    if not owner and not (not agent and sys.stdin.isatty()):
+        print(json.dumps({"error": "not the current owner of this logical session"}))
+        return 3
+    meta = record.get("task") or {}
+    text, why = load_task(lsid, meta)
+    if text is None:
+        print(json.dumps({"error": why}))
+        return 3
+    spans = task_part_spans(text)
+    served = meta.get("served") or {}
+    if part is None:
+        print(json.dumps({
+            "logical_session_id": lsid, "chars": meta.get("chars"), "bytes": meta.get("bytes"), "lines": meta.get("lines"),
+            "sha256": meta.get("sha256"), "parts": len(spans), "parts_read": sorted(int(k) for k in served),
+            "next_part": next((i for i in range(1, len(spans) + 1) if str(i) not in served), None),
+        }, indent=2, sort_keys=True))
+        return 0
+    if not 1 <= part <= len(spans):
+        print(json.dumps({"error": "part must be between 1 and %d" % len(spans)}))
+        return 3
+    start, end = spans[part - 1]
+    body = text[start:end]
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if owner:
+        def mark(rec):
+            rec.setdefault("task", {}).setdefault("served", {})[str(part)] = digest[:16]
+
+        logical_mutate(lsid, mark)
+        log_event("task_part_served", logical_session_id=lsid, part=part, parts=len(spans), chars=len(body))
+    header = "TERMINAL HANDOFF TASK PART %d OF %d (characters %d-%d of %d; part sha256 %s; task sha256 %s)" % (
+        part, len(spans), start + 1, end, len(text), digest, meta.get("sha256"))
+    footer = "END OF TASK PART %d OF %d" % (part, len(spans))
+    sys.stdout.flush()
+    sys.stdout.buffer.write(("%s\n%s\n%s\n" % (header, body, footer)).encode("utf-8"))
+    sys.stdout.buffer.flush()
+    return 0
 
 
 def cmd_session(args):
@@ -6915,7 +6999,7 @@ def cmd_session(args):
         else:
             print(json.dumps({r["logical_session_id"]: r["state"] for r in logical_reconcile_all(strict=args.strict)}, indent=2, sort_keys=True))
         return 0
-    if action in ("inbox", "ack", "note", "check", "wait", "gate", "consume"):
+    if action in ("inbox", "ack", "note", "check", "wait", "gate", "consume", "task"):
         lsid = logical_link_for_agent(lsid, agent)
     if not lsid:
         print(json.dumps({"error": "no logical session"}))
@@ -6924,6 +7008,8 @@ def cmd_session(args):
     if record is None:
         print(json.dumps({"error": "unknown logical session"}))
         return 2
+    if action == "task":
+        return _cmd_session_task(record, lsid, agent, args.part)
     out = {"logical_session_id": lsid}
     ok, why = True, None
     if action == "show":
@@ -6940,11 +7026,24 @@ def cmd_session(args):
     elif action == "inbox":
         ok, why, claimed = inbox_claim(lsid, agent)
         out["messages"] = claimed or []
+        served = ((logical_read(lsid) or {}).get("task") or {}).get("served") or {}
+        for message in out["messages"]:
+            ref = message.get("task_ref")
+            if ref:
+                message["task_progress"] = {
+                    "parts": ref["parts"], "parts_read": len(served),
+                    "next_part": next((i for i in range(1, ref["parts"] + 1) if str(i) not in served), None),
+                    "complete": len(served) >= ref["parts"],
+                }
         if not ok and str(why).startswith("halted:"):
             out["directive"] = "HALT"
             out["halt"] = why.split(":", 1)[1]
     elif action == "ack":
-        ok, why, result = inbox_ack(lsid, agent, args.message_id)
+        unread = _unread_task_reason(record, args.message_id)
+        if unread:
+            ok, why, result = False, unread, None
+        else:
+            ok, why, result = inbox_ack(lsid, agent, args.message_id)
         out["result"] = result
     elif action == "note":
         ok, why, _ = logical_append_output(lsid, agent, args.text or "")
@@ -7749,14 +7848,65 @@ class RemoteGateway(object):
         return hit[1] if hit and self.clock() - hit[0] <= 600 else None
 
 
-def _json_body(handler):
+DRAIN_LIMIT_BYTES = 16 * 1024 * 1024
+BULK_BODY_BYTES = 64 * 1024
+BULK_READ_TIMEOUT = 60
+
+
+BODY_READ_DEADLINE_SECONDS = 120
+
+
+def _read_exact(rfile, size, deadline=BODY_READ_DEADLINE_SECONDS, clock=time.monotonic):
+    """Read `size` bytes, giving up after `deadline` seconds overall (each recv is also bounded by the socket timeout)."""
+    end = clock() + deadline
+    chunks, remaining = [], size
+    while remaining > 0:
+        if clock() > end:
+            raise TimeoutError("body read deadline")
+        chunk = rfile.read(min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _json_body(handler, limit=MAX_BODY_BYTES):
+    """`(body, None)` or `(None, reason)`; on failure `handler.body_error_status` says 400 or 413."""
+    handler.body_error_status = 400
     length = handler.headers.get("Content-Length")
-    if not length or not length.isdigit() or int(length) > MAX_BODY_BYTES:
-        return None, "invalid or oversized body"
+    if not length or not length.isdigit():
+        return None, "invalid or missing Content-Length"
+    size = int(length)
+    if size > limit:
+        # Say so with the numbers, and drain a plausible body first: closing with an unread upload makes the
+        # client see a connection reset instead of this message.
+        handler.body_error_status = 413
+        if size <= DRAIN_LIMIT_BYTES:
+            remaining = size
+            try:
+                while remaining > 0:
+                    chunk = handler.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            except OSError:
+                pass
+        return None, "Request body is {:,} bytes; the maximum for this request is {:,} bytes".format(size, limit)
     if (handler.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
         return None, "content type must be application/json"
+    if size > BULK_BODY_BYTES:
+        try:
+            handler.connection.settimeout(BULK_READ_TIMEOUT)  # a large paste over a slow mobile link
+        except OSError:
+            pass
     try:
-        body = json.loads(handler.rfile.read(int(length)).decode("utf-8"))
+        raw = _read_exact(handler.rfile, size)
+    except (OSError, TimeoutError):
+        handler.body_error_status = 408
+        return None, "timed out reading the request body"
+    try:
+        body = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return None, "malformed json"
     return (body, None) if isinstance(body, dict) else (None, "body must be an object")
@@ -7808,6 +7958,7 @@ header { padding:16px 0 4px; } h1 { font-size:22px; margin:0; } h2 { font-size:1
 .s-STOPPED, .s-ORPHANED, .s-FAILED { color:var(--bad); }
 button, select, textarea, input { font:inherit; width:100%; min-height:52px; border-radius:12px; border:1px solid var(--line); background:var(--bg); color:var(--fg); padding:10px 12px; margin:6px 0; }
 textarea { min-height:120px; }
+textarea.task-box { min-height:240px; resize:vertical; white-space:pre-wrap; overflow-wrap:anywhere; tab-size:4; }
 button { background:var(--accent); color:#fff; border:0; font-weight:700; }
 button.secondary { background:var(--card); color:var(--fg); border:1px solid var(--line); }
 button.danger { background:var(--bad); color:#fff; } button.ok { background:var(--ok); color:#fff; }
@@ -7829,7 +7980,7 @@ UI_APP_JS = r"""
 (function () {
   'use strict';
   var app = document.getElementById('app');
-  var csrf = null, timer = null, formRequestId = null;
+  var csrf = null, timer = null, formRequestId = null, taskDraft = '';
 
   function el(tag, attrs, kids) {
     var e = document.createElement(tag);
@@ -7974,27 +8125,69 @@ UI_APP_JS = r"""
     }
     select.addEventListener('change', syncAgents);
     var nameBox = el('input', { type: 'text', maxlength: '60', placeholder: 'Session name (optional)', 'aria-label': 'Session name', autocomplete: 'off' });
-    var task = el('textarea', { placeholder: 'What should Claude do? (dictation works here)', 'aria-label': 'Task' });
+    var task = el('textarea', { placeholder: 'What should Claude do? (dictation works here)', 'aria-label': 'Task', rows: '12', 'class': 'mono task-box', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', wrap: 'soft' });
     agentSel.addEventListener('change', function () { task.setAttribute('placeholder', 'What should ' + (agentSel.value === 'grok' ? 'Grok' : 'Claude') + ' do? (dictation works here)'); });
     var msg = el('p', { 'class': 'err', text: '' });
+    var sizeNote = el('p', { 'class': 'muted', text: 'Paste or type the task. Long prompts are supported and kept exactly as written.' });
+    var maxBytes = 524288;
+    // The draft lives in memory only (a pasted task may hold secrets, so nothing is written to browser storage). It survives a
+    // rejected launch and leaving and re-opening this screen; it is dropped once the Mac has accepted the task.
+    // Counted the way the Mac counts: UTF-8 bytes, Unicode code points (an emoji is one), and newline-terminated lines.
+    function measure(str) {
+      var bytes = 0, chars = 0, i, c;
+      for (i = 0; i < str.length; i++) {
+        c = str.charCodeAt(i); chars++;
+        if (c < 128) bytes += 1; else if (c < 2048) bytes += 2; else if (c >= 55296 && c <= 56319 && (str.charCodeAt(i + 1) & 64512) === 56320) { bytes += 4; i++; } else bytes += 3;
+      }
+      var lines = str ? str.split('\n').length - (str.charAt(str.length - 1) === '\n' ? 1 : 0) : 0;
+      return { bytes: bytes, chars: chars, lines: lines };
+    }
+    function utf8Len(str) { return measure(str).bytes; }
+    function fmt(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+    var over = false;
+    function paintSize() {
+      var v = task.value, m = measure(v), bytes = m.bytes, lines = m.lines;
+      over = bytes > maxBytes;
+      if (!v) { sizeNote.className = 'muted'; sizeNote.textContent = 'Paste or type the task. Long prompts are supported and kept exactly as written.'; }
+      else if (over) { sizeNote.className = 'err'; sizeNote.textContent = 'Too large: ' + fmt(bytes) + ' bytes (' + fmt(m.chars) + ' characters); the maximum is ' + fmt(maxBytes) + ' bytes. Nothing will be truncated, so shorten it to send.'; }
+      else { sizeNote.className = 'muted'; sizeNote.textContent = fmt(m.chars) + ' characters · ' + fmt(bytes) + ' bytes · ' + fmt(lines) + ' lines (limit ' + fmt(maxBytes) + ' bytes)'; }
+    }
+    task.value = taskDraft;
+    // Sized by polling, never by an input listener: nothing here may touch the native iOS paste path.
+    function watchSize() { taskDraft = task.value; paintSize(); }
+    paintSize();
+    poll(watchSize, 400);
     var go = el('button', { text: 'Start Session', onclick: function () {
-      if (!select.value || !task.value.trim()) { msg.textContent = 'Choose a project and describe the task.'; return; }
-      go.disabled = true; msg.textContent = ''; msg.className = 'note'; msg.textContent = 'Starting on your Mac…';
-      var body = { project: select.value, task: task.value, request_id: formRequestId };
+      if (!select.value || !task.value.trim()) { msg.className = 'err'; msg.textContent = 'Choose a project and describe the task.'; return; }
+      if (over) { msg.className = 'err'; msg.textContent = 'The task is over the size limit; see the count above.'; return; }
+      go.disabled = true; msg.className = 'note'; msg.textContent = 'Sending ' + fmt(utf8Len(task.value)) + ' bytes to your Mac…';
+      var sent = task.value;
+      var body = { project: select.value, task: sent, request_id: formRequestId };
       if (agentSel.value === 'grok') body.agent = 'grok';
       if (nameBox.value.trim()) body.name = nameBox.value.trim();
       api('POST', '/api/v1/sessions', body).then(function (r) {
         var d = r.data || {};
-        if ((r.status === 201 || r.status === 200 || r.status === 202) && d.logical_session_id) nav('#/s/' + d.logical_session_id);
-        else { go.disabled = false; msg.className = 'err'; msg.textContent = 'Not started: ' + (d.reason || d.error || ('error ' + r.status)); }
-      });
+        if ((r.status === 201 || r.status === 200 || r.status === 202) && d.logical_session_id) {
+          taskDraft = '';
+          var t = d.task, rec = d.auto_recovered || [];
+          msg.className = 'note';
+          msg.textContent = (t ? 'Accepted the whole task: ' + fmt(t.chars) + ' characters, ' + fmt(t.bytes) + ' bytes, ' + fmt(t.lines) + ' lines (fingerprint ' + t.fingerprint + '). ' : 'Accepted. ')
+            + (rec.length ? 'A stale session (' + rec.map(function (x) { return x.name; }).join(', ') + ') was recovered and your launch continued. ' : '');
+          if (rec.length) setTimeout(function () { nav('#/s/' + d.logical_session_id); }, 1800); else nav('#/s/' + d.logical_session_id);
+        } else {
+          // A definitive answer (not a network failure) must not be replayed for a retry: use a fresh request id. The task text stays.
+          go.disabled = false; formRequestId = rid(); msg.className = 'err';
+          msg.textContent = 'Not started: ' + (d.reason || d.error || ('error ' + r.status)) + ' Your task is still here.';
+        }
+      }).catch(function () { go.disabled = false; msg.className = 'err'; msg.textContent = 'Could not reach your Mac. Your task is still here; tap Start Session to retry.'; });
     } });
     app.appendChild(el('a', { 'class': 'back', href: '#/', text: '‹ Sessions' }));
-    app.appendChild(el('div', { 'class': 'card' }, [el('h2', { text: 'New Session' }), el('label', { text: 'Project' }), select, el('label', { text: 'Agent' }), agentSel, el('label', { text: 'Name' }), nameBox, el('label', { text: 'Task' }), task, go, msg]));
+    app.appendChild(el('div', { 'class': 'card' }, [el('h2', { text: 'New Session' }), el('label', { text: 'Project' }), select, el('label', { text: 'Agent' }), agentSel, el('label', { text: 'Name' }), nameBox, el('label', { text: 'Task' }), task, sizeNote, go, msg]));
     api('GET', '/api/v1/projects').then(function (r) {
       var names = (r.data && r.data.projects) || [];
       if (!names.length) { msg.textContent = 'No project is enabled for remote launch.'; go.disabled = true; }
       agentsByProject = (r.data && r.data.agents) || {};
+      if (r.data && r.data.limits && r.data.limits.task_max_bytes) { maxBytes = r.data.limits.task_max_bytes; paintSize(); }
       names.forEach(function (n) { select.appendChild(el('option', { value: n, text: n })); });
       syncAgents();
     });
@@ -8162,6 +8355,7 @@ UI_APP_JS = r"""
         : (age === null || age === undefined ? 'Claude has not checked in yet' : (age < 45 ? 'Claude is listening' : 'Claude is busy or away; it will see new instructions at its next check'));
       head.appendChild(el('div', { 'class': 'card' }, [
         el('div', { 'class': 'muted', text: 'Current task' }), el('div', { text: s.title || '(none)' }),
+        (s.task && !s.task.inline) ? el('div', { 'class': 'muted', text: 'Full task stored: ' + s.task.chars + ' characters, ' + s.task.bytes + ' bytes, ' + s.task.lines + ' lines · read by the agent so far: ' + s.task.parts_read + ' of ' + s.task.parts + ' part' + (s.task.parts === 1 ? '' : 's') }) : null,
         el('div', { 'class': 'muted', text: 'Branch: ' + (s.branch || 'n/a') }),
         el('div', { 'class': 'muted', text: 'Owner generation: ' + (s.owner ? s.owner.generation : 'none') + ' · ID ' + short(s.logical_session_id) }),
         el('div', { 'class': 'muted', text: 'Elapsed: ' + ago(s.created_utc) }),
@@ -8291,7 +8485,10 @@ def make_remote_handler(gateway):
 
         def _deny(self, status, code, why=None):
             log_event("remote_request_refused", status=status, code=code, why=why, path=self.path.split("?")[0][:80])
-            self._send(status, {"error": code})
+            payload = {"error": code}
+            if code == "payload_too_large" and why:
+                payload["reason"] = why  # sizes only, so the phone can say exactly how far over it was
+            self._send(status, payload)
 
         # ---- gate: every request passes here first
         def _gate(self, mutating, need_device=True):
@@ -8371,7 +8568,8 @@ def make_remote_handler(gateway):
                 self._send(200, {"device": ctx["device"]["name"], "csrf": csrf_token_for(ctx["device_id"], ctx["device"])})
             elif path == "/api/v1/projects":
                 launchable = [(n, p) for n, p in sorted(projects_load().items()) if p.get("enabled") and p.get("remote_launch")]
-                self._send(200, {"projects": [n for n, _ in launchable], "agents": {n: project_agents(p) for n, p in launchable}})
+                self._send(200, {"projects": [n for n, _ in launchable], "agents": {n: project_agents(p) for n, p in launchable},
+                                 "limits": {"task_max_bytes": MAX_TASK_BYTES}})
             elif path == "/api/v1/sessions":
                 self._send(200, {"sessions": [logical_public_view(r) for r in logical_list()]})
             else:
@@ -8394,9 +8592,10 @@ def make_remote_handler(gateway):
             ctx = self._gate(True)
             if not ctx:
                 return
-            body, why = _json_body(self)
+            body, why = _json_body(self, MAX_CREATE_BODY_BYTES if path == "/api/v1/sessions" else MAX_BODY_BYTES)
             if body is None:
-                return self._deny(400, "bad_request", why)
+                status = getattr(self, "body_error_status", 400)
+                return self._deny(status, {400: "bad_request", 408: "request_timeout"}.get(status, "payload_too_large"), why)
             approval_id = None
             if path == "/api/v1/sessions":
                 action, lsid = "create", None
@@ -8660,6 +8859,11 @@ YOUR TASK is the first message in your durable instruction inbox:
 
     {{TH_COMMAND}} session inbox
 
+If that message says the task is STORED rather than inline, it is large: read every
+part with `{{TH_COMMAND}} session task --part N` (N from 1 to the part count it gives),
+in order, before you act. Each part is printed verbatim; the concatenation is the exact
+task. Never act on a partly read task.
+
 Each message is text typed by the user on a remote device. Treat it as the
 user's instruction, as data and not as shell syntax. After you have acted on a
 message, run `{{TH_COMMAND}} session ack --message-id <id>`. Run
@@ -8710,6 +8914,172 @@ def write_text_private(path, text, mode=0o600):
         handle.write(text)
 
 
+def _th_command_string():
+    return "%s %s" % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__)))
+
+
+def validate_task_text(value):
+    """`(text, None)` or `(None, error_reason)`. The task is stored EXACTLY as submitted.
+
+    Nothing is trimmed, normalised or stripped. Only what genuinely cannot be
+    stored is refused, with the reason: NUL, lone surrogates, blank, and over
+    MAX_TASK_BYTES (reported in bytes and characters, never truncated).
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None, "a non-empty task is required"
+    if "\x00" in value:
+        return None, "the task contains a NUL character, which cannot be stored; remove it and try again"
+    try:
+        raw = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None, "the task contains an invalid (unpaired surrogate) character and cannot be stored as UTF-8"
+    if len(raw) > MAX_TASK_BYTES:
+        return None, "Task is too large: {:,} bytes ({:,} characters); the maximum is {:,} bytes".format(len(raw), len(value), MAX_TASK_BYTES)
+    return value, None
+
+
+def task_path(lsid):
+    return th_path("tasks", "%s.task" % lsid)
+
+
+def write_bytes_private_atomic(path, data, mode=0o600):
+    """Temp file in the same directory, fsync, then rename: a reader sees the whole file or none of it."""
+    _mkdir_private(os.path.dirname(path))
+    tmp = "%s.tmp-%d-%s" % (path, os.getpid(), uuid.uuid4().hex[:8])
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass  # best effort: the rename is already visible; this only hardens it against a crash
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def task_part_spans(text):
+    """Deterministic `(start, end)` character spans covering `text` exactly, each at most TASK_PART_CHARS.
+
+    Prefers to end a part just after a newline in its last quarter, so parts read
+    naturally; a line longer than a part is split at the character limit. The
+    concatenation of the parts is always exactly the original text."""
+    spans, start, total = [], 0, len(text)
+    while start < total:
+        end = min(start + TASK_PART_CHARS, total)
+        if end < total:
+            cut = text.rfind("\n", start + (TASK_PART_CHARS * 3) // 4, end)
+            if cut != -1:
+                end = cut + 1
+        spans.append((start, end))
+        start = end
+    return spans
+
+
+def store_task(lsid, text):
+    """Persist the exact task for one logical session and return its metadata (never the text)."""
+    raw = text.encode("utf-8")
+    path = task_path(lsid)
+    write_bytes_private_atomic(path, raw)
+    with open(path, "rb") as handle:
+        if hashlib.sha256(handle.read()).digest() != hashlib.sha256(raw).digest():
+            raise OSError("the stored task did not read back identically")
+    return {
+        "bytes": len(raw),
+        "chars": len(text),
+        "lines": text.count("\n") + (0 if text.endswith("\n") else 1),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "parts": len(task_part_spans(text)),
+        "part_chars": TASK_PART_CHARS,
+        "stored_utc": utc_stamp(),
+        "served": {},
+    }
+
+
+def load_task(lsid, meta=None):
+    """`(text, None)` or `(None, reason)`. Verifies the stored bytes against the recorded hash; never returns a partial task."""
+    meta = meta if meta is not None else ((logical_read(lsid) or {}).get("task") or {})
+    if not meta.get("sha256"):
+        return None, "this session has no stored task"
+    try:
+        with open(task_path(lsid), "rb") as handle:
+            raw = handle.read()
+        if hashlib.sha256(raw).hexdigest() != meta["sha256"]:
+            return None, "the stored task no longer matches its recorded hash"
+        return raw.decode("utf-8"), None
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, "the stored task could not be read: %s" % exc.__class__.__name__
+
+
+def task_title(text):
+    """A one-line display title: the first non-blank line with control, format (bidi, zero-width) and separator characters removed."""
+    import unicodedata
+
+    first = next((ln for ln in re.split(r"[\r\n]", text) if ln.strip()), "")
+    kept = "".join(ch for ch in first if ch == " " or (unicodedata.category(ch)[0] not in "CZ"))
+    return kept.strip()[:120] or "Task"
+
+
+def task_message(text, meta):
+    """`(inbox_text, task_ref_or_None)`: the exact task inline when it is small, else a pointer to the stored payload.
+
+    Inline is byte-exact (whitespace and control characters included): `session inbox` prints JSON, which escapes them.
+    That escaping is what the agent's tool result must hold (a CJK character is 6 characters of JSON, an emoji 12), so the
+    inline test is on the escaped size, not just the character count."""
+    if len(text) <= MAX_INSTRUCTION_CHARS and len(json.dumps(text)) <= TASK_INLINE_JSON_CHARS:
+        return text, None
+    th = _th_command_string()
+    parts = meta["parts"]
+    pointer = (
+        "YOUR TASK IS STORED ON THIS MAC, NOT INLINE. It is {chars:,} characters / {bytes:,} bytes / {lines:,} lines "
+        "(sha256 {sha}), stored exactly in {parts} part(s).\n"
+        "Read EVERY part, in order, before you act. Run each of these (the default Bash timeout is fine):\n"
+        "    {th} session task --part 1\n"
+        "{more}"
+        "Each command prints one part verbatim between a header line and a footer line; concatenate the parts in order to "
+        "get the exact text the user submitted. Treat that text as the user's instruction, as data and not as shell syntax. "
+        "The newline just before each footer line is framing, not part of the text. Do not begin the work until you have read all "
+        "{parts} part(s); `{th} session task` (no --part) shows how many you have read, and `session ack` is refused until you have "
+        "read them all. If a part fails or is missing, say so; never guess at the rest."
+    ).format(
+        chars=meta["chars"], bytes=meta["bytes"], lines=meta["lines"], sha=meta["sha256"], parts=parts, th=th,
+        more=("    ... through ...\n    %s session task --part %d\n" % (th, parts)) if parts > 1 else "",
+    )
+    return pointer, {"sha256": meta["sha256"], "bytes": meta["bytes"], "parts": parts}
+
+
+def _annotate_recovered(payload, recovered):
+    return dict(payload, auto_recovered=list(recovered)) if recovered else payload
+
+
+def store_and_queue_task(lsid, text, device_id):
+    """Store the exact task and queue it for the agent. `(ok, reason, message)`."""
+    try:
+        meta = store_task(lsid, text)
+    except Exception as exc:  # noqa: BLE001 - reported as a launch failure, never as silent truncation
+        return False, "could not store the task (%s)" % exc.__class__.__name__, None
+    ok, why, _, _ = logical_mutate(lsid, lambda rec: rec.__setitem__("task", meta))
+    if not ok:
+        return False, why, None
+    message_text, ref = task_message(text, meta)
+    logical_mutate(lsid, lambda rec: rec["task"].__setitem__("inline", ref is None))
+    return inbox_post(
+        lsid, message_text, idempotency_key="task-%s" % lsid[3:], source="device:%s" % device_id,
+        limit=max(len(message_text), MAX_INSTRUCTION_CHARS), trusted=True, extra={"task_ref": ref} if ref else None,
+    )
+
+
 def render_remote_prompt(record, profile):
     gates = "\n".join("  - %s" % gate for gate in (profile or {}).get("human_gate", []))
     values = {
@@ -8755,7 +9125,7 @@ def remote_statusline_command():
 # it approve its own gate or clear its own STOP.
 AGENT_CLI_SUBCOMMANDS = (
     "session inbox", "session wait", "session ack", "session note", "session check",
-    "session gate", "session consume", "continuation wait", "continuation gate",
+    "session gate", "session consume", "session task", "continuation wait", "continuation gate",
     "continuation resume", "continuation status", "continuation remote-check",
 )
 
@@ -8913,7 +9283,7 @@ def _remove_launch_material(lsid):
 
 
 def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wait=None, sleep=time.sleep,
-                          isolation_check=None, grok_preflight=None, grok_launcher=None):
+                          isolation_check=None, grok_preflight=None, grok_launcher=None, project_liveness=None):
     """Create a logical session and start Claude Code on this Mac.
 
     Returns `(http_status, payload)`. Success (201) means the Mac has really
@@ -8927,15 +9297,14 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     request_key = "device:%s:%s" % (device_id, body["request_id"])
 
     project_name = body.get("project")
-    task = clean_untrusted_text(body.get("task"), MAX_TASK_CHARS)
     if not isinstance(project_name, str):
         return 400, {"error": "bad_request", "reason": "a project is required"}
+    task, task_error = validate_task_text(body.get("task"))
     if task is None:
-        # An over-long task is a different failure from an empty one; say which (lengths only, never content).
-        full = clean_untrusted_text(body.get("task"), 10 ** 9)
-        if full is not None:
-            return 400, {"error": "bad_request", "reason": "Task is too long: {:,} characters; maximum is {:,}".format(len(full), MAX_TASK_CHARS)}
-        return 400, {"error": "bad_request", "reason": "a non-empty task is required"}
+        if task_error.startswith("Task is too large"):  # sizes only, never content; rejected before anything launches
+            raw = body["task"].encode("utf-8")
+            return 413, {"error": "task_too_large", "reason": task_error, "bytes": len(raw), "chars": len(body["task"]), "limit_bytes": MAX_TASK_BYTES}
+        return 400, {"error": "bad_request", "reason": task_error}
     name_ok, custom_name, name_why = clean_session_name(body.get("name"))
     if not name_ok:
         return 400, {"error": "bad_request", "reason": name_why}
@@ -8957,6 +9326,7 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
         return remote_create_grok_session(
             body, ctx, project_name, real, project, profile, task, custom_name, request_key,
             wait_seconds=wait_seconds, sleep=sleep, preflight=grok_preflight, launcher=grok_launcher,
+            project_liveness=project_liveness,
         )
     claude_bin = find_claude_executable()
     if not claude_bin:
@@ -8974,9 +9344,9 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
         for existing in logical_list():
             if existing.get("created_request_id") == request_key:
                 return 200, dict(logical_public_view(existing), duplicate=True)
-        for existing in logical_list():
-            if existing.get("project") == project_name and existing.get("state") not in LS_TERMINAL:
-                return 409, {"error": "project_in_use", "logical_session_id": existing["logical_session_id"]}
+        blocker, recovered = reconcile_project_blockers(project_name, liveness=project_liveness)
+        if blocker is not None:
+            return 409, blocker
         launch_token = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
         record = logical_create(
             project=project_name,
@@ -8985,7 +9355,7 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
             created_by="device:%s" % device_id,
             launch_token_sha256=_sha256(launch_token),
             launch_expires_epoch=time.time() + LAUNCH_TOKEN_TTL,
-            title=task.splitlines()[0][:120],
+            title=task_title(task),
         )
         lsid = record["logical_session_id"]
         settings_file = write_permission_settings(lsid, profile, repository=real)
@@ -9003,7 +9373,7 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
         logical_mutate(lsid, annotate)
     log_event("remote_session_created", logical_session_id=lsid, project=project_name, device_id=device_id)
 
-    ok, why, message = inbox_post(lsid, task, idempotency_key="task-%s" % lsid[3:], source="device:%s" % device_id, limit=MAX_TASK_CHARS)
+    ok, why, message = store_and_queue_task(lsid, task, device_id)
     if not ok:
         return _remote_failure(lsid, "could not queue the task: %s" % why)
 
@@ -9044,10 +9414,10 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
         # succeeds; only the background reconciliation loop (logical_reconcile),
         # using the token's real expiry, may eventually declare a
         # truly-abandoned session dead.
-        return 202, dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac")
+        return 202, _annotate_recovered(dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac"), recovered)
     _remove_launch_material(lsid)
     if record.get("state") in LS_TERMINAL:
-        return 502, logical_public_view(record)
+        return 502, _annotate_recovered(logical_public_view(record), recovered)
 
     agent = (record.get("owner") or {}).get("agent_session_id")
     health_deadline = time.time() + health_wait
@@ -9066,7 +9436,7 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
             "remote_degraded_%s" % lsid,
         )
     log_event("remote_session_running", logical_session_id=lsid, remote_healthy=bool(healthy))
-    return 201, logical_public_view(logical_read(lsid))
+    return 201, _annotate_recovered(logical_public_view(logical_read(lsid)), recovered)
 
 
 def remote_registration(facts):
@@ -9817,6 +10187,17 @@ class GrokBridge(object):
 
     def deliver(self, message):
         text = message.get("text") or ""
+        ref = message.get("task_ref")
+        if ref:
+            # A large or non-inline task travels by reference: push the EXACT stored text, verified against its hash.
+            full, why = load_task(self.lsid)
+            if full is None or hashlib.sha256(full.encode("utf-8")).hexdigest() != ref.get("sha256"):
+                self.audit("task_payload_unavailable", message_id=message["id"], reason=(why or "hash mismatch")[:80])
+                self.history("task_payload_unavailable")
+                self.add_line("The task could not be loaded, so it was not sent: %s" % (why or "stored task does not match"))
+                inbox_ack(self.lsid, self.sid, message["id"])  # not retried: never send a partial or altered task
+                return
+            text = full
         first = (text.strip().splitlines() or [""])[0][:300]
         self.audit("instruction_delivered", message_id=message["id"], chars=len(text))
         try:
@@ -10033,7 +10414,7 @@ def grok_health():
 
 
 def remote_create_grok_session(body, ctx, project_name, real, project, profile, task, custom_name, request_key,
-                               wait_seconds=None, sleep=time.sleep, preflight=None, launcher=None):
+                               wait_seconds=None, sleep=time.sleep, preflight=None, launcher=None, project_liveness=None):
     """Create a Grok logical session in an already-registered project and start its bridge."""
     wait_seconds = DEFAULT_CREATE_WAIT if wait_seconds is None else wait_seconds
     device_id = ctx["device_id"]
@@ -10056,9 +10437,9 @@ def remote_create_grok_session(body, ctx, project_name, real, project, profile, 
         for existing in logical_list():
             if existing.get("created_request_id") == request_key:
                 return 200, dict(logical_public_view(existing), duplicate=True)
-        for existing in logical_list():
-            if existing.get("project") == project_name and existing.get("state") not in LS_TERMINAL:
-                return 409, {"error": "project_in_use", "logical_session_id": existing["logical_session_id"]}
+        blocker, recovered = reconcile_project_blockers(project_name, liveness=project_liveness)
+        if blocker is not None:
+            return 409, blocker
         launch_token = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
         record = logical_create(
             project=project_name,
@@ -10067,7 +10448,7 @@ def remote_create_grok_session(body, ctx, project_name, real, project, profile, 
             created_by="device:%s" % device_id,
             launch_token_sha256=_sha256(launch_token),
             launch_expires_epoch=time.time() + LAUNCH_TOKEN_TTL,
-            title=task.splitlines()[0][:120],
+            title=task_title(task),
             agent_type=AGENT_GROK,
         )
         lsid = record["logical_session_id"]
@@ -10081,7 +10462,7 @@ def remote_create_grok_session(body, ctx, project_name, real, project, profile, 
         logical_mutate(lsid, annotate)
     log_event("remote_session_created", logical_session_id=lsid, project=project_name, device_id=device_id, agent=AGENT_GROK)
 
-    ok, why, message = inbox_post(lsid, task, idempotency_key="task-%s" % lsid[3:], source="device:%s" % device_id, limit=MAX_TASK_CHARS)
+    ok, why, message = store_and_queue_task(lsid, task, device_id)
     if not ok:
         return _remote_failure(lsid, "could not queue the task: %s" % why)
     token_file = th_path("prompts", "remote-%s.tok" % lsid)
@@ -10101,13 +10482,13 @@ def remote_create_grok_session(body, ctx, project_name, real, project, profile, 
         # Same reasoning as the Claude path above: the synchronous wait elapsing
         # is not evidence of failure. The launch token stays valid; only
         # logical_reconcile's real-expiry check may declare this session dead.
-        return 202, dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac")
+        return 202, _annotate_recovered(dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac"), recovered)
     _remove_launch_material(lsid)
     if record.get("state") in LS_TERMINAL:
         reason = ((record.get("failure") or {}).get("reason")) or "the Grok session could not be started"
-        return 502, {"logical_session_id": lsid, "state": record.get("state"), "error": "launch_failed", "reason": reason}
+        return 502, _annotate_recovered({"logical_session_id": lsid, "state": record.get("state"), "error": "launch_failed", "reason": reason}, recovered)
     log_event("remote_session_running", logical_session_id=lsid, agent=AGENT_GROK)
-    return 201, logical_public_view(logical_read(lsid))
+    return 201, _annotate_recovered(logical_public_view(logical_read(lsid)), recovered)
 
 
 def remote_create_session_handler(body, ctx):
@@ -10590,8 +10971,13 @@ def logical_reconcile_all(**kw):
     return [logical_reconcile(r["logical_session_id"], **kw) for r in logical_list()]
 
 
-def logical_recover(lsid, action, by="local", liveness=None):
-    """Deliberate recovery of an ORPHANED session: reattach (if truly alive) or abandon."""
+def logical_recover(lsid, action, by="local", liveness=None, expect_epoch=None, reason=None, require_dead=False):
+    """Deliberate recovery of an ORPHANED session: reattach (if truly alive) or abandon.
+
+    Automatic recovery only: `expect_epoch` refuses the abandon if ownership
+    changed after the caller's check, and `require_dead` re-checks the owner
+    UNDER the record lock, at the moment of the state change, so a verdict is
+    never applied to a session that has since been reattached or re-owned."""
     liveness = liveness or owner_liveness
     if action not in ("reattach", "abandon"):
         return False, "action must be reattach or abandon", None
@@ -10602,8 +10988,14 @@ def logical_recover(lsid, action, by="local", liveness=None):
         if rec.get("state") != LS_ORPHANED:
             raise LogicalRefusal("session is not ORPHANED")
         if action == "abandon":
+            if expect_epoch is not None and rec.get("owner_epoch") != expect_epoch:
+                raise LogicalRefusal("ownership changed since the owner health check")
+            if require_dead:
+                now_verdict, now_detail = liveness(rec, time.time())
+                if now_verdict != "dead":
+                    raise LogicalRefusal("the owner is not conclusively dead at the moment of recovery: %s" % now_detail)
             rec["state"] = LS_FAILED
-            rec["failure"] = {"reason": "abandoned after owner loss", "ts": utc_stamp()}
+            rec["failure"] = {"reason": reason or "abandoned after owner loss", "ts": utc_stamp()}
             logical_history(rec, "abandoned", by=by)
             return
         if verdict[0] != "alive":
@@ -10617,6 +11009,156 @@ def logical_recover(lsid, action, by="local", liveness=None):
     if ok:
         log_event("logical_recovered", logical_session_id=lsid, action=action, by=by)
     return ok, why, record
+
+
+def _project_session_summary(record):
+    """Who holds a project, for a refusal message. Names and state only: no paths, PIDs or hashes."""
+    return {
+        "logical_session_id": record.get("logical_session_id"),
+        "name": record.get("name") or record.get("title") or record.get("project"),
+        "state": record.get("state"),
+        "agent_type": agent_type_of(record),
+        "created_utc": record.get("created_utc"),
+        "updated_utc": record.get("updated_utc"),
+    }
+
+
+def _project_in_use_payload(project_name, record, why, recovery=None, recovered=None):
+    summary = _project_session_summary(record)
+    label = "%s (%s, %s)" % (summary["name"], summary["state"], AGENT_LABELS.get(summary["agent_type"], summary["agent_type"]))
+    payload = {
+        "error": "project_in_use",
+        "logical_session_id": summary["logical_session_id"],
+        "session": summary,
+        "reason": "Project '%s' is in use by session %s. %s" % (project_name, label, why),
+    }
+    if recovery:
+        payload["recovery"] = recovery
+    if recovered:
+        payload["auto_recovered"] = recovered
+    return payload
+
+
+def reconcile_project_blockers(project_name, liveness=None, sleep=time.sleep, settle=0.5, now=None):
+    """Before refusing a launch as `project_in_use`, reconcile the sessions holding the project.
+
+    Must be called inside the create lock, so two launches cannot both
+    recover, or both take, the same project. Uses the same authoritative
+    owner-health evidence as the supported `session recover ... abandon`:
+
+    * a genuinely live owner keeps blocking, and is never signalled or killed;
+    * an ORPHANED session is abandoned automatically only when a FRESH check
+      says its owner is conclusively dead (never on an earlier verdict, an
+      "unknown", or a session mid-handoff);
+    * a not-yet-orphaned session whose owner is conclusively dead needs two
+      FRESH "dead" verdicts a settle apart, then the ORPHANED transition, then
+      the same abandon (never on "unknown", and with no alert for a session
+      this very launch is recovering);
+    * any failure or ambiguity fails closed with the reason.
+
+    Only sessions of `project_name` are examined or changed. Returns
+    `(blocker_payload_or_None, recovered_list)`.
+    """
+    liveness = liveness or owner_liveness
+    recovered = []
+    for existing in logical_list():
+        if existing.get("project") != project_name or existing.get("state") in LS_TERMINAL:
+            continue
+        lsid = existing["logical_session_id"]
+        try:
+            blocker = _reconcile_stale_session(lsid, project_name, liveness, sleep, settle, now, recovered)
+        except Exception as exc:  # noqa: BLE001 - fail closed, never let a recovery bug free a project
+            log_event("project_stale_recovery_error", logical_session_id=lsid, project=project_name, error=redact_secrets(str(exc))[:200])
+            record = logical_read(lsid) or existing
+            blocker = _project_in_use_payload(
+                project_name, record, "Automatic recovery of the stale session failed and it was left unchanged.",
+                recovery={"attempted": True, "outcome": "failed", "detail": redact_secrets(str(exc))[:200]},
+            )
+        if blocker is not None:
+            if recovered:
+                blocker["auto_recovered"] = list(recovered)
+            return blocker, recovered
+    return None, recovered
+
+
+def _mark_orphaned_if_dead(lsid, liveness, detail):
+    """The ORPHANED transition for a session whose owner is conclusively dead, decided under the record lock."""
+
+    def mutate(rec):
+        if rec.get("state") in LS_TERMINAL or rec.get("state") == LS_ORPHANED:
+            return
+        verdict, why = liveness(rec, time.time())
+        if verdict != "dead":
+            return
+        health = rec.setdefault("owner_health", {})
+        health.update({"checked_epoch": time.time(), "checked_utc": utc_stamp(), "verdict": "dead", "detail": why})
+        rec["orphaned"] = {"since_utc": utc_stamp(), "previous_state": rec.get("state"), "reason": why, "owner_epoch": rec.get("owner_epoch")}
+        rec["state"] = LS_ORPHANED
+        logical_history(rec, "orphaned", reason=why[:100])
+
+    logical_mutate(lsid, mutate)
+
+
+def _reconcile_stale_session(lsid, project_name, liveness, sleep, settle, now, recovered):
+    """One holder of the project: return a blocker payload, or None once it no longer blocks."""
+    clock = time.time() if now is None else now
+    record = logical_read(lsid)
+    if record is None or record.get("state") in LS_TERMINAL:
+        return None
+    state = record.get("state")
+    if state == LS_CREATING:
+        record = logical_reconcile(lsid, liveness=liveness, now=clock) or record
+        if record.get("state") in LS_TERMINAL:
+            return None
+        return _project_in_use_payload(project_name, record, "It is still starting; wait for it to register or fail, then retry.")
+    if state != LS_ORPHANED:
+        if _handoff_in_progress(record, clock):
+            return _project_in_use_payload(project_name, record, "It is being handed over to a successor; retry shortly.")
+        verdict, detail = liveness(record, clock)
+        if verdict != "dead":
+            note = "Its owner is alive." if verdict == "alive" else "Its owner state could not be proven either way (%s)." % detail
+            return _project_in_use_payload(project_name, record, note + " Wait for it to finish or stop it, then retry.")
+        # Conclusively dead but not yet marked: two FRESH "dead" verdicts, a settle apart, then the same ORPHANED
+        # transition. Unlike a strict reconcile this never orphans on "unknown" and sends no alert for a session
+        # the same request is about to abandon.
+        sleep(settle)
+        second = liveness(logical_read(lsid) or record, time.time() if now is None else now)
+        if second[0] != "dead":
+            return _project_in_use_payload(
+                project_name, logical_read(lsid) or record,
+                "Its owner looked dead but could not be confirmed on a second check (%s), so it was left unchanged." % second[1],
+                recovery={"attempted": False, "outcome": "not_conclusive", "verdict": second[0]},
+            )
+        _mark_orphaned_if_dead(lsid, liveness, detail)
+        record = logical_read(lsid) or record
+        if record.get("state") in LS_TERMINAL:
+            return None
+        if record.get("state") != LS_ORPHANED:
+            return _project_in_use_payload(
+                project_name, record, "Its owner looks dead but the session could not be confirmed orphaned, so it was left unchanged.",
+                recovery={"attempted": True, "outcome": "not_orphaned"},
+            )
+    # ORPHANED: a fresh, authoritative verdict decides. Anything but "dead" fails closed.
+    verdict, detail = liveness(record, time.time() if now is None else now)
+    if verdict != "dead":
+        why = ("Its owner is still alive, so it was not recovered; reattach it or stop it deliberately."
+               if verdict == "alive" else
+               "It is ORPHANED but its owner could not be proven dead (%s), so it was not recovered automatically. "
+               "Recover or abandon it deliberately: session recover --recover-action abandon." % detail)
+        return _project_in_use_payload(project_name, record, why, recovery={"attempted": False, "outcome": "not_conclusive", "verdict": verdict})
+    ok, why, _ = logical_recover(
+        lsid, "abandon", by="auto:project-launch", liveness=liveness, expect_epoch=record.get("owner_epoch"), require_dead=True,
+        reason="abandoned automatically: owner confirmed dead (%s) when a new launch needed the project" % detail[:80],
+    )
+    if not ok:
+        return _project_in_use_payload(
+            project_name, logical_read(lsid) or record, "Automatic recovery was refused and the session was left unchanged.",
+            recovery={"attempted": True, "outcome": "refused", "detail": str(why)[:200]},
+        )
+    summary = _project_session_summary(record)
+    recovered.append({"logical_session_id": lsid, "name": summary["name"], "previous_state": state, "reason": detail[:120]})
+    log_event("project_stale_session_recovered", logical_session_id=lsid, project=project_name, previous_state=state, reason=detail[:100])
+    return None
 
 
 def service_recover(liveness=None, sleep=time.sleep, now=None, settle=2.0):
@@ -10978,6 +11520,20 @@ def sweep_launch_artifacts(max_age=None):
                     removed += 1
             except OSError:
                 pass
+    # Crash debris only: a `.tmp-` file left by an interrupted atomic write of a task payload. Payloads themselves are
+    # session evidence and are never swept.
+    try:
+        for name in os.listdir(th_path("tasks")):
+            if ".tmp-" in name:
+                path = os.path.join(th_path("tasks"), name)
+                try:
+                    if time.time() - os.stat(path).st_mtime > 3600:
+                        os.unlink(path)
+                        removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
     return removed
 
 
@@ -13570,9 +14126,11 @@ def main(argv=None):
         "action",
         choices=(
             "list", "show", "stop", "pause", "resume", "post", "inbox", "ack", "note", "check",
-            "wait", "gate", "consume", "decide", "recover", "reconcile", "hook-stop", "rename",
+            "wait", "gate", "consume", "decide", "recover", "reconcile", "hook-stop", "rename", "task",
         ),
     )
+    p.add_argument("--part", type=int, default=None, help="with `task`: print this 1-based part of the stored task verbatim")
+    p.add_argument("--info", action="store_true", help="with `task`: show the stored task's size and how many parts have been read (the default without --part)")
     p.add_argument("--timeout", type=float, default=540.0)
     p.add_argument("--requested-action", default=None)
     p.add_argument("--approval-id", default=None)
