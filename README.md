@@ -477,7 +477,7 @@ Stated plainly. Overstating them would make this tool untrustworthy.
 6. **Remote project access is deliberately opt-in.**
 7. **Mac reboot recovery is not implemented** (service restart recovery is). Relaunching an `ORPHANED` session automatically is deliberately not done.
 8. The remote-control health signal is read from Claude's live session record, an implementation detail that is not a documented API, and `--setting-sources` is undocumented; isolation is proven per exact Claude version, automatically on the first remote launch of a new version (or ahead of time with `remote verify-isolation`); a failed verification blocks the launch, and no future version is implicitly trusted.
-9. Remote sessions do not load project or user settings (including project hooks); `CLAUDE.md` files still load. One active remote session per project.
+9. Remote sessions do not load project or user settings (including project hooks); `CLAUDE.md` files still load. A Git project can run several concurrent remote sessions, each in its own isolated worktree (see [Concurrent sessions](docs/REMOTE_CONTROL.md#concurrent-sessions-on-one-project)); other projects keep a single writer.
 
 **Grok** (new in 1.5.0)
 

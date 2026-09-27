@@ -415,9 +415,10 @@ sequenceDiagram
 
 Success (`201 RUNNING`) is returned only after the launched Claude has
 registered as owner. The task text is stored exactly (see [Large prompts](#large-prompts))
-and read by the agent as data; it never reaches a shell or argv. Only one active session
-per project is allowed (a single writer); a stale one is reconciled first (see
-[Stale sessions](#stale-sessions-and-project_in_use)).
+and read by the agent as data; it never reaches a shell or argv. Two modifying agents never share a
+physical working tree: a stale holder is reconciled first (see
+[Stale sessions](#stale-sessions-and-project_in_use)), and a healthy one no longer blocks a Git project, the new
+session gets its own isolated worktree (see [Concurrent sessions](#concurrent-sessions-on-one-project)).
 
 ## Large prompts
 
@@ -456,22 +457,77 @@ Follow-up instructions (`Tell Claude...`) keep their 8,000-character limit.
 
 ## Stale sessions and `project_in_use`
 
-A launch is refused with `project_in_use` only when a session genuinely holds the project. Before refusing,
-Terminal Handoff reconciles the sessions holding it, inside the create lock, using the same owner-health evidence
-as `session recover`:
+A launch is refused with `project_in_use` only when a session holds the project and no safe isolated workspace can
+be made for the new one. Before deciding, Terminal Handoff reconciles the sessions holding it, inside the create lock,
+using the same owner-health evidence as `session recover`:
 
 | Existing session | Result |
 |---|---|
 | ORPHANED, and a *fresh* check proves the owner conclusively dead | **abandoned automatically** (`by auto:project-launch`); the same launch continues; the response lists it in `auto_recovered` |
 | RUNNING/PAUSED/etc. whose owner is conclusively dead | two fresh "dead" verdicts a settle apart, then ORPHANED (never on "unknown"; no alert), then abandoned as above |
-| RUNNING with a live owner | blocks; never touched, signalled or killed |
-| ORPHANED but the owner is alive, or "unknown" | blocks and says why; recover or abandon it deliberately |
-| CREATING (still inside its launch window) | blocks ("still starting"); one whose window has passed without registering is failed as before |
-| handoff in progress, recovery refused or failing, ownership changed or the owner no longer provably dead at the moment of recovery | blocks; nothing is changed |
+| RUNNING with a live owner, a session mid-handoff, or one still inside its launch window (CREATING) | a **healthy holder**: never touched, signalled or killed. A Git project gives the new launch its own workspace; a project that cannot be isolated blocks and says why |
+| ORPHANED but the owner is alive, or an owner that is "unknown" | **ambiguous: blocks** and says why; recover or abandon it deliberately |
+| recovery refused or failing, ownership changed or the owner no longer provably dead at the moment of recovery | **ambiguous: blocks**; nothing is changed |
+| a CREATING session whose launch window passed without registering | failed as before |
 
 Only sessions of the requested project are examined or changed. Two racing launches cannot both recover or both
 take the project: one wins, the other is told which session now holds it. The refusal names the holder, for example
 `Project 'nova' is in use by session Nova Health (RUNNING, Claude Code). Its owner is alive.`
+
+## Concurrent sessions on one project
+
+A healthy session occupying a project does not stop another launch on it. The rules, in order:
+
+* a dead ORPHANED owner: auto-recovered, and the launch uses the project directory (unchanged);
+* a **healthy** holder of the project directory and a **Git project**: the new session gets its own **isolated
+  worktree**, and the holder is not touched in any way;
+* **ambiguous** ownership: fail closed;
+* a project that **cannot be isolated safely**: fail closed, with the actual reason.
+
+**The workspace.** `git worktree add -b th/<project>/<session> <root>/<project>/<session> <base>`, where `<root>` is
+`.th-worktrees` beside the project directory (or `worktree_root` in `remote/config.json`, which may not be inside the
+project). It is created with Git hooks disabled, then verified (path, base commit, branch, same repository); anything
+that fails is undone and reported as `workspace_unavailable` with the reason, never as a bare `project_in_use`. Two
+launches never share a path or a branch (both carry the session id), and an existing path is never reused. A Git worktree
+of a project you already trusted does not raise Claude's folder-trust prompt.
+
+**The base commit** is the project's own HEAD when it sits on the default branch (or is detached); when the project
+directory is on another branch (another session's feature branch), the default branch (`origin/HEAD`, `origin/main`,
+`origin/master`, `main`, `master`) is used instead and the phone is told. When no default branch can be identified the
+current branch's HEAD is used and the phone is told that too. The commit is verified to exist. If the project's parent
+directory is not writable, set `worktree_root` in `remote/config.json`. The base SHA,
+base ref, branch and workspace path are recorded on the logical session, and `remote/workspaces.json` records which
+session owns which worktree.
+
+**Uncommitted work in the project directory** is never copied and never dropped. The new workspace starts from the
+committed base; the phone is told how many modified, staged and untracked files (counts only) are not in it. Ignored files
+(for example `.env`, `node_modules`) and submodule contents are not in a new worktree either.
+
+**Permissions.** The project's registration and permission profile are unchanged. The isolated session runs with the same
+profile pointed at its own workspace: an absolute allow rule that names the project directory is re-targeted at the
+workspace (it gains no access to the project directory), a deny rule is kept as written **and** re-targeted (only the
+`//absolute` form, on whole path boundaries: `//x/app` is not `//x/app-old`), and `Edit` and `Write` on the project
+directory are denied to it, so it cannot edit the tree another session occupies. This is a permission rule, not a sandbox:
+a Bash command can still reach any path the profile's Bash rules allow, and the agent's prompt tells it not to. The agent's
+prompt says it is in an isolated worktree and where the main workspace is.
+
+**Phone.** No `project_in_use` for a healthy holder. The launch continues and the page says, for example: *Nova Health is
+already using this project. A separate isolated workspace was created for PlanGuard.* with the branch, the base, and any
+warning. The task text is untouched. The session page shows the workspace kind, branch and base.
+
+**Cleanup.** `session workspace-cleanup` (and a periodic sweep) removes a worktree only when **all** of these hold: its
+session is COMPLETED or FAILED for at least ten minutes (a STOPPED or PAUSED session may be resumed, so its workspace
+stays until it ends); its owner is *provably dead* (an "unknown" owner keeps it) and **no process has its working directory
+inside it** (if that cannot be checked, it stays); git lists it as a worktree of the project, it is under the root recorded
+when it was created, and the ownership index says this session owns it; no git operation is in progress; HEAD is still **on
+the session branch** (commits on a detached HEAD or another branch could otherwise be lost); no file is hidden from
+`git status` (skip-worktree / assume-unchanged); and it holds **nothing** uncommitted: no modified, staged, untracked or
+unmerged file, and no ignored file other than provably regenerable caches: `.DS_Store`, `*.pyc` inside a `__pycache__`, and
+anything inside `.pytest_cache`, `.mypy_cache`, `.ruff_cache` or `node_modules`, and only where the cache sits under a
+directory that holds tracked files (an ignored data directory that merely contains a cache-named folder is kept). It uses
+`git worktree remove` **without** `--force`, and the session branch is never deleted, so commits made on it always survive.
+Anything else is kept and the reason recorded (`kept_dirty`, `kept_ignored`, `kept_owner_alive`, `kept_unsafe`). Nothing
+removes a kept workspace for you: deal with it by hand, then run the command again.
 
 ## Session names
 
@@ -686,7 +742,8 @@ handoffs.
 * **STOP is cooperative** unless a process binding exists for `--hard`.
 * **Relaunching an ORPHANED session, and Mac reboot recovery, are not
   implemented.**
-* **One active remote session per project.**
+* **One active remote session per physical working tree.** A Git project runs several concurrent sessions, each in its
+  own worktree; a non-Git project, one that is not the top level of its repository, or one with no commits keeps a single writer.
 * The interface polls (every 3–5 s while open); it is not a push channel. Alerts
   use the existing notification outbox.
 * Rate limits other than the persistent ones are per process.
@@ -703,7 +760,8 @@ handoffs.
 | `429` | lockout or rate limit; wait, or check `security_state.json` windows |
 | `isolation_unverified` | the automatic verification for the installed Claude version failed (the reason names the check): fix it, or run `remote verify-isolation` to see the probe |
 | `permission_profile_required` | `project permissions validate <name>`, then `enable-remote` |
-| `project_in_use` | a session genuinely holds the project: the message names it and its state. A dead ORPHANED one is recovered automatically now; a live or unprovable one is not: stop it, or recover/abandon it deliberately |
+| `project_in_use` | a session holds the project and the new one cannot be given its own workspace: the message names the holder and says why isolation was not possible (not a Git repository, not the repository top level, no commits, ambiguous ownership). A dead ORPHANED holder is recovered automatically; a healthy holder in a Git project no longer causes this |
+| `workspace_unavailable` | the isolated worktree could not be created; the reason is in the message and nothing was left behind |
 | `413 task_too_large` / `payload_too_large` | the task is over 524,288 bytes (or the body over its limit); the message gives the counts. Shorten it: nothing is ever truncated |
 | `504` on create | Terminal did not open a registered Claude in time; check Automation permission for Terminal |
 | Session shows ORPHANED | the owner process is gone; **Re-check** if it has come back, otherwise **Abandon** |

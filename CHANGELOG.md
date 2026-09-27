@@ -163,6 +163,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer than 330 seconds for another launch's verification refuses rather than proceeding. Project
   permissions, registrations and the isolation probe itself are unchanged.
 
+- **Concurrent sessions on one project, each in its own worktree.** A healthy session holding a project no longer
+  produces `project_in_use` for a Git project. The new launch gets a dedicated `git worktree` beside the project
+  (`.th-worktrees/<project>/<session>`, or `worktree_root`) on its own session branch `th/<project>/<session>`, created
+  from a verified base commit (the project's HEAD on the default branch, else the default branch), verified, and
+  recorded (base SHA, base ref, branch, path) on the logical session and in `remote/workspaces.json`. The existing session
+  is not touched and the launch continues in the same request; the phone says which session holds the project and
+  which branch and base the new workspace has. Uncommitted work in the project directory is never copied or dropped and
+  is reported as counts. The project's registration and permission profile are unchanged: the isolated session runs with
+  the same profile pointed at its workspace (allow rules re-targeted, deny rules kept and re-targeted, `Edit`/`Write` on
+  the project directory denied to it). Ambiguous ownership, a non-Git project, a directory that is not its repository's
+  top level, a repository with no commits, and a git operation in progress still fail closed with the actual reason;
+  a workspace that cannot be created reports `workspace_unavailable`. Cleanup (`session workspace-cleanup` and a
+  periodic sweep) removes a worktree only after its session is COMPLETED or FAILED, its owner is provably dead and no
+  process runs inside it, git and the ownership index agree it is ours, HEAD is still on the session branch, and nothing
+  in it is uncommitted or hidden (ignored files count unless they are provably regenerable caches); it never forces, and
+  never deletes the branch. A STOPPED or PAUSED session's workspace is left until the session ends. The stale-session
+  auto-recovery above is unchanged. Claude and Grok launch inside the workspace (Grok's bridge accepts the
+  workspace as the session's working directory).
+
 - **A stale session no longer blocks a project (`project_in_use`).** Phone launches were repeatedly refused
   by an ORPHANED session whose owner process was already dead, until someone ran
   `session recover --recover-action abandon` by hand. Before a launch is refused, the sessions holding that
