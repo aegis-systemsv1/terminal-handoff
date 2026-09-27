@@ -6848,6 +6848,22 @@ def logical_append_output(lsid, agent_session_id, text):
     return ok, why, None
 
 
+def _workspace_public(ws):
+    """Whether a session has its own workspace, and on which branch; never a path."""
+    if not ws:
+        return None
+    dirty = ws.get("canonical_dirty") or {}
+    return {
+        "kind": ws.get("kind") or "canonical",
+        "isolated": ws.get("kind") == "worktree",
+        "branch": ws.get("branch") if ws.get("kind") == "worktree" else None,
+        "base_sha": (ws.get("base_sha") or "")[:12] or None,
+        "base_ref": ws.get("base_ref"),
+        "canonical_uncommitted": sum(v for k, v in dirty.items() if isinstance(v, int) and not isinstance(v, bool)) if dirty else 0,
+        "cleanup": (ws.get("cleanup") or {}).get("state"),
+    }
+
+
 def _task_public(meta):
     """Size and progress of the stored task, for the phone. Never the text; only a short fingerprint."""
     if not meta:
@@ -6913,6 +6929,7 @@ def logical_public_view(record):
         "human_gate": next((approval_public(a, True) for a in (record.get("approvals") or []) if a.get("status") == "pending"), None),
         "project_available": record.get("project_available", True),
         "task": _task_public(record.get("task")),
+        "workspace": _workspace_public(record.get("workspace")),
     }
 
 
@@ -6993,6 +7010,13 @@ def cmd_session(args):
         if message:
             sys.stderr.write(message)
         return code
+    if action == "workspace-cleanup":
+        if lsid:
+            out = cleanup_session_workspace(lsid, grace=0.0)
+        else:
+            out = sweep_session_workspaces(grace=0.0, recheck=0.0)
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
     if action == "reconcile":
         if args.startup:
             print(json.dumps(service_recover(), indent=2, sort_keys=True))
@@ -8169,11 +8193,12 @@ UI_APP_JS = r"""
         var d = r.data || {};
         if ((r.status === 201 || r.status === 200 || r.status === 202) && d.logical_session_id) {
           taskDraft = '';
-          var t = d.task, rec = d.auto_recovered || [];
+          var t = d.task, rec = d.auto_recovered || [], iso = d.isolation || null;
           msg.className = 'note';
           msg.textContent = (t ? 'Accepted the whole task: ' + fmt(t.chars) + ' characters, ' + fmt(t.bytes) + ' bytes, ' + fmt(t.lines) + ' lines (fingerprint ' + t.fingerprint + '). ' : 'Accepted. ')
-            + (rec.length ? 'A stale session (' + rec.map(function (x) { return x.name; }).join(', ') + ') was recovered and your launch continued. ' : '');
-          if (rec.length) setTimeout(function () { nav('#/s/' + d.logical_session_id); }, 1800); else nav('#/s/' + d.logical_session_id);
+            + (rec.length ? 'A stale session (' + rec.map(function (x) { return x.name; }).join(', ') + ') was recovered and your launch continued. ' : '')
+            + (iso ? iso.message + ' Branch ' + iso.branch + ', from ' + iso.base_ref + ' (' + iso.base_sha + '). ' + (iso.warnings || []).join(' ') : '');
+          if (rec.length || iso) setTimeout(function () { nav('#/s/' + d.logical_session_id); }, iso && (iso.warnings || []).length ? 6000 : 2500); else nav('#/s/' + d.logical_session_id);
         } else {
           // A definitive answer (not a network failure) must not be replayed for a retry: use a fresh request id. The task text stays.
           go.disabled = false; formRequestId = rid(); msg.className = 'err';
@@ -8355,6 +8380,8 @@ UI_APP_JS = r"""
         : (age === null || age === undefined ? 'Claude has not checked in yet' : (age < 45 ? 'Claude is listening' : 'Claude is busy or away; it will see new instructions at its next check'));
       head.appendChild(el('div', { 'class': 'card' }, [
         el('div', { 'class': 'muted', text: 'Current task' }), el('div', { text: s.title || '(none)' }),
+        (s.workspace && s.workspace.isolated) ? el('div', { 'class': 'muted', text: 'Isolated workspace: branch ' + s.workspace.branch + ', from ' + s.workspace.base_ref + ' (' + s.workspace.base_sha + ')'
+          + (s.workspace.canonical_uncommitted ? ' · the main workspace had ' + s.workspace.canonical_uncommitted + ' uncommitted change(s) that are not in it' : '') }) : null,
         (s.task && !s.task.inline) ? el('div', { 'class': 'muted', text: 'Full task stored: ' + s.task.chars + ' characters, ' + s.task.bytes + ' bytes, ' + s.task.lines + ' lines · read by the agent so far: ' + s.task.parts_read + ' of ' + s.task.parts + ' part' + (s.task.parts === 1 ? '' : 's') }) : null,
         el('div', { 'class': 'muted', text: 'Branch: ' + (s.branch || 'n/a') }),
         el('div', { 'class': 'muted', text: 'Owner generation: ' + (s.owner ? s.owner.generation : 'none') + ' · ID ' + short(s.logical_session_id) }),
@@ -8740,6 +8767,7 @@ def _reconcile_loop(interval=15.0):
         try:
             logical_reconcile_all()
             sweep_launch_artifacts()
+            sweep_session_workspaces()
         except Exception as exc:
             log_event("reconcile_error", error=str(exc)[:200])
 
@@ -8841,7 +8869,7 @@ REMOTE_SESSION_PROMPT = """TERMINAL HANDOFF REMOTE SESSION
 You are a Claude Code session that Terminal Handoff started on this Mac at the
 request of an authenticated remote device belonging to the user. You act for
 logical session {{LOGICAL_ID}} on project "{{PROJECT}}".
-Working directory: {{WORKING_DIRECTORY}}
+Working directory: {{WORKING_DIRECTORY}}{{WORKSPACE_NOTE}}
 
 FIRST, confirm you are the registered owner:
 
@@ -9059,10 +9087,6 @@ def task_message(text, meta):
     return pointer, {"sha256": meta["sha256"], "bytes": meta["bytes"], "parts": parts}
 
 
-def _annotate_recovered(payload, recovered):
-    return dict(payload, auto_recovered=list(recovered)) if recovered else payload
-
-
 def store_and_queue_task(lsid, text, device_id):
     """Store the exact task and queue it for the agent. `(ok, reason, message)`."""
     try:
@@ -9080,12 +9104,26 @@ def store_and_queue_task(lsid, text, device_id):
     )
 
 
+def _workspace_note(record):
+    ws = record.get("workspace") or {}
+    if ws.get("kind") != "worktree":
+        return ""
+    return (
+        "\nWORKSPACE: this is an ISOLATED Git worktree on branch %s, created from %s (%s). Another session is using the project's "
+        "main workspace at %s: never change, check out, reset or delete anything there, and never run a git command that moves "
+        "or removes this worktree. Commit your work on this branch. The worktree is removed only after this session has ended and "
+        "only if nothing in it is uncommitted; the branch is never deleted." % (
+            ws.get("branch"), str(ws.get("base_sha"))[:12], ws.get("base_ref"), ws.get("canonical_repository"))
+    )
+
+
 def render_remote_prompt(record, profile):
     gates = "\n".join("  - %s" % gate for gate in (profile or {}).get("human_gate", []))
     values = {
         "{{LOGICAL_ID}}": record["logical_session_id"],
         "{{PROJECT}}": str(record.get("project")),
         "{{WORKING_DIRECTORY}}": str(record.get("repository")),
+        "{{WORKSPACE_NOTE}}": _workspace_note(record),
         "{{HUMAN_GATES}}": gates or "  - (none recorded)",
         "{{TH_COMMAND}}": "%s %s" % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__))),
         "{{TH_VERSION}}": TERMINAL_HANDOFF_VERSION,
@@ -9282,6 +9320,127 @@ def _remove_launch_material(lsid):
             pass
 
 
+def _isolation_notice(occupants, workspace, custom_name, base_note):
+    """What the phone is told when a launch was given its own workspace because the project was in use."""
+    holder = occupants[0]["session"]["name"] if occupants else "Another session"
+    mine = custom_name or "your new session"
+    dirty = workspace.get("canonical_dirty") or {}
+    total = sum(v for k, v in dirty.items() if isinstance(v, int) and not isinstance(v, bool))
+    warnings = []
+    if base_note:
+        warnings.append(base_note)
+    if dirty.get("unknown"):
+        warnings.append("The main workspace's uncommitted changes could not be checked; none of them are in the new workspace.")
+    elif total:
+        warnings.append("The main workspace has uncommitted changes (%d modified, %d staged, %d untracked). They are not in the new workspace, "
+                        "which starts from committed %s (%s)." % (dirty.get("modified", 0), dirty.get("staged", 0), dirty.get("untracked", 0),
+                                                                    workspace["base_ref"], workspace["base_sha"][:12]))
+    return {
+        "isolated": True,
+        "message": "%s is already using this project. A separate isolated workspace was created for %s." % (holder, mine),
+        "occupied_by": occupants[0]["session"] if occupants else None,
+        "branch": workspace["branch"],
+        "base_sha": workspace["base_sha"][:12],
+        "base_ref": workspace["base_ref"],
+        "warnings": warnings,
+    }
+
+
+def _without_kind(payload):
+    return {k: v for k, v in payload.items() if k != "kind"}
+
+
+def _claim_project_session(project_name, real, project, profile, repo, request_key, device_id, task, custom_name, agent_type, project_liveness):
+    """Under the create lock: de-duplicate, reconcile the holders of the project, and decide this session's workspace.
+
+    `(early_response, claim)`: `early_response` is `(status, payload)` when the launch must not proceed. A healthy
+    holder of the canonical workspace does not block: the new session is given its own worktree, and the holder is
+    not touched. Ambiguity, and a project that cannot be isolated safely, still fail closed, with the reason."""
+    # Planning reads the repository (status, refs) and can be slow on a large one: do it before taking the global create
+    # lock whenever a holder exists, and only fall back to planning under the lock in the rare race where one appeared since.
+    preplan = None
+    if any(r.get("project") == project_name and r.get("state") not in LS_TERMINAL for r in logical_list()):
+        preplan = plan_session_workspace(project_name, real)
+    with _create_lock():
+        for existing in logical_list():
+            if existing.get("created_request_id") == request_key:
+                return (200, dict(logical_public_view(existing), duplicate=True)), None
+        blocker, recovered, occupants = reconcile_project_occupancy(project_name, liveness=project_liveness)
+        if blocker is not None:
+            return (409, _without_kind(blocker)), None
+        occupants.sort(key=lambda o: o["session"]["workspace_kind"] == "worktree")  # the holder of the project directory first
+        plan = None
+        if any(o["session"]["workspace_kind"] != "worktree" for o in occupants):
+            plan, why = preplan if preplan is not None else plan_session_workspace(project_name, real)
+            if plan is None:
+                refusal = dict(occupants[0])
+                refusal["reason"] = "%s %s." % (refusal["reason"].rstrip(), why[:1].upper() + why[1:])
+                refusal["isolation"] = {"attempted": True, "possible": False, "reason": why}
+                if recovered:
+                    refusal["auto_recovered"] = list(recovered)
+                log_event("remote_create_refused", device_id=device_id, project=project_name, reason="project in use; not isolatable")
+                return (409, _without_kind(refusal)), None
+        launch_token = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
+        record = logical_create(
+            project=project_name,
+            repository=real,
+            branch=repo.get("branch"),
+            created_by="device:%s" % device_id,
+            launch_token_sha256=_sha256(launch_token),
+            launch_expires_epoch=time.time() + LAUNCH_TOKEN_TTL,
+            title=task_title(task),
+            agent_type=agent_type,
+        )
+        lsid = record["logical_session_id"]
+        workspace = {"kind": "canonical"}
+        if plan is not None:
+            path, branch = workspace_identity(project_name, plan, lsid)
+            base = plan["base"]
+            workspace = {
+                "kind": "worktree", "state": "pending", "project": project_name, "canonical_repository": real, "path": path, "branch": branch,
+                "root": plan["root"], "base_sha": base["sha"], "base_ref": base["ref"], "canonical_head_sha": base["head_sha"],
+                "canonical_head_branch": base["head_branch"], "canonical_dirty": plan["dirty"], "created_utc": utc_stamp(), "cleanup": None,
+            }
+
+        def annotate(rec):
+            rec["created_request_id"] = request_key
+            rec["name"] = custom_name
+            rec["th_command"] = {"python": sys.executable or "python3", "core": os.path.abspath(__file__)}
+            rec["workspace"] = workspace
+            if plan is not None:
+                rec["repository"] = workspace["path"]
+                rec["branch"] = workspace["branch"]
+            rec["permissions"] = {"profile": profile["profile"], "human_gate": list(profile["human_gate"]), "settings_file": None}
+
+        logical_mutate(lsid, annotate)
+    return None, {"lsid": lsid, "launch_token": launch_token, "recovered": recovered, "occupants": occupants, "plan": plan, "workspace": workspace}
+
+
+def _open_claimed_workspace(claim, project_name, real, custom_name):
+    """Create the planned worktree, outside the create lock. `(workdir, isolation_notice, failure_or_None)`."""
+    lsid, workspace = claim["lsid"], claim["workspace"]
+    if claim["plan"] is None:
+        return real, None, None
+    ok, why = create_session_workspace(lsid, project_name, real, workspace)
+    holder = claim["occupants"][0]["session"]["name"] if claim["occupants"] else "another session"
+    if not ok:
+        status, payload = _remote_failure(
+            lsid, "Project '%s' is in use by %s, and a separate isolated workspace could not be created safely: %s" % (project_name, holder, why), 503)
+        payload["error"] = "workspace_unavailable"
+        return None, None, (status, _annotate_launch(payload, claim["recovered"], None))
+    logical_mutate(lsid, lambda rec: rec["workspace"].__setitem__("state", "ready"))
+    log_event("session_workspace_created", logical_session_id=lsid, project=project_name, branch=workspace["branch"], base=workspace["base_sha"][:12])
+    return workspace["path"], _isolation_notice(claim["occupants"], workspace, custom_name, claim["plan"]["base"].get("note")), None
+
+
+def _annotate_launch(payload, recovered, isolation):
+    if recovered:
+        payload = dict(payload, auto_recovered=list(recovered))
+    if isolation:
+        payload = dict(payload, isolation=isolation)
+    return payload
+
+
 def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wait=None, sleep=time.sleep,
                           isolation_check=None, grok_preflight=None, grok_launcher=None, project_liveness=None):
     """Create a logical session and start Claude Code on this Mac.
@@ -9340,38 +9499,23 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
         if repo.get(flag):
             return 409, {"error": "repository_busy", "reason": "a git operation is in progress"}
 
-    with _create_lock():
-        for existing in logical_list():
-            if existing.get("created_request_id") == request_key:
-                return 200, dict(logical_public_view(existing), duplicate=True)
-        blocker, recovered = reconcile_project_blockers(project_name, liveness=project_liveness)
-        if blocker is not None:
-            return 409, blocker
-        launch_token = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
-        record = logical_create(
-            project=project_name,
-            repository=real,
-            branch=repo.get("branch"),
-            created_by="device:%s" % device_id,
-            launch_token_sha256=_sha256(launch_token),
-            launch_expires_epoch=time.time() + LAUNCH_TOKEN_TTL,
-            title=task_title(task),
+    early, claim = _claim_project_session(project_name, real, project, profile, repo, request_key, device_id, task, custom_name, AGENT_CLAUDE, project_liveness)
+    if early is not None:
+        return early
+    lsid, launch_token, recovered = claim["lsid"], claim["launch_token"], claim["recovered"]
+    log_event("remote_session_created", logical_session_id=lsid, project=project_name, device_id=device_id, workspace=claim["workspace"]["kind"])
+    workdir, isolation, failure = _open_claimed_workspace(claim, project_name, real, custom_name)
+    if failure is not None:
+        return failure
+    launch_profile = profile
+    if workdir != real:
+        launch_profile = dict(
+            profile,
+            allow=translate_rules_for_workspace(profile["allow"], real, workdir),
+            deny=translate_rules_for_workspace(profile.get("deny", []), real, workdir, deny=True) + isolated_workspace_deny_rules(real),
         )
-        lsid = record["logical_session_id"]
-        settings_file = write_permission_settings(lsid, profile, repository=real)
-
-        def annotate(rec):
-            rec["created_request_id"] = request_key
-            rec["name"] = custom_name
-            rec["th_command"] = {"python": sys.executable or "python3", "core": os.path.abspath(__file__)}
-            rec["permissions"] = {
-                "profile": profile["profile"],
-                "human_gate": list(profile["human_gate"]),
-                "settings_file": settings_file,
-            }
-
-        logical_mutate(lsid, annotate)
-    log_event("remote_session_created", logical_session_id=lsid, project=project_name, device_id=device_id)
+    settings_file = write_permission_settings(lsid, launch_profile, repository=workdir)
+    logical_mutate(lsid, lambda rec: rec["permissions"].__setitem__("settings_file", settings_file))
 
     ok, why, message = store_and_queue_task(lsid, task, device_id)
     if not ok:
@@ -9390,7 +9534,7 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     script_file = th_path("prompts", "remote-%s.sh" % lsid)
     token_file = th_path("prompts", "remote-%s.tok" % lsid)
     write_text_private(token_file, launch_token)
-    write_text_private(script_file, build_remote_launch_script(real, argv, lsid, token_file), 0o700)
+    write_text_private(script_file, build_remote_launch_script(workdir, argv, lsid, token_file), 0o700)
 
     result = terminal({}, script_file, "Terminal Handoff: %s" % (name,), env_flag("CLAUDE_TERMINAL_HANDOFF_TEST_MODE"))
     log_event("remote_claude_launched", logical_session_id=lsid, launched=bool(result.get("launched")), simulated=bool(result.get("test_mode")))
@@ -9414,10 +9558,10 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
         # succeeds; only the background reconciliation loop (logical_reconcile),
         # using the token's real expiry, may eventually declare a
         # truly-abandoned session dead.
-        return 202, _annotate_recovered(dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac"), recovered)
+        return 202, _annotate_launch(dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac"), recovered, isolation)
     _remove_launch_material(lsid)
     if record.get("state") in LS_TERMINAL:
-        return 502, _annotate_recovered(logical_public_view(record), recovered)
+        return 502, _annotate_launch(logical_public_view(record), recovered, isolation)
 
     agent = (record.get("owner") or {}).get("agent_session_id")
     health_deadline = time.time() + health_wait
@@ -9436,7 +9580,7 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
             "remote_degraded_%s" % lsid,
         )
     log_event("remote_session_running", logical_session_id=lsid, remote_healthy=bool(healthy))
-    return 201, _annotate_recovered(logical_public_view(logical_read(lsid)), recovered)
+    return 201, _annotate_launch(logical_public_view(logical_read(lsid)), recovered, isolation)
 
 
 def remote_registration(facts):
@@ -10259,9 +10403,13 @@ class GrokBridge(object):
             return 2
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "terminating", True))
         real, _, why = project_resolve(record.get("project") or "")
-        if real is None or real != record.get("repository"):
+        workspace = record.get("workspace") or {}
+        expected = workspace.get("canonical_repository") if workspace.get("kind") == "worktree" else record.get("repository")
+        if real is None or real != expected:
             return self.fail("the project is no longer available at its registered location")
-        self.repository = real
+        if workspace.get("kind") == "worktree" and (workspace.get("state") != "ready" or not os.path.isdir(record.get("repository") or "")):
+            return self.fail("the session's isolated workspace is not available")
+        self.repository = record.get("repository") or real
         self.grok_bin = find_grok_executable()
         if not self.grok_bin:
             return self.fail(GROK_NOT_INSTALLED)
@@ -10433,34 +10581,14 @@ def remote_create_grok_session(body, ctx, project_name, real, project, profile, 
         if repo.get(flag):
             return 409, {"error": "repository_busy", "reason": "a git operation is in progress"}
 
-    with _create_lock():
-        for existing in logical_list():
-            if existing.get("created_request_id") == request_key:
-                return 200, dict(logical_public_view(existing), duplicate=True)
-        blocker, recovered = reconcile_project_blockers(project_name, liveness=project_liveness)
-        if blocker is not None:
-            return 409, blocker
-        launch_token = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
-        record = logical_create(
-            project=project_name,
-            repository=real,
-            branch=repo.get("branch"),
-            created_by="device:%s" % device_id,
-            launch_token_sha256=_sha256(launch_token),
-            launch_expires_epoch=time.time() + LAUNCH_TOKEN_TTL,
-            title=task_title(task),
-            agent_type=AGENT_GROK,
-        )
-        lsid = record["logical_session_id"]
-
-        def annotate(rec):
-            rec["created_request_id"] = request_key
-            rec["name"] = custom_name
-            rec["th_command"] = {"python": sys.executable or "python3", "core": os.path.abspath(__file__)}
-            rec["permissions"] = {"profile": profile["profile"], "human_gate": list(profile["human_gate"]), "settings_file": None}
-
-        logical_mutate(lsid, annotate)
-    log_event("remote_session_created", logical_session_id=lsid, project=project_name, device_id=device_id, agent=AGENT_GROK)
+    early, claim = _claim_project_session(project_name, real, project, profile, repo, request_key, device_id, task, custom_name, AGENT_GROK, project_liveness)
+    if early is not None:
+        return early
+    lsid, launch_token, recovered = claim["lsid"], claim["launch_token"], claim["recovered"]
+    log_event("remote_session_created", logical_session_id=lsid, project=project_name, device_id=device_id, agent=AGENT_GROK, workspace=claim["workspace"]["kind"])
+    workdir, isolation, failure = _open_claimed_workspace(claim, project_name, real, custom_name)
+    if failure is not None:
+        return failure
 
     ok, why, message = store_and_queue_task(lsid, task, device_id)
     if not ok:
@@ -10482,13 +10610,13 @@ def remote_create_grok_session(body, ctx, project_name, real, project, profile, 
         # Same reasoning as the Claude path above: the synchronous wait elapsing
         # is not evidence of failure. The launch token stays valid; only
         # logical_reconcile's real-expiry check may declare this session dead.
-        return 202, _annotate_recovered(dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac"), recovered)
+        return 202, _annotate_launch(dict(logical_public_view(record), note="launch requested; not yet confirmed by the Mac"), recovered, isolation)
     _remove_launch_material(lsid)
     if record.get("state") in LS_TERMINAL:
         reason = ((record.get("failure") or {}).get("reason")) or "the Grok session could not be started"
-        return 502, _annotate_recovered({"logical_session_id": lsid, "state": record.get("state"), "error": "launch_failed", "reason": reason}, recovered)
+        return 502, _annotate_launch({"logical_session_id": lsid, "state": record.get("state"), "error": "launch_failed", "reason": reason}, recovered, isolation)
     log_event("remote_session_running", logical_session_id=lsid, agent=AGENT_GROK)
-    return 201, _annotate_recovered(logical_public_view(logical_read(lsid)), recovered)
+    return 201, _annotate_launch(logical_public_view(logical_read(lsid)), recovered, isolation)
 
 
 def remote_create_session_handler(body, ctx):
@@ -11011,6 +11139,398 @@ def logical_recover(lsid, action, by="local", liveness=None, expect_epoch=None, 
     return ok, why, record
 
 
+# ---------------------------------------------------------------------------
+# Session workspaces: concurrent sessions on one project
+# ---------------------------------------------------------------------------
+#
+# One physical working tree is never shared by two modifying agents. The first
+# session on a project uses the registered project directory (the canonical
+# workspace). While a healthy session occupies it, another launch gets its own
+# `git worktree` beside it, on its own session branch, from a verified base
+# commit, and the existing session is not touched in any way. Ownership is
+# recorded on the logical session (and in a small index), and a worktree is
+# removed only after its session is terminal, its owner is gone, and it holds
+# nothing uncommitted. The session branch is never deleted, so committed work
+# always survives cleanup. A project that cannot be isolated safely (not a Git
+# repository, not the top level of one, no commits, a git operation in
+# progress) keeps blocking, with the reason.
+
+WORKTREE_DIRNAME = ".th-worktrees"
+WORKTREE_GIT_TIMEOUT = 300
+PLANNING_GIT_TIMEOUT = 30  # planning runs under the global create lock: never let a slow read hold it for long
+WORKSPACE_CLEANUP_GRACE = 600.0
+REGENERABLE_IGNORED = ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".DS_Store")
+
+
+def _git_env():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def _git(cwd, args, timeout=WORKTREE_GIT_TIMEOUT, hooks_off=False):
+    """`(returncode, stdout, stderr)`. Read-only commands take no optional locks, so the canonical index is never refreshed."""
+    argv = ["/usr/bin/git", "--no-optional-locks", "-c", "core.fsmonitor=false"] + (["-c", "core.hooksPath=/dev/null"] if hooks_off else []) + list(args)
+    try:
+        proc = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=_git_env(), timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 127, "", exc.__class__.__name__
+    return proc.returncode, proc.stdout.decode("utf-8", "replace"), redact_secrets(proc.stderr.decode("utf-8", "replace")).strip()[:300]
+
+
+def workspaces_index_path():
+    return th_path("remote", "workspaces.json")
+
+
+@contextlib.contextmanager
+def _workspace_lock(project_name):
+    ensure_dirs()
+    fd = os.open(th_path("remote", "worktree-%s.lock" % project_name), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def worktree_root_for(canonical):
+    """`(root, None)` or `(None, reason)`: outside the canonical tree, so it can never show up in it."""
+    configured = remote_config().get("worktree_root")
+    root = configured if isinstance(configured, str) and os.path.isabs(configured) else os.path.join(os.path.dirname(canonical), WORKTREE_DIRNAME)
+    resolved = os.path.realpath(root)
+    if resolved == canonical or resolved.startswith(canonical + os.sep):
+        return None, "the configured worktree_root is inside the project itself"
+    return resolved, None
+
+
+def choose_workspace_base(canonical):
+    """The commit a new isolated workspace starts from, or `(None, reason)`.
+
+    The project's own HEAD when it sits on the repository's default branch (or is
+    detached); otherwise the default branch, because a live session's feature
+    branch is not the right start for an unrelated task. Always a verified commit."""
+    rc, head, _ = _git(canonical, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], timeout=PLANNING_GIT_TIMEOUT)
+    head = head.strip() if rc == 0 else ""
+    if not head:
+        return None, "the repository has no commits to start a workspace from"
+    rc, cur, _ = _git(canonical, ["symbolic-ref", "-q", "--short", "HEAD"], timeout=PLANNING_GIT_TIMEOUT)
+    cur = cur.strip() if rc == 0 and cur.strip() else None
+    candidates = []
+    rc, out, _ = _git(canonical, ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], timeout=PLANNING_GIT_TIMEOUT)
+    if rc == 0 and out.strip():
+        candidates.append(out.strip())
+    candidates += ["origin/main", "origin/master", "main", "master"]
+    default = None
+    for ref in candidates:
+        rc, sha, _ = _git(canonical, ["rev-parse", "--verify", "--quiet", ref + "^{commit}"], timeout=PLANNING_GIT_TIMEOUT)
+        if rc == 0 and sha.strip():
+            default = (ref, sha.strip())
+            break
+    default_local = (default[0].split("/", 1)[-1] if default[0].startswith("origin/") else default[0]) if default else None
+    base = {"head_sha": head, "head_branch": cur}
+    if default is None and cur is not None:
+        base.update(sha=head, ref=cur, note="No default branch could be identified, so the new workspace starts from the main workspace's current branch %s." % cur)
+    elif default is None or cur is None or cur == default_local:
+        base.update(sha=head, ref=cur or "HEAD", note=None)
+    else:
+        base.update(sha=default[1], ref=default[0],
+                    note="The main workspace is on branch %s; the new workspace starts from %s." % (cur, default[0]))
+    return base, None
+
+
+def canonical_dirty_summary(canonical):
+    """Counts only, never names or contents."""
+    rc, out, _ = _git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"], timeout=PLANNING_GIT_TIMEOUT)
+    counts = {"staged": 0, "modified": 0, "untracked": 0}
+    if rc != 0:
+        return dict(counts, unknown=True)
+    for line in out.splitlines():
+        if line.startswith("??"):
+            counts["untracked"] += 1
+        else:
+            if line[:1] not in (" ", "?"):
+                counts["staged"] += 1
+            if line[1:2] not in (" ", "?"):
+                counts["modified"] += 1
+    return counts
+
+
+def plan_session_workspace(project_name, canonical):
+    """`(plan, None)` or `(None, reason)`: can this project safely host a second concurrent session?"""
+    rc, top, err = _git(canonical, ["rev-parse", "--show-toplevel"], timeout=PLANNING_GIT_TIMEOUT)
+    if rc != 0 or not top.strip():
+        return None, "the project is not a Git repository, so a second session cannot be isolated safely"
+    if os.path.realpath(top.strip()) != canonical:
+        return None, "the project directory is not the top level of its Git repository, so a second session cannot be isolated safely"
+    rc, bare, _ = _git(canonical, ["rev-parse", "--is-bare-repository"], timeout=PLANNING_GIT_TIMEOUT)
+    if bare.strip() == "true":
+        return None, "the repository is bare, so a second session cannot be isolated safely"
+    base, why = choose_workspace_base(canonical)
+    if base is None:
+        return None, why
+    root, why = worktree_root_for(canonical)
+    if root is None:
+        return None, why
+    return {"base": base, "root": root, "dirty": canonical_dirty_summary(canonical)}, None
+
+
+def workspace_identity(project_name, plan, lsid):
+    return os.path.join(plan["root"], project_name, lsid), "th/%s/%s" % (project_name, lsid[3:])
+
+
+def _index_update(mutator):
+    update_json_locked(workspaces_index_path(), lambda data: mutator(data.setdefault("worktrees", {})))
+
+
+def create_session_workspace(lsid, project_name, canonical, workspace):
+    """Create the worktree the claim planned. `(True, None)` or `(False, reason)`; on failure nothing of ours is left behind."""
+    path, branch, sha = workspace["path"], workspace["branch"], workspace["base_sha"]
+    with _workspace_lock(project_name):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except OSError as exc:
+            return False, "could not create the workspace folder (%s)" % exc.__class__.__name__
+        if os.path.lexists(path):
+            return False, "the workspace path already exists; refusing to reuse another session's workspace"
+        if _git(canonical, ["check-ref-format", "--branch", branch])[0] != 0:
+            return False, "the session branch name is not valid"
+        if _git(canonical, ["rev-parse", "--verify", "--quiet", "refs/heads/" + branch])[0] == 0:
+            return False, "the session branch already exists; refusing to reuse it"
+        rc, _, err = _git(canonical, ["worktree", "add", "-b", branch, path, sha], hooks_off=True)
+        problem = None
+        if rc != 0:
+            problem = "git could not create the workspace: %s" % (err or "unknown error")
+        else:
+            real = os.path.realpath(path)
+            head = _git(real, ["rev-parse", "HEAD"])[1].strip()
+            cur = _git(real, ["rev-parse", "--abbrev-ref", "HEAD"])[1].strip()
+            common = _git(real, ["rev-parse", "--git-common-dir"])[1].strip()
+            canonical_common = _git(canonical, ["rev-parse", "--git-common-dir"])[1].strip()
+            same_repo = os.path.realpath(os.path.join(real, common)) == os.path.realpath(os.path.join(canonical, canonical_common))
+            if real != path or head != sha or cur != branch or not same_repo:
+                problem = "the new workspace did not verify (path, base commit, branch or repository mismatch)"
+        if problem:
+            # Undo only what this call made, never with force: a fresh workspace has nothing in it to lose.
+            if os.path.lexists(path):
+                _git(canonical, ["worktree", "remove", path])
+            _git(canonical, ["branch", "-d", branch])
+            _git(canonical, ["worktree", "prune"])
+            return False, problem
+        _index_update(lambda index: index.__setitem__(path, {
+            "logical_session_id": lsid, "project": project_name, "branch": branch, "base_sha": sha,
+            "created_utc": utc_stamp(), "state": "active",
+        }))
+    return True, None
+
+
+TOOL_CACHE_DIRS = (".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules")
+
+
+def _unsafe_ignored(path, status_ignored_lines):
+    """Ignored paths that are not provably regenerable caches, so not ours to delete.
+
+    Only these are cache: `.DS_Store`; `*.pyc`/`*.pyo` inside a `__pycache__`; anything inside a tool cache directory
+    (`.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `node_modules`). And even then only when the cache sits under a directory
+    that holds tracked files (or at the top level), so a user-ignored data directory that merely contains a cache-named
+    folder is never treated as disposable. Anything quoted or unparsable is unsafe."""
+    tracked_prefix = {}
+
+    def prefix_tracked(prefix):
+        if not prefix:
+            return True
+        if prefix not in tracked_prefix:
+            rc, out, _ = _git(path, ["ls-files", "--", prefix + "/"])
+            tracked_prefix[prefix] = rc == 0 and bool(out.strip())
+        return tracked_prefix[prefix]
+
+    hits = []
+    for line in status_ignored_lines:
+        if not line.startswith("!! "):
+            continue
+        entry = line[3:]
+        if entry.startswith('"'):
+            hits.append(entry)
+            continue
+        parts = [p for p in entry.split("/") if p]
+        collapsed = entry.endswith("/")
+        safe = False
+        if parts and parts[-1] == ".DS_Store" and not collapsed:
+            safe = True
+        else:
+            for index, part in enumerate(parts):
+                rest = parts[index + 1:]
+                if part in TOOL_CACHE_DIRS and prefix_tracked("/".join(parts[:index])):
+                    safe = True
+                elif part == "__pycache__" and prefix_tracked("/".join(parts[:index])):
+                    if collapsed and index == len(parts) - 1:
+                        walk_ok = True
+                        for root, _dirs, files in os.walk(os.path.join(path, *parts)):
+                            if any(not name.endswith((".pyc", ".pyo")) for name in files):
+                                walk_ok = False
+                                break
+                        safe = walk_ok
+                    else:
+                        safe = len(rest) == 1 and rest[0].endswith((".pyc", ".pyo"))
+                if safe:
+                    break
+        if not safe:
+            hits.append(entry)
+    return hits
+
+
+def workspace_in_use(path):
+    """True when any process has its working directory inside `path`; also True when that cannot be determined (fail closed)."""
+    try:
+        proc = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-d", "cwd", "-Fn"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if proc.returncode not in (0, 1):
+        return True
+    prefix = path.rstrip(os.sep) + os.sep
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        if line.startswith("n") and (line[1:] == path or line[1:].startswith(prefix)):
+            return True
+    return False
+
+
+def cleanup_session_workspace(lsid, liveness=None, now=None, grace=0.0):
+    """Remove a finished session's worktree if, and only if, that is provably safe. Returns a small outcome dict.
+
+    Never force-removes, never deletes the session branch (committed work always
+    survives), never touches a workspace it does not own, and keeps anything with
+    uncommitted or untracked work, an operation in progress, or a live owner."""
+    liveness = liveness or owner_liveness
+    now = time.time() if now is None else now
+    record = logical_read(lsid)
+    ws = (record or {}).get("workspace") or {}
+    if not record or ws.get("kind") != "worktree":
+        return {"state": "not_applicable"}
+    if (ws.get("cleanup") or {}).get("state") == "removed":
+        return {"state": "removed"}
+
+    def keep(state, reason, **extra):
+        outcome = dict(extra, state=state, reason=reason, checked_utc=utc_stamp(), checked_epoch=now)
+
+        def mutate(rec):
+            rec.setdefault("workspace", {})["cleanup"] = outcome
+
+        logical_mutate(lsid, mutate)
+        log_event("session_workspace_kept", logical_session_id=lsid, state=state)
+        return outcome
+
+    if record.get("state") not in LS_TERMINAL:
+        return {"state": "not_terminal", "reason": "the owning session has not ended"}
+    if now - float(record.get("updated_epoch") or 0) < grace:
+        return {"state": "too_soon", "reason": "the session ended moments ago"}
+    if record.get("owner"):
+        verdict, detail = liveness(record, now)
+        if verdict != "dead":  # alive, or not provably gone: never remove a workspace out from under a possible owner
+            return keep("kept_owner_alive", "the owner is not provably gone (%s): %s" % (verdict, detail))
+    path, canonical = ws.get("path"), ws.get("canonical_repository")
+    if not path or not canonical:
+        return keep("kept_unsafe", "the workspace record is incomplete")
+    root = ws.get("root") or worktree_root_for(canonical)[0]
+    index = read_json(workspaces_index_path(), {}) or {}
+    owned = (index.get("worktrees") or {}).get(path) or {}
+    if (root is None or not os.path.realpath(path).startswith(root + os.sep) or owned.get("logical_session_id") != lsid
+            or os.path.realpath(path) != path):
+        return keep("kept_unsafe", "the workspace is not provably owned by this session, so it was left in place")
+    if workspace_in_use(path):
+        return keep("kept_owner_alive", "a process is running inside the workspace (or that could not be checked)")
+    with _workspace_lock(ws.get("project") or record.get("project") or "project"):
+        if not os.path.isdir(path):
+            _git(canonical, ["worktree", "prune"])
+            _index_update(lambda idx: idx.get(path, {}).update(state="removed"))
+            outcome = {"state": "removed", "reason": "the workspace directory was already gone", "checked_utc": utc_stamp()}
+            logical_mutate(lsid, lambda rec: rec["workspace"].__setitem__("cleanup", outcome))
+            return outcome
+        rc, listing, _ = _git(canonical, ["worktree", "list", "--porcelain"])
+        if rc != 0 or ("worktree " + path) not in listing.splitlines():
+            return keep("kept_unsafe", "git does not list this directory as a worktree of the project")
+        rc, status, err = _git(path, ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"])
+        if rc != 0:
+            return keep("kept_unsafe", "the workspace state could not be read: %s" % (err or "git failed"))
+        lines = status.splitlines()
+        dirty = [ln for ln in lines if not ln.startswith("!! ")]
+        if dirty:
+            return keep("kept_dirty", "%d file(s) with uncommitted or untracked changes; left in place" % len(dirty), dirty_files=len(dirty))
+        unsafe = _unsafe_ignored(path, lines)
+        if unsafe:
+            return keep("kept_ignored", "%d ignored file(s) that are not plain caches; left in place" % len(unsafe), ignored_files=len(unsafe))
+        state = capture_repo_state(path)
+        if any(state.get(flag) for flag in ("merge_in_progress", "rebase_in_progress", "cherry_pick_in_progress", "revert_in_progress", "bisect_in_progress")):
+            return keep("kept_unsafe", "a git operation is in progress in the workspace")
+        # Commits are only safe if a branch holds them: HEAD must still be ON the session branch (a detached HEAD, or another
+        # branch, could carry commits that removing the worktree would leave unreachable).
+        rc, head_branch, _ = _git(path, ["symbolic-ref", "-q", "--short", "HEAD"])
+        if rc != 0 or head_branch.strip() != ws.get("branch"):
+            return keep("kept_unsafe", "HEAD is not on the session branch, so commits made here could be lost; left in place")
+        rc, listing_flags, _ = _git(path, ["ls-files", "-v"])
+        if rc != 0 or any(ln[:1].islower() or ln[:1] == "S" for ln in listing_flags.splitlines()):
+            return keep("kept_unsafe", "files hidden from git status (skip-worktree or assume-unchanged) are present; left in place")
+        rc, ahead, _ = _git(path, ["rev-list", "--count", "%s..HEAD" % ws.get("base_sha")])
+        rc, out, err = _git(canonical, ["worktree", "remove", path])  # no --force, ever
+        if rc != 0:
+            return keep("kept_unsafe", "git refused to remove the workspace: %s" % (err or "unknown"))
+        _git(canonical, ["worktree", "prune"])
+        _index_update(lambda idx: idx.get(path, {}).update(state="removed"))
+        outcome = {"state": "removed", "checked_utc": utc_stamp(), "branch_retained": ws.get("branch"),
+                   "commits_on_branch": int(ahead.strip()) if ahead.strip().isdigit() else None}
+        logical_mutate(lsid, lambda rec: rec["workspace"].__setitem__("cleanup", outcome))
+        log_event("session_workspace_removed", logical_session_id=lsid, branch=ws.get("branch"))
+        return outcome
+
+
+def sweep_session_workspaces(now=None, liveness=None, grace=WORKSPACE_CLEANUP_GRACE, recheck=600.0):
+    """Attempt cleanup for finished sessions' worktrees. Cheap when there is nothing to do; never raises."""
+    now = time.time() if now is None else now
+    results = {}
+    for record in logical_list():
+        ws = record.get("workspace") or {}
+        if ws.get("kind") != "worktree" or record.get("state") not in LS_TERMINAL:
+            continue
+        cleanup = ws.get("cleanup") or {}
+        if cleanup.get("state") == "removed":
+            continue
+        if now - float(cleanup.get("checked_epoch") or 0) < recheck:
+            continue
+        try:
+            results[record["logical_session_id"]] = cleanup_session_workspace(record["logical_session_id"], liveness=liveness, now=now, grace=grace)
+        except Exception as exc:  # noqa: BLE001 - a cleanup problem must never disturb the gateway
+            log_event("session_workspace_cleanup_error", logical_session_id=record["logical_session_id"], error=redact_secrets(str(exc))[:200])
+    return results
+
+
+def translate_rules_for_workspace(profile_rules, canonical, workspace_path, deny=False):
+    """Re-target absolute (`//path`) rules that name the project at the session's workspace.
+
+    Only a whole path is matched (`//x/app` is not `//x/app-old`). Allow rules are re-targeted only (the session gets no
+    access to the canonical tree it did not have before); deny rules are kept AND re-targeted, so no protection is lost."""
+    token = "//" + canonical.lstrip("/")
+    pattern = re.compile(re.escape(token) + r"(?![\w.\-])")
+    target = "//" + workspace_path.lstrip("/")
+    out = []
+    for rule in profile_rules:
+        if pattern.search(rule):
+            if deny:
+                out.append(rule)
+            out.append(pattern.sub(lambda match: target, rule))
+        else:
+            out.append(rule)
+    return out
+
+
+def isolated_workspace_deny_rules(canonical):
+    """An isolated session must not edit the canonical tree another session occupies."""
+    root = "//" + canonical.lstrip("/")
+    return ["Edit(%s/**)" % root, "Write(%s/**)" % root]
+
+
+
 def _project_session_summary(record):
     """Who holds a project, for a refusal message. Names and state only: no paths, PIDs or hashes."""
     return {
@@ -11020,10 +11540,11 @@ def _project_session_summary(record):
         "agent_type": agent_type_of(record),
         "created_utc": record.get("created_utc"),
         "updated_utc": record.get("updated_utc"),
+        "workspace_kind": (record.get("workspace") or {}).get("kind") or "canonical",
     }
 
 
-def _project_in_use_payload(project_name, record, why, recovery=None, recovered=None):
+def _project_in_use_payload(project_name, record, why, recovery=None, recovered=None, kind="ambiguous"):
     summary = _project_session_summary(record)
     label = "%s (%s, %s)" % (summary["name"], summary["state"], AGENT_LABELS.get(summary["agent_type"], summary["agent_type"]))
     payload = {
@@ -11031,6 +11552,7 @@ def _project_in_use_payload(project_name, record, why, recovery=None, recovered=
         "logical_session_id": summary["logical_session_id"],
         "session": summary,
         "reason": "Project '%s' is in use by session %s. %s" % (project_name, label, why),
+        "kind": kind,
     }
     if recovery:
         payload["recovery"] = recovery
@@ -11039,28 +11561,18 @@ def _project_in_use_payload(project_name, record, why, recovery=None, recovered=
     return payload
 
 
-def reconcile_project_blockers(project_name, liveness=None, sleep=time.sleep, settle=0.5, now=None):
-    """Before refusing a launch as `project_in_use`, reconcile the sessions holding the project.
+def reconcile_project_occupancy(project_name, liveness=None, sleep=time.sleep, settle=0.5, now=None):
+    """Reconcile every session holding the project (stale ones are recovered exactly as before) and classify the rest.
 
-    Must be called inside the create lock, so two launches cannot both
-    recover, or both take, the same project. Uses the same authoritative
-    owner-health evidence as the supported `session recover ... abandon`:
+    Must be called inside the create lock. Returns `(blocker, recovered, occupants)`:
 
-    * a genuinely live owner keeps blocking, and is never signalled or killed;
-    * an ORPHANED session is abandoned automatically only when a FRESH check
-      says its owner is conclusively dead (never on an earlier verdict, an
-      "unknown", or a session mid-handoff);
-    * a not-yet-orphaned session whose owner is conclusively dead needs two
-      FRESH "dead" verdicts a settle apart, then the ORPHANED transition, then
-      the same abandon (never on "unknown", and with no alert for a session
-      this very launch is recovering);
-    * any failure or ambiguity fails closed with the reason.
-
-    Only sessions of `project_name` are examined or changed. Returns
-    `(blocker_payload_or_None, recovered_list)`.
-    """
+    * `blocker` is set, and the launch must be refused, when any holder is AMBIGUOUS (owner unknown, not conclusively
+      dead, recovery refused or failing, ownership changing): ambiguity always fails closed;
+    * `occupants` are the healthy holders (a live owner, a session mid-handoff, one still starting), which do not
+      block a launch that can be given its own workspace;
+    * `recovered` lists the stale sessions this call abandoned."""
     liveness = liveness or owner_liveness
-    recovered = []
+    recovered, occupants = [], []
     for existing in logical_list():
         if existing.get("project") != project_name or existing.get("state") in LS_TERMINAL:
             continue
@@ -11074,11 +11586,25 @@ def reconcile_project_blockers(project_name, liveness=None, sleep=time.sleep, se
                 project_name, record, "Automatic recovery of the stale session failed and it was left unchanged.",
                 recovery={"attempted": True, "outcome": "failed", "detail": redact_secrets(str(exc))[:200]},
             )
-        if blocker is not None:
-            if recovered:
-                blocker["auto_recovered"] = list(recovered)
-            return blocker, recovered
-    return None, recovered
+        if blocker is None:
+            continue
+        if blocker.get("kind") in ("live", "starting"):
+            occupants.append(blocker)
+            continue
+        if recovered:
+            blocker["auto_recovered"] = list(recovered)
+        return blocker, recovered, occupants
+    return None, recovered, occupants
+
+
+def reconcile_project_blockers(project_name, liveness=None, sleep=time.sleep, settle=0.5, now=None):
+    """Compatibility view of reconcile_project_occupancy: any holder at all is a blocker. `(blocker_or_None, recovered)`."""
+    blocker, recovered, occupants = reconcile_project_occupancy(project_name, liveness=liveness, sleep=sleep, settle=settle, now=now)
+    if blocker is None and occupants:
+        blocker = dict(occupants[0])
+        if recovered:
+            blocker["auto_recovered"] = list(recovered)
+    return blocker, recovered
 
 
 def _mark_orphaned_if_dead(lsid, liveness, detail):
@@ -11110,14 +11636,14 @@ def _reconcile_stale_session(lsid, project_name, liveness, sleep, settle, now, r
         record = logical_reconcile(lsid, liveness=liveness, now=clock) or record
         if record.get("state") in LS_TERMINAL:
             return None
-        return _project_in_use_payload(project_name, record, "It is still starting; wait for it to register or fail, then retry.")
+        return _project_in_use_payload(project_name, record, "It is still starting; wait for it to register or fail, then retry.", kind="starting")
     if state != LS_ORPHANED:
         if _handoff_in_progress(record, clock):
-            return _project_in_use_payload(project_name, record, "It is being handed over to a successor; retry shortly.")
+            return _project_in_use_payload(project_name, record, "It is being handed over to a successor; retry shortly.", kind="live")
         verdict, detail = liveness(record, clock)
         if verdict != "dead":
             note = "Its owner is alive." if verdict == "alive" else "Its owner state could not be proven either way (%s)." % detail
-            return _project_in_use_payload(project_name, record, note + " Wait for it to finish or stop it, then retry.")
+            return _project_in_use_payload(project_name, record, note + " Wait for it to finish or stop it, then retry.", kind="live" if verdict == "alive" else "ambiguous")
         # Conclusively dead but not yet marked: two FRESH "dead" verdicts, a settle apart, then the same ORPHANED
         # transition. Unlike a strict reconcile this never orphans on "unknown" and sends no alert for a session
         # the same request is about to abandon.
@@ -14126,7 +14652,7 @@ def main(argv=None):
         "action",
         choices=(
             "list", "show", "stop", "pause", "resume", "post", "inbox", "ack", "note", "check",
-            "wait", "gate", "consume", "decide", "recover", "reconcile", "hook-stop", "rename", "task",
+            "wait", "gate", "consume", "decide", "recover", "reconcile", "hook-stop", "rename", "task", "workspace-cleanup",
         ),
     )
     p.add_argument("--part", type=int, default=None, help="with `task`: print this 1-based part of the stored task verbatim")
