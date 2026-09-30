@@ -383,6 +383,57 @@ Trade-off: a remote session does not load the repository's own
 `.claude/settings*.json` (including any project hooks). `CLAUDE.md` files still
 load.
 
+### The Nova operator profile (one project only)
+
+On 30 September 2026 the owner decided that sessions of the `nova` project may
+ship without him at a Terminal. That grant is an **elevation** checked in code,
+not a looser profile. It follows these rules:
+
+- **It applies to one project only.** A profile may ask for it by name with
+  `"elevation": "nova-operator"` (and must be named `nova-operator`). It
+  validates only when stored for the project registered as `nova`. For any
+  other project, or when copied into another project's entry, it is refused. A
+  Grok session on `nova` gets the profile with the elevation removed.
+- **It waives only the deployment gates.** It may omit the `production
+  deployment`, `production restart` and `rollback` gates. It must then carry the
+  narrower gate `production deploy, restart or rollback by any path other than
+  nova-ops deploy/rollback/privd`. All other mandatory gates stay.
+- **It must deny the direct routes around `nova-ops`:** `Bash(git push:*)`,
+  `Bash(gh pr merge:*)`, `Bash(gh api:*)`, `Bash(git remote:*)` and
+  `Bash(sudo:*)`. `UNALLOWABLE_COMMANDS` is unchanged, so none of these can be
+  allow rules either.
+- **What the session gains at launch.** Terminal Handoff adds allow rules for
+  `terminal-handoff.py nova-ops push|merge|deploy|rollback|status|privd`. These
+  run from the installed file, which a Nova session cannot edit. Deployment
+  tooling always comes from a clean `git archive` of a commit in origin/main,
+  never from a checkout the session can edit. The session prompt lists the
+  commands.
+
+Register it once, locally:
+
+```sh
+TH="python3 ~/.claude/terminal-handoff/terminal-handoff.py"
+$TH project add nova /Users/johngavin/Nova
+$TH project permissions edit nova --from-file docs/nova-operator-profile.json
+$TH project enable-remote nova
+$TH project list        # "permissions": "valid"
+```
+
+What `nova-ops` checks:
+
+| Command | Checks |
+| --- | --- |
+| `push` | Only a checkout or worktree of the `nova` project. Only the checked-out feature branch, never `main`/`master` or a detached HEAD. The refspec is explicit and non-forcing (`refs/heads/B:refs/heads/B`). |
+| `merge PR --sha HEAD` | The PR is OPEN, not a draft, based on `main`, and not from a fork. Its head equals the SHA given. The review decision is not `CHANGES_REQUESTED`/`REVIEW_REQUIRED`. The merge state is `CLEAN`. "Architecture Validation" and "Safety Boundary Gate" are green and no other check is failing or running. The merge uses `gh pr merge --merge --match-head-commit`, never `--admin`. |
+| `deploy SHA --instruction "..."` | A full 40-character SHA, contained in origin/main after a fetch, with green CI (it waits up to `--wait-ci` seconds). The tool at that SHA is extracted with `git archive`. It runs `nova_deploy.py authorize` (which records the quoted instruction and the session), then `deploy`, then `verify`. Nova's lock, ledger, merged check, health proof and automatic rollback all apply. |
+| `rollback SHA --instruction "..."` | The same, using the tool at the origin/main tip. The Nova tool accepts only a release its ledger shows was deployed and proven. |
+| `privd VERB ...` | `sudo -n /Library/Nova/bin/nova-privd` with only `status`, `list-pending`, `request-mint`, `deploy`, `rollback` and `restart`, each with validated flags. The verbs that need a password and a terminal are never reachable. |
+
+The owner's quoted instruction is **attribution and audit evidence, not a
+security boundary**. A process running as the same macOS user can still write a
+receipt or move a pointer by hand. Closing that requires the root-owned
+`nova-privd` authority.
+
 ## Folder trust (one-time human step per project)
 
 Claude Code asks *"Is this a project you created or one you trust?"* the first

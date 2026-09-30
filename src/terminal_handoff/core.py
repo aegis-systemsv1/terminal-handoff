@@ -7135,7 +7135,7 @@ MANDATORY_HUMAN_GATES = (
     "security configuration changes",
     "irreversible external action",
 )
-PERMISSION_PROFILE_KEYS = ("profile", "description", "allow", "deny", "human_gate")
+PERMISSION_PROFILE_KEYS = ("profile", "description", "allow", "deny", "human_gate", "elevation")
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob", "LS")
 FILE_EDIT_ALIASES = ("Write", "MultiEdit", "NotebookEdit")
 # Command families that may never be pre-approved: they are gates or native prompts.
@@ -7146,6 +7146,25 @@ UNALLOWABLE_COMMANDS = re.compile(
     r"terraform|kubectl|helm|docker|vercel|fly|flyctl|gcloud|aws|az|heroku|netlify|firebase|supabase)\b"
 )
 BROAD_SPECIFIERS = ("*", ":*", "**", "*:*")
+
+# The Nova operator grant (owner decision, 30 September 2026). Exactly one registered
+# project name may carry it, and only when its profile asks for it by name. It waives
+# the deployment and rollback gates, because those now run only through the fixed
+# `nova-ops` commands that Terminal Handoff itself adds at launch (see NOVA_OPS_*
+# below). It never loosens UNALLOWABLE_COMMANDS: a raw `git push`, `gh pr merge` or
+# `sudo` stays denied, and every other project keeps every mandatory gate.
+NOVA_OPERATOR_PROJECT = "nova"
+NOVA_OPERATOR_ELEVATION = "nova-operator"
+NOVA_OPERATOR_WAIVED_GATES = ("production deployment", "production restart", "rollback")
+NOVA_OPERATOR_SCOPED_GATE = "production deploy, restart or rollback by any path other than nova-ops deploy/rollback/privd"
+# The direct routes around nova-ops. An operator profile must deny all of them.
+NOVA_OPERATOR_REQUIRED_DENY = (
+    "Bash(git push:*)",
+    "Bash(gh pr merge:*)",
+    "Bash(gh api:*)",
+    "Bash(git remote:*)",
+    "Bash(sudo:*)",
+)
 
 
 def starter_permission_profile():
@@ -7166,8 +7185,13 @@ def starter_permission_profile():
     }
 
 
-def validate_permission_profile(profile):
-    """Return a list of problems. An empty list means the profile is valid."""
+def validate_permission_profile(profile, project_name=None):
+    """Return a list of problems. An empty list means the profile is valid.
+
+    `project_name` is the registered name the profile is for. It matters only to
+    an elevated profile, which is refused when the name is absent or not the one
+    project the elevation belongs to.
+    """
     problems = []
     if not isinstance(profile, dict):
         return ["profile must be a JSON object"]
@@ -7195,10 +7219,48 @@ def validate_permission_profile(profile):
     if not isinstance(gates, list) or not all(isinstance(g, str) and 0 < len(g) <= 120 for g in gates):
         problems.append("human_gate must be a list of short strings")
         gates = []
+    elevated = "elevation" in profile
+    if elevated:
+        problems.extend(_validate_elevation(profile, project_name, gates, deny))
+    waived = NOVA_OPERATOR_WAIVED_GATES if elevated else ()
     for required in MANDATORY_HUMAN_GATES:
-        if required not in gates:
+        if required not in gates and required not in waived:
             problems.append("human_gate must include %r" % required)
     return problems
+
+
+def _validate_elevation(profile, project_name, gates, deny):
+    if profile.get("elevation") != NOVA_OPERATOR_ELEVATION:
+        return ["unknown elevation %r" % (profile.get("elevation"),)]
+    if project_name != NOVA_OPERATOR_PROJECT:
+        return ["elevation %r belongs only to project %r" % (NOVA_OPERATOR_ELEVATION, NOVA_OPERATOR_PROJECT)]
+    problems = []
+    if profile.get("profile") != NOVA_OPERATOR_ELEVATION:
+        problems.append("an elevated profile must be named %r" % NOVA_OPERATOR_ELEVATION)
+    if NOVA_OPERATOR_SCOPED_GATE not in gates:
+        problems.append("human_gate must include %r" % NOVA_OPERATOR_SCOPED_GATE)
+    for rule in NOVA_OPERATOR_REQUIRED_DENY:
+        if rule not in deny:
+            problems.append("an elevated profile must deny %r" % rule)
+    return problems
+
+
+def without_elevation(profile):
+    """The profile with any elevation removed and every mandatory gate restored."""
+    if not isinstance(profile, dict) or "elevation" not in profile:
+        return profile
+    gates = [g for g in profile.get("human_gate", []) if g != NOVA_OPERATOR_SCOPED_GATE]
+    gates += [g for g in MANDATORY_HUMAN_GATES if g not in gates]
+    return dict({k: v for k, v in profile.items() if k != "elevation"}, human_gate=gates)
+
+
+def profile_is_nova_operator(profile, project_name):
+    return (
+        isinstance(profile, dict)
+        and profile.get("elevation") == NOVA_OPERATOR_ELEVATION
+        and project_name == NOVA_OPERATOR_PROJECT
+        and not validate_permission_profile(profile, project_name)
+    )
 
 
 def _validate_tool_rule(entry, allowing):
@@ -7306,13 +7368,16 @@ def project_resolve(name):
     return current, project, None
 
 
-def project_permissions_ok(project):
-    """`(profile, None)` when the stored profile validates and is unchanged."""
+def project_permissions_ok(project, name=None):
+    """`(profile, None)` when the stored profile validates and is unchanged.
+
+    `name` is the project's registered name; an elevated profile never validates without it.
+    """
     permissions = (project or {}).get("permissions")
     if not isinstance(permissions, dict) or not isinstance(permissions.get("profile"), dict):
         return None, "no remote permission profile is configured"
     profile = permissions["profile"]
-    problems = validate_permission_profile(profile)
+    problems = validate_permission_profile(profile, name)
     if problems:
         return None, "permission profile is invalid: %s" % problems[0]
     if permissions.get("validated_sha256") != permission_profile_hash(profile):
@@ -7321,7 +7386,7 @@ def project_permissions_ok(project):
 
 
 def project_set_permissions(name, profile):
-    problems = validate_permission_profile(profile)
+    problems = validate_permission_profile(profile, name)
     if problems:
         return False, problems
     outcome = {}
@@ -7353,7 +7418,7 @@ def project_set_remote_launch(name, enabled):
             outcome["error"] = "unknown project"
             return
         if enabled:
-            _, why = project_permissions_ok(project)
+            _, why = project_permissions_ok(project, name)
             if why:
                 outcome["error"] = why
                 return
@@ -7372,7 +7437,7 @@ def cmd_project(args):
     if action == "list":
         rows = []
         for name, project in sorted(projects_load().items()):
-            _, why = project_permissions_ok(project)
+            _, why = project_permissions_ok(project, name)
             rows.append(
                 {
                     "name": name,
@@ -7429,9 +7494,9 @@ def cmd_project(args):
             print(json.dumps(stored or {"note": "no profile configured; run `project permissions edit %s`" % name}, indent=2))
             return 0
         if sub == "validate":
-            profile, why = project_permissions_ok(project)
+            profile, why = project_permissions_ok(project, name)
             if why and isinstance(stored, dict):
-                problems = validate_permission_profile(stored)
+                problems = validate_permission_profile(stored, name)
                 if not problems:
                     ok, _ = project_set_permissions(name, stored)  # unchanged and valid: record it
                     print("valid" if ok else "invalid")
@@ -8912,7 +8977,7 @@ proceed on your own judgement. Remote approval of these gates is not yet
 available: the user must answer in this session. Native Claude permission
 prompts are separate and are answered only by the user. Never use the
 --dangerously-skip-permissions flag or any permission bypass, and never clear a STOP.
-
+{{OPERATOR_NOTE}}
 Terminal Handoff is active in this session and will hand you over to a
 successor session near the context limit. Allow that to happen.
 
@@ -9117,6 +9182,23 @@ def _workspace_note(record):
     )
 
 
+def nova_operator_note(record, profile):
+    if not profile_is_nova_operator(profile, record.get("project")):
+        return ""
+    th = "%s %s" % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__)))
+    return (
+        "\nNOVA OPERATOR. The owner authorised this project's sessions to ship without him at a\n"
+        "Terminal, through these commands only (raw git push, gh pr merge and sudo stay denied):\n"
+        "    %(th)s nova-ops push                      push the checked-out feature branch\n"
+        "    %(th)s nova-ops merge PR --sha HEADSHA    merge a PR whose CI is green\n"
+        "    %(th)s nova-ops deploy SHA --instruction \"<owner's words, verbatim>\" [--service-key K]\n"
+        "    %(th)s nova-ops rollback SHA --instruction \"<owner's words, verbatim>\" [--service-key K]\n"
+        "    %(th)s nova-ops status | privd VERB ...\n"
+        "Deploy or roll back only when the owner has explicitly instructed it, quoting his words;\n"
+        "the quote is recorded with this session's identity. Report the verified result.\n" % {"th": th}
+    )
+
+
 def render_remote_prompt(record, profile):
     gates = "\n".join("  - %s" % gate for gate in (profile or {}).get("human_gate", []))
     values = {
@@ -9125,6 +9207,7 @@ def render_remote_prompt(record, profile):
         "{{WORKING_DIRECTORY}}": str(record.get("repository")),
         "{{WORKSPACE_NOTE}}": _workspace_note(record),
         "{{HUMAN_GATES}}": gates or "  - (none recorded)",
+        "{{OPERATOR_NOTE}}": nova_operator_note(record, profile),
         "{{TH_COMMAND}}": "%s %s" % (shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__))),
         "{{TH_VERSION}}": TERMINAL_HANDOFF_VERSION,
     }
@@ -9254,6 +9337,385 @@ def write_permission_settings(lsid, profile, repository=None):
         settings["permissions"]["disableAutoMode"] = "disable"  # no mode chosen: never turn auto mode on implicitly
     write_json_private(path, settings)
     return path
+
+
+# -- Nova operator commands (`nova-ops`) --------------------------------------
+#
+# Owner decision, 30 September 2026: a session of the `nova` project running the
+# nova-operator profile may push its own feature branch, merge a PR whose CI is
+# green, and deploy or roll back an exact merged SHA without John at a Terminal.
+# Those are exactly the operations below. Each one is run by THIS installed file,
+# which a Nova session cannot edit, never by code from a Nova checkout the session
+# can edit: deployment tooling always comes from a clean `git archive` of a commit
+# already contained in origin/main. The session gets these commands, not `git push`,
+# `gh pr merge` or `sudo`, which its profile still denies.
+#
+# Nova's own guards all stay in force: its deploy lock, audit ledger, merged-to-main
+# check, health proof and automatic rollback. So does its one-use receipt, which now
+# records John's quoted instruction and the session that acted on it. That receipt is
+# attribution and audit evidence, not a security boundary.
+
+NOVA_OPS_PYTHON = "/usr/local/bin/python3.11"
+NOVA_OPS_TOOL = "scripts/nova_deploy.py"
+NOVA_PRIVD = "/Library/Nova/bin/nova-privd"
+NOVA_REQUIRED_CHECKS = ("Architecture Validation", "Safety Boundary Gate")
+NOVA_PROTECTED_BRANCHES = ("main", "master", "HEAD")
+NOVA_OK_CONCLUSIONS = ("SUCCESS", "NEUTRAL", "SKIPPED")
+NOVA_OPS_SUBCOMMANDS = ("push", "merge", "deploy", "rollback", "status", "privd")
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+NOVA_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
+NOVA_SERVICE_KEY_RE = re.compile(r"^[a-z][a-z0-9-]{0,40}$")
+NOVA_INSTRUCTION_MIN, NOVA_INSTRUCTION_MAX = 12, 2000
+# nova-privd verbs a session may use: the ones the root authority gates itself.
+# Password-and-terminal verbs (install, approve, set-policy, break-glass...) are not here.
+NOVA_PRIVD_VERBS = {
+    "status": {"--json": None},
+    "list-pending": {},
+    "request-mint": {"--sha": SHA40_RE, "--action": re.compile(r"^(deploy|rollback)$"),
+                     "--session": re.compile(r"^[A-Za-z0-9._:-]{1,80}$"), "--reason": re.compile(r"^[^\x00-\x1f]{1,300}$"),
+                     "--service": NOVA_SERVICE_KEY_RE},
+    "deploy": {"--receipt": re.compile(r"^[0-9a-f]{32}$"), "--session": re.compile(r"^[A-Za-z0-9._:-]{1,80}$"),
+               "--service": NOVA_SERVICE_KEY_RE},
+    "rollback": {"--receipt": re.compile(r"^[0-9a-f]{32}$"), "--session": re.compile(r"^[A-Za-z0-9._:-]{1,80}$"),
+                 "--service": NOVA_SERVICE_KEY_RE},
+    "restart": {"--service": re.compile(r"^(automation-core|watchdog|gui-launch-watchdog)$")},
+}
+
+
+class NovaOpsRefused(Exception):
+    pass
+
+
+def nova_ops_allow_rules():
+    """The pre-approved nova-ops commands, added at launch to a nova-operator session only."""
+    base = "%s %s" % (sys.executable or "python3", os.path.abspath(__file__))
+    if any(ch in base for ch in "()," ) or base.count(" ") != 1:
+        return []
+    return ["Bash(%s nova-ops %s:*)" % (base, sub) for sub in NOVA_OPS_SUBCOMMANDS]
+
+
+def nova_ops_env():
+    """The agent's environment minus anything that could redirect git, Python or Nova's layout."""
+    env = {}
+    for key, value in os.environ.items():
+        if key.startswith(("GIT_", "PYTHON", "NOVA_")) or key in ("GH_REPO", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"):
+            continue
+        env[key] = value
+    return env
+
+
+def _nova_run(argv, cwd=None, timeout=300, capture=True, runner=None):
+    runner = runner or subprocess.run
+    return runner(argv, cwd=cwd, env=nova_ops_env(), timeout=timeout, text=True,
+                  capture_output=capture, stdin=subprocess.DEVNULL)
+
+
+def _nova_git(repo, *args, timeout=300, runner=None):
+    out = _nova_run(["git", "-C", repo] + list(args), timeout=timeout, runner=runner)
+    if out.returncode != 0:
+        raise NovaOpsRefused("git %s failed: %s" % (args[0], (out.stderr or out.stdout or "").strip()[:300]))
+    return (out.stdout or "").strip()
+
+
+def nova_ops_canonical():
+    """The registered nova project's checkout, only while it runs the valid nova-operator profile."""
+    real, project, why = project_resolve(NOVA_OPERATOR_PROJECT)
+    if real is None:
+        raise NovaOpsRefused("the %r project is not registered: %s" % (NOVA_OPERATOR_PROJECT, why))
+    profile, why = project_permissions_ok(project, NOVA_OPERATOR_PROJECT)
+    if not profile_is_nova_operator(profile, NOVA_OPERATOR_PROJECT):
+        raise NovaOpsRefused("the %r project does not run a valid nova-operator profile: %s" % (NOVA_OPERATOR_PROJECT, why))
+    return real
+
+
+def nova_repo_slug(url):
+    match = re.match(r"^(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", url or "")
+    if not match:
+        raise NovaOpsRefused("origin is not a GitHub repository: %r" % url)
+    return match.group(1)
+
+
+def nova_checks_verdict(checks):
+    """`(ok, pending, reason)` for a list of `{name, status, conclusion}` CI results.
+
+    Every required check must have succeeded, and no other check may be failing or
+    still running.
+    """
+    seen = {}
+    for check in checks or []:
+        name = check.get("name") or check.get("context") or "?"
+        status = str(check.get("status") or "COMPLETED").upper()
+        conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
+        seen.setdefault(name, []).append((status, conclusion))
+    pending = []
+    for name, results in sorted(seen.items()):
+        for status, conclusion in results:
+            if status != "COMPLETED" or conclusion in ("", "PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS"):
+                pending.append(name)
+            elif conclusion not in NOVA_OK_CONCLUSIONS:
+                return False, False, "check %r concluded %s" % (name, conclusion)
+    missing = [name for name in NOVA_REQUIRED_CHECKS if name not in seen]
+    if pending:
+        return False, True, "checks still running: %s" % ", ".join(sorted(set(pending)))
+    if missing:
+        return False, True, "required checks not reported yet: %s" % ", ".join(missing)
+    for name in NOVA_REQUIRED_CHECKS:
+        if not any(c == "SUCCESS" for _, c in seen[name]):
+            return False, False, "required check %r did not succeed" % name
+    return True, False, "CI green"
+
+
+def nova_session_identity():
+    return {
+        "claude_session": os.environ.get("CLAUDE_CODE_SESSION_ID"),
+        "logical_session": os.environ.get("CLAUDE_TERMINAL_HANDOFF_LOGICAL_SESSION"),
+    }
+
+
+def nova_ops_push(cwd, runner=None):
+    canonical = nova_ops_canonical()
+    top = _nova_git(cwd, "rev-parse", "--show-toplevel", runner=runner)
+    common = os.path.realpath(_nova_git(top, "rev-parse", "--path-format=absolute", "--git-common-dir", runner=runner))
+    canonical_common = os.path.realpath(_nova_git(canonical, "rev-parse", "--path-format=absolute", "--git-common-dir", runner=runner))
+    if common != canonical_common:
+        raise NovaOpsRefused("%s is not a checkout or worktree of the nova project" % top)
+    branch = _nova_run(["git", "-C", top, "symbolic-ref", "--quiet", "--short", "HEAD"], runner=runner)
+    branch = (branch.stdout or "").strip() if branch.returncode == 0 else ""
+    if not branch:
+        raise NovaOpsRefused("HEAD is detached: check out your feature branch first")
+    if (branch in NOVA_PROTECTED_BRANCHES or not NOVA_BRANCH_RE.match(branch) or ".." in branch
+            or branch.endswith((".lock", "/"))):
+        raise NovaOpsRefused("refusing to push %r: only a feature branch may be pushed, never main" % branch)
+    url = _nova_git(top, "remote", "get-url", "--push", "origin", runner=runner)
+    if url != _nova_git(canonical, "remote", "get-url", "--push", "origin", runner=runner):
+        raise NovaOpsRefused("origin of this checkout differs from the nova project's origin")
+    sha = _nova_git(top, "rev-parse", "HEAD", runner=runner)
+    # An explicit, non-forcing refspec: no `+`, no --force, same branch name on origin.
+    _nova_git(top, "push", "--porcelain", "-u", "origin", "refs/heads/%s:refs/heads/%s" % (branch, branch), runner=runner)
+    log_event("nova_ops_push", branch=branch, sha=sha, **nova_session_identity())
+    return {"pushed": branch, "sha": sha}
+
+
+NOVA_PR_FIELDS = "number,state,isDraft,baseRefName,headRefName,headRefOid,mergeStateStatus,reviewDecision,isCrossRepository,statusCheckRollup,mergeCommit"
+
+
+def nova_pr_merge_problems(pr, sha):
+    """Everything wrong with merging `pr` at `sha`; an empty list means it may be merged."""
+    problems = []
+    if pr.get("state") != "OPEN":
+        problems.append("PR is %s, not OPEN" % pr.get("state"))
+    if pr.get("isDraft"):
+        problems.append("PR is a draft")
+    if pr.get("baseRefName") != "main":
+        problems.append("PR targets %r, not main" % pr.get("baseRefName"))
+    if pr.get("headRefName") in NOVA_PROTECTED_BRANCHES:
+        problems.append("PR head is a protected branch")
+    if pr.get("isCrossRepository"):
+        problems.append("PR comes from a fork")
+    if pr.get("headRefOid") != sha:
+        problems.append("PR head is %s, not the approved %s" % (str(pr.get("headRefOid"))[:12], sha[:12]))
+    if pr.get("reviewDecision") in ("CHANGES_REQUESTED", "REVIEW_REQUIRED"):
+        problems.append("review decision is %s" % pr.get("reviewDecision"))
+    if pr.get("mergeStateStatus") not in ("CLEAN", "HAS_HOOKS"):
+        problems.append("merge state is %s, not CLEAN" % pr.get("mergeStateStatus"))
+    ok, _, reason = nova_checks_verdict(pr.get("statusCheckRollup"))
+    if not ok:
+        problems.append("CI: %s" % reason)
+    return problems
+
+
+def nova_ops_merge(number, sha, runner=None, wait_seconds=0, sleep=time.sleep):
+    if not SHA40_RE.match(sha or ""):
+        raise NovaOpsRefused("name the approved PR head as a full 40-character SHA")
+    canonical = nova_ops_canonical()
+    slug = nova_repo_slug(_nova_git(canonical, "remote", "get-url", "origin", runner=runner))
+    deadline = time.time() + max(0, wait_seconds)
+    while True:
+        out = _nova_run(["gh", "pr", "view", str(int(number)), "--repo", slug, "--json", NOVA_PR_FIELDS], runner=runner)
+        if out.returncode != 0:
+            raise NovaOpsRefused("gh pr view failed: %s" % (out.stderr or "").strip()[:300])
+        pr = json.loads(out.stdout)
+        problems = nova_pr_merge_problems(pr, sha)
+        _, pending, _ = nova_checks_verdict(pr.get("statusCheckRollup"))
+        if not problems or not (pending or pr.get("mergeStateStatus") in ("UNKNOWN", "BLOCKED", "UNSTABLE")) or time.time() >= deadline:
+            break
+        sleep(20)
+    if problems:
+        log_event("nova_ops_merge_refused", pr=int(number), sha=sha, problems=problems, **nova_session_identity())
+        raise NovaOpsRefused("refusing to merge PR #%s: %s" % (number, "; ".join(problems)))
+    # --match-head-commit makes GitHub refuse if the head moved after the checks above.
+    out = _nova_run(["gh", "pr", "merge", str(int(number)), "--repo", slug, "--merge", "--match-head-commit", sha], runner=runner)
+    if out.returncode != 0:
+        raise NovaOpsRefused("gh pr merge failed: %s" % (out.stderr or out.stdout or "").strip()[:300])
+    after = json.loads(_nova_run(["gh", "pr", "view", str(int(number)), "--repo", slug, "--json", "state,mergeCommit"], runner=runner).stdout or "{}")
+    merge_sha = ((after.get("mergeCommit") or {}).get("oid"))
+    log_event("nova_ops_merge", pr=int(number), head_sha=sha, merge_sha=merge_sha, state=after.get("state"), **nova_session_identity())
+    return {"merged": int(number), "state": after.get("state"), "merge_commit": merge_sha}
+
+
+def nova_commit_checks(slug, sha, runner=None):
+    out = _nova_run(["gh", "api", "repos/%s/commits/%s/check-runs?per_page=100" % (slug, sha)], runner=runner)
+    if out.returncode != 0:
+        raise NovaOpsRefused("could not read CI for %s: %s" % (sha[:12], (out.stderr or "").strip()[:300]))
+    return [{"name": r.get("name"), "status": r.get("status"), "conclusion": r.get("conclusion")}
+            for r in json.loads(out.stdout).get("check_runs", [])]
+
+
+def nova_ops_workdir():
+    path = th_path("state", "nova-ops")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def nova_extract_tree(canonical, sha, dest, runner=None):
+    """A clean copy of exactly `sha`'s committed files: `git archive`, never a working tree."""
+    import tarfile
+
+    runner = runner or subprocess.run
+    tar_path = os.path.join(dest, "tree.tar")
+    with open(tar_path, "wb") as handle:
+        out = runner(["git", "-C", canonical, "archive", "--format=tar", sha], stdout=handle, stderr=subprocess.PIPE,
+                     env=nova_ops_env(), timeout=300, stdin=subprocess.DEVNULL)
+    if out.returncode != 0:
+        raise NovaOpsRefused("git archive %s failed" % sha[:12])
+    tree = os.path.join(dest, "tree")
+    os.makedirs(tree, mode=0o700)
+    with tarfile.open(tar_path) as archive:
+        archive.extractall(tree, filter="data")
+    os.unlink(tar_path)
+    tool = os.path.join(tree, NOVA_OPS_TOOL)
+    if not os.path.isfile(tool):
+        raise NovaOpsRefused("%s has no %s" % (sha[:12], NOVA_OPS_TOOL))
+    return tree
+
+
+def nova_ops_deploy(sha, service_key, instruction, rollback=False, wait_ci=1200, runner=None, sleep=time.sleep,
+                    python=NOVA_OPS_PYTHON):
+    """Deploy (or roll back to) exactly `sha`, running the deploy tool from a clean archive.
+
+    A deploy runs the tool at `sha` itself, which must be in origin/main with green CI. A
+    rollback runs the tool at the current origin/main tip; the Nova tool limits its target
+    to a release the ledger shows was once deployed and proven.
+    """
+    if not SHA40_RE.match(sha or ""):
+        raise NovaOpsRefused("name the exact commit as a full 40-character SHA, not a ref")
+    if not NOVA_SERVICE_KEY_RE.match(service_key or ""):
+        raise NovaOpsRefused("malformed service key")
+    text = " ".join((instruction or "").split())
+    if not NOVA_INSTRUCTION_MIN <= len(text) <= NOVA_INSTRUCTION_MAX:
+        raise NovaOpsRefused("quote John's instruction verbatim with --instruction (%d-%d characters)"
+                             % (NOVA_INSTRUCTION_MIN, NOVA_INSTRUCTION_MAX))
+    action = "rollback" if rollback else "deploy"
+    canonical = nova_ops_canonical()
+    slug = nova_repo_slug(_nova_git(canonical, "remote", "get-url", "origin", runner=runner))
+    identity = nova_session_identity()
+    log_event("nova_ops_%s_requested" % action, sha=sha, service_key=service_key,
+              instruction_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(), **identity)
+    _nova_git(canonical, "fetch", "origin", "--prune", "--quiet", runner=runner)
+    main_sha = _nova_git(canonical, "rev-parse", "origin/main", runner=runner)
+    if not rollback:
+        contained = _nova_run(["git", "-C", canonical, "merge-base", "--is-ancestor", sha, main_sha], runner=runner)
+        if contained.returncode != 0:
+            raise NovaOpsRefused("%s is not contained in origin/main (%s)" % (sha[:12], main_sha[:12]))
+        deadline = time.time() + max(0, wait_ci)
+        while True:
+            ok, pending, reason = nova_checks_verdict(nova_commit_checks(slug, sha, runner=runner))
+            if ok or not pending or time.time() >= deadline:
+                break
+            sleep(20)
+        if not ok:
+            log_event("nova_ops_deploy_refused", sha=sha, reason=reason, **identity)
+            raise NovaOpsRefused("CI gate for %s: %s" % (sha[:12], reason))
+    tool_sha = main_sha if rollback else sha
+    import tempfile
+
+    work = tempfile.mkdtemp(prefix="nova-ops-", dir=nova_ops_workdir())
+    try:
+        tree = nova_extract_tree(canonical, tool_sha, work, runner=runner)
+        tool = os.path.join(tree, NOVA_OPS_TOOL)
+        mint = [python, tool, "authorize", sha, "--service-key", service_key, "--instruction", text]
+        if rollback:
+            mint.append("--rollback")
+        minted = _nova_run(mint, cwd=tree, timeout=600, capture=False, runner=runner)
+        if minted.returncode != 0:
+            raise NovaOpsRefused("the Nova tool refused to record the owner instruction (exit %s)" % minted.returncode)
+        move = [python, tool, action, sha, "--service-key", service_key]
+        moved = _nova_run(move, cwd=tree, timeout=3600, capture=False, runner=runner)
+        verified = _nova_run([python, tool, "verify"], cwd=tree, timeout=600, capture=False, runner=runner) if moved.returncode == 0 else None
+    finally:
+        import shutil
+
+        shutil.rmtree(work, ignore_errors=True)
+    outcome = "ok" if moved.returncode == 0 and verified is not None and verified.returncode == 0 else "failed"
+    log_event("nova_ops_%s" % action, sha=sha, service_key=service_key, tool_sha=tool_sha, outcome=outcome,
+              exit_code=moved.returncode, verify_exit=None if verified is None else verified.returncode, **identity)
+    if outcome != "ok":
+        raise NovaOpsRefused("%s of %s did not complete and verify (exit %s); see the output above"
+                             % (action, sha[:12], moved.returncode))
+    return {"action": action, "sha": sha, "service_key": service_key, "tool_sha": tool_sha, "verified": True}
+
+
+def nova_ops_status(runner=None, python=NOVA_OPS_PYTHON):
+    canonical = nova_ops_canonical()
+    _nova_git(canonical, "fetch", "origin", "--prune", "--quiet", runner=runner)
+    main_sha = _nova_git(canonical, "rev-parse", "origin/main", runner=runner)
+    import tempfile
+
+    work = tempfile.mkdtemp(prefix="nova-ops-", dir=nova_ops_workdir())
+    try:
+        tree = nova_extract_tree(canonical, main_sha, work, runner=runner)
+        return _nova_run([python, os.path.join(tree, NOVA_OPS_TOOL), "status"], cwd=tree, timeout=300, capture=False,
+                         runner=runner).returncode
+    finally:
+        import shutil
+
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def nova_privd_argv(verb, args):
+    """`sudo -n nova-privd <verb> ...` for a verb and flags the root authority gates itself."""
+    spec = NOVA_PRIVD_VERBS.get(verb)
+    if spec is None:
+        raise NovaOpsRefused("nova-privd %r is not available to a session (allowed: %s)" % (verb, ", ".join(sorted(NOVA_PRIVD_VERBS))))
+    argv, rest = ["sudo", "-n", NOVA_PRIVD, verb], list(args)
+    while rest:
+        flag = rest.pop(0)
+        if flag not in spec:
+            raise NovaOpsRefused("nova-privd %s does not take %r" % (verb, flag))
+        pattern = spec[flag]
+        if pattern is None:
+            argv.append(flag)
+            continue
+        if not rest or not pattern.match(rest[0]):
+            raise NovaOpsRefused("nova-privd %s %s needs a well-formed value" % (verb, flag))
+        argv += [flag, rest.pop(0)]
+    return argv
+
+
+def nova_ops_privd(verb, args, runner=None):
+    nova_ops_canonical()
+    argv = nova_privd_argv(verb, args)
+    log_event("nova_ops_privd", verb=verb, **nova_session_identity())
+    return _nova_run(argv, timeout=3600, capture=False, runner=runner).returncode
+
+
+def cmd_nova_ops(args):
+    try:
+        if args.op == "push":
+            print(json.dumps(nova_ops_push(os.getcwd()), indent=2))
+        elif args.op == "merge":
+            print(json.dumps(nova_ops_merge(args.pr, args.sha, wait_seconds=args.wait_ci), indent=2))
+        elif args.op in ("deploy", "rollback"):
+            print(json.dumps(nova_ops_deploy(args.sha, args.service_key, args.instruction,
+                                             rollback=args.op == "rollback", wait_ci=args.wait_ci), indent=2))
+        elif args.op == "status":
+            return nova_ops_status()
+        elif args.op == "privd":
+            return nova_ops_privd(args.verb, args.privd_args)
+    except NovaOpsRefused as exc:
+        print("nova-ops REFUSED: %s" % exc, file=sys.stderr)
+        return 3
+    return 0
 
 
 def build_remote_launch_script(workdir, argv, lsid, token_file):
@@ -9474,7 +9936,7 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
         return 404, {"error": "unknown_project"}
     if not project.get("remote_launch"):
         return 403, {"error": "remote_launch_disabled"}
-    profile, why = project_permissions_ok(project)
+    profile, why = project_permissions_ok(project, project_name)
     if profile is None:
         log_event("remote_create_refused", device_id=device_id, project=project_name, reason=why)
         return 403, {"error": "permission_profile_required", "reason": why}
@@ -9482,8 +9944,9 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
     if not isinstance(agent, str) or agent not in AGENT_TYPES:
         return 400, {"error": "bad_request", "reason": "agent must be one of: %s" % ", ".join(AGENT_TYPES)}
     if agent == AGENT_GROK:
+        # The Nova operator grant is for Claude sessions: Grok keeps every mandatory gate.
         return remote_create_grok_session(
-            body, ctx, project_name, real, project, profile, task, custom_name, request_key,
+            body, ctx, project_name, real, project, without_elevation(profile), task, custom_name, request_key,
             wait_seconds=wait_seconds, sleep=sleep, preflight=grok_preflight, launcher=grok_launcher,
             project_liveness=project_liveness,
         )
@@ -9514,6 +9977,9 @@ def remote_create_session(body, ctx, terminal=None, wait_seconds=None, health_wa
             allow=translate_rules_for_workspace(profile["allow"], real, workdir),
             deny=translate_rules_for_workspace(profile.get("deny", []), real, workdir, deny=True) + isolated_workspace_deny_rules(real),
         )
+    if profile_is_nova_operator(profile, project_name):
+        launch_profile = dict(launch_profile, allow=list(launch_profile["allow"]) + nova_ops_allow_rules())
+        log_event("nova_operator_session", logical_session_id=lsid, project=project_name)
     settings_file = write_permission_settings(lsid, launch_profile, repository=workdir)
     logical_mutate(lsid, lambda rec: rec["permissions"].__setitem__("settings_file", settings_file))
 
@@ -11835,6 +12301,8 @@ def isolation_probe(claude_bin, run=subprocess.run, model="claude-haiku-4-5-2025
             "verified_utc": utc_stamp(),
         }
     finally:
+        import shutil
+
         shutil.rmtree(work, ignore_errors=True)
 
 
@@ -14681,6 +15149,25 @@ def main(argv=None):
     p.add_argument("rest", nargs="*")
     p.add_argument("--from-file", default=None)
     p.set_defaults(func=cmd_project)
+
+    p = sub.add_parser("nova-ops", help="Nova operator commands (nova-operator profile only)")
+    ops = p.add_subparsers(dest="op", required=True)
+    ops.add_parser("push", help="push the checked-out feature branch (never main, never forced)")
+    q = ops.add_parser("merge", help="merge a PR whose CI is green, pinned to its head SHA")
+    q.add_argument("pr", type=int)
+    q.add_argument("--sha", required=True)
+    q.add_argument("--wait-ci", type=int, default=0, help="seconds to wait for running checks")
+    for op in ("deploy", "rollback"):
+        q = ops.add_parser(op, help="%s exactly SHA on the owner's quoted instruction" % op)
+        q.add_argument("sha")
+        q.add_argument("--instruction", required=True)
+        q.add_argument("--service-key", default="automation-core")
+        q.add_argument("--wait-ci", type=int, default=1200)
+    ops.add_parser("status", help="what is live (read-only)")
+    q = ops.add_parser("privd", help="call the root nova-privd authority (self-gated verbs only)")
+    q.add_argument("verb")
+    q.add_argument("privd_args", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_nova_ops)
 
     p = sub.add_parser("remote", help="Remote gateway: configure, enroll and revoke devices, serve")
     p.add_argument("action", choices=("configure", "enroll-device", "list-devices", "revoke-device", "check", "serve", "verify-isolation"))

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Nova operator profile and `nova-ops`**. An owner decision (30 September 2026) grants one registered
+  project, `nova`, a code-checked elevation.
+  - **How the grant is scoped.** The profile must name `"elevation": "nova-operator"`, and it validates only
+    for the project named `nova`. It may drop the `production deployment`, `production restart` and `rollback`
+    gates, and in exchange it must carry a narrower gate and deny raw `git push`, `gh pr merge`, `gh api`,
+    `git remote` and `sudo`. Every other project, and a Grok session on `nova`, keeps all mandatory gates.
+    `UNALLOWABLE_COMMANDS` is unchanged, and the profile still cannot pre-approve those commands.
+  - **What an elevated session gets at launch.** Terminal Handoff adds the fixed `nova-ops` commands, run by
+    this installed file, never by code a session can edit:
+    - `push`: the checked-out feature branch, with an explicit non-forcing refspec; never main.
+    - `merge PR --sha HEAD`: only when the PR is open, not a draft, based on main, and not from a fork;
+      "Architecture Validation" and "Safety Boundary Gate" are green; the merge state is `CLEAN`; and the head
+      is pinned with `--match-head-commit`.
+    - `deploy` / `rollback SHA --instruction "<owner's words>"`: Nova's own deploy tool, run from a clean
+      `git archive` of the exact SHA. A deploy SHA must be in origin/main with green CI. `NOVA_*`, `GIT_*` and
+      `PYTHON*` overrides are scrubbed, and the owner's instruction and session identity are recorded.
+    - `privd VERB`: only the verbs the root `nova-privd` authority gates itself, with well-formed values.
+
 - **`th checkpoint`** (Slice 1 of Terminal Handoff V2): a standalone, deterministic, machine-verifiable
   snapshot of repository and session state. Unlike a handoff manifest it never launches a successor and
   never touches the transfer state machine - a pure capture, safe to run at any time. Captures git identity,

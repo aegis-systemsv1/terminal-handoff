@@ -1,0 +1,42 @@
+{
+  "profile": "nova-operator",
+  "elevation": "nova-operator",
+  "description": "Nova sessions ship without John at a Terminal, through nova-ops only.",
+  "allow": [
+    "Read",
+    "Grep",
+    "Glob",
+    "Edit(scripts/**)",
+    "Edit(tools/**)",
+    "Bash(git status:*)",
+    "Bash(git diff:*)",
+    "Bash(git log:*)",
+    "Bash(git add:*)",
+    "Bash(git commit:*)",
+    "Bash(gh pr create:*)",
+    "Bash(gh pr view:*)",
+    "Bash(gh pr checks:*)",
+    "Bash(git switch:*)",
+    "Bash(git fetch:*)",
+    "Bash(git rev-parse:*)",
+    "Bash(gh pr list:*)"
+  ],
+  "deny": [
+    "Bash(git push:*)",
+    "Bash(gh pr merge:*)",
+    "Bash(gh api:*)",
+    "Bash(git remote:*)",
+    "Bash(sudo:*)",
+    "Bash(rm:*)",
+    "Bash(curl:*)",
+    "Bash(wget:*)",
+    "Bash(ssh:*)"
+  ],
+  "human_gate": [
+    "destructive filesystem operation",
+    "credential changes",
+    "security configuration changes",
+    "irreversible external action",
+    "production deploy, restart or rollback by any path other than nova-ops deploy/rollback/privd"
+  ]
+}
