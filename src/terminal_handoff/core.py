@@ -9193,9 +9193,15 @@ def nova_operator_note(record, profile):
         "    %(th)s nova-ops merge PR --sha HEADSHA    merge a PR whose CI is green\n"
         "    %(th)s nova-ops deploy SHA --instruction \"<owner's words, verbatim>\" [--service-key K]\n"
         "    %(th)s nova-ops rollback SHA --instruction \"<owner's words, verbatim>\" [--service-key K]\n"
-        "    %(th)s nova-ops status | privd VERB ...\n"
+        "    %(th)s nova-ops status                    what is live (read-only)\n"
+        "    %(th)s nova-ops privd VERB ...            self-gated nova-privd verbs\n"
         "Deploy or roll back only when the owner has explicitly instructed it, quoting his words;\n"
-        "the quote is recorded with this session's identity. Report the verified result.\n" % {"th": th}
+        "the quote is recorded with this session's identity. Report the verified result.\n"
+        "Run each nova-ops command EXACTLY as shown, as its own Bash call: the same interpreter\n"
+        "and path, and nothing before or after it -- no `;`, `&&`, `|`, `cd`, redirection or\n"
+        "`$(...)`. Only that bare form is pre-approved. Anything combined with it is judged as an\n"
+        "ordinary production action and refused, and a refused deploy must not be retried in\n"
+        "another form. Record notes with separate `session note` calls.\n" % {"th": th}
     )
 
 

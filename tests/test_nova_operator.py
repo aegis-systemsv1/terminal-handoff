@@ -166,6 +166,14 @@ class TestNovaOperatorLaunch(LaunchCase):
         prompt = text_file(CORE.th_path("prompts", "remote-%s.md" % view["logical_session_id"]))
         self.assertIn("NOVA OPERATOR", prompt)
         self.assertIn("nova-ops deploy SHA --instruction", prompt)
+        # 3 Oct 2026: a session piped `nova-ops deploy` into `tail` and chained it after
+        # `session note`; the compound line fell outside the allow rule and was refused.
+        self.assertIn("as its own Bash call", prompt)
+        self.assertIn("no `;`, `&&`, `|`", prompt)
+        # Every command the prompt shows must start with exactly its allow rule's prefix.
+        for rule in CORE.nova_ops_allow_rules():
+            prefix = rule[len("Bash("):-len(":*)")]
+            self.assertTrue(any(line.strip().startswith(prefix) for line in prompt.splitlines()), prefix)
 
     def test_an_ordinary_profile_session_gets_nothing_extra(self):
         status, view = self.create()
