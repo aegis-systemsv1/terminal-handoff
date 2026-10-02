@@ -413,7 +413,7 @@ Register it once, locally:
 
 ```sh
 TH="python3 ~/.claude/terminal-handoff/terminal-handoff.py"
-$TH project add nova /Users/johngavin/Nova
+$TH project add nova "$HOME/Nova"
 $TH project permissions edit nova --from-file docs/nova-operator-profile.json
 $TH project enable-remote nova
 $TH project list        # "permissions": "valid"

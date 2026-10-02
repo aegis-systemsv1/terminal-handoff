@@ -9567,6 +9567,39 @@ def nova_ops_workdir():
     return path
 
 
+def nova_tar_has_data_filter():
+    """tarfile's "data" filter exists from Python 3.12 and in late 3.8-3.11 patch releases."""
+    import tarfile
+
+    return hasattr(tarfile, "data_filter")
+
+
+def nova_check_archive_members(members, root):
+    """Refuse an archive member that could write outside `root` or is not a plain file,
+    directory or link: the checks tarfile's "data" filter makes, done here so they hold
+    on every supported Python (the filter only exists from 3.12 and late patch releases).
+    """
+    root = os.path.realpath(root)
+
+    def inside(path):
+        return path == root or path.startswith(root + os.sep)
+
+    for member in members:
+        name = member.name
+        if os.path.isabs(name) or ".." in name.replace("\\", "/").split("/"):
+            raise NovaOpsRefused("archive member %r has an unsafe path" % name)
+        target = os.path.realpath(os.path.join(root, name))
+        if not inside(target):
+            raise NovaOpsRefused("archive member %r would land outside the tree" % name)
+        if member.issym() or member.islnk():
+            link = member.linkname
+            base = os.path.dirname(target) if member.issym() else root
+            if os.path.isabs(link) or not inside(os.path.realpath(os.path.join(base, link))):
+                raise NovaOpsRefused("archive link %r -> %r points outside the tree" % (name, link))
+        elif not (member.isfile() or member.isdir()):
+            raise NovaOpsRefused("archive member %r is not a file, directory or link" % name)
+
+
 def nova_extract_tree(canonical, sha, dest, runner=None):
     """A clean copy of exactly `sha`'s committed files: `git archive`, never a working tree."""
     import tarfile
@@ -9581,7 +9614,11 @@ def nova_extract_tree(canonical, sha, dest, runner=None):
     tree = os.path.join(dest, "tree")
     os.makedirs(tree, mode=0o700)
     with tarfile.open(tar_path) as archive:
-        archive.extractall(tree, filter="data")
+        nova_check_archive_members(archive.getmembers(), tree)
+        if nova_tar_has_data_filter():
+            archive.extractall(tree, filter="data")
+        else:
+            archive.extractall(tree)  # every member was validated above
     os.unlink(tar_path)
     tool = os.path.join(tree, NOVA_OPS_TOOL)
     if not os.path.isfile(tool):

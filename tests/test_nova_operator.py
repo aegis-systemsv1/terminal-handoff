@@ -413,6 +413,70 @@ class TestNovaOpsDeploy(NovaOpsCase):
         self.assertTrue(any(r["event"] == "nova_ops_deploy" and r["outcome"] == "ok" for r in rows))
 
 
+class TestNovaArchiveMembers(unittest.TestCase):
+    """The checks tarfile's "data" filter makes, enforced on every supported Python."""
+
+    def member(self, name, kind="file", link=""):
+        import tarfile
+
+        info = tarfile.TarInfo(name)
+        info.type = {"file": tarfile.REGTYPE, "dir": tarfile.DIRTYPE, "sym": tarfile.SYMTYPE,
+                     "hard": tarfile.LNKTYPE, "dev": tarfile.CHRTYPE, "fifo": tarfile.FIFOTYPE}[kind]
+        info.linkname = link
+        return info
+
+    def setUp(self):
+        import tempfile
+
+        self.root = tempfile.mkdtemp()
+
+    def test_an_ordinary_tree_with_an_in_tree_relative_symlink_is_accepted(self):
+        # Shape of Nova's own tree: .claude/skills/find-skills -> ../../.agents/skills/find-skills
+        CORE.nova_check_archive_members([
+            self.member("scripts", "dir"), self.member("scripts/nova_deploy.py"),
+            self.member(".claude/skills/find-skills", "sym", "../../.agents/skills/find-skills"),
+            self.member("docs/copy.md", "hard", "docs/original.md"),
+        ], self.root)
+
+    def test_anything_that_could_escape_or_is_not_a_plain_entry_is_refused(self):
+        cases = [
+            self.member("/etc/passwd"),
+            self.member("../outside"),
+            self.member("a/../../outside"),
+            self.member("link", "sym", "/etc"),
+            self.member("link", "sym", "../../outside"),
+            self.member("hard", "hard", "../outside"),
+            self.member("dev", "dev"),
+            self.member("pipe", "fifo"),
+        ]
+        for member in cases:
+            with self.subTest(member.name, link=member.linkname):
+                with self.assertRaises(CORE.NovaOpsRefused):
+                    CORE.nova_check_archive_members([member], self.root)
+
+    def test_extraction_works_without_the_data_filter(self):
+        """Python 3.9 has no `filter=`: extraction must still succeed there, validated."""
+        repo = os.path.join(self.root, "repo")
+        subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+        os.makedirs(os.path.join(repo, "scripts"))
+        with open(os.path.join(repo, "scripts", "nova_deploy.py"), "w") as handle:
+            handle.write("print('tool')\n")
+        os.symlink("scripts/nova_deploy.py", os.path.join(repo, "alias"))
+        git(repo, "add", ".")
+        git(repo, "-c", "user.email=t@e", "-c", "user.name=T", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "x")
+        sha = git(repo, "rev-parse", "HEAD")
+        dest = os.path.join(self.root, "work")
+        os.makedirs(dest)
+        real = CORE.nova_tar_has_data_filter
+        CORE.nova_tar_has_data_filter = lambda: False
+        try:
+            tree = CORE.nova_extract_tree(repo, sha, dest)
+        finally:
+            CORE.nova_tar_has_data_filter = real
+        self.assertTrue(os.path.isfile(os.path.join(tree, "scripts", "nova_deploy.py")))
+        self.assertEqual(os.readlink(os.path.join(tree, "alias")), "scripts/nova_deploy.py")
+
+
 class TestNovaPrivd(unittest.TestCase):
     def test_only_self_gated_verbs_with_well_formed_values(self):
         self.assertEqual(CORE.nova_privd_argv("status", ["--json"]), ["sudo", "-n", CORE.NOVA_PRIVD, "status", "--json"])
