@@ -1,0 +1,14 @@
+# Gitleaks config: default rules plus a narrow allowlist for known fake test fixtures.
+# Every path below holds dummy keys only (verified in the 27 Oct 2026 secrets audit). Keep this list exact.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake keys in test fixtures and scanner self-tests"
+paths = [
+  '^tests/test_checkpoint\.py$',
+  '^tests/test_remote_api\.py$',
+  '^tests/test_remote_launch\.py$',
+  '^tests/test_session_names\.py$',
+  '^tests/test_stage6\.py$',
+]
